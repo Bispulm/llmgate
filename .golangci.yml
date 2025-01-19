@@ -1,0 +1,31 @@
+version: "2"
+
+linters:
+  enable:
+    - bodyclose
+    - contextcheck
+    - copyloopvar
+    - errcheck
+    - errorlint
+    - gosec
+    - govet
+    - ineffassign
+    - misspell
+    - nilerr
+    - noctx
+    - sloglint
+    - staticcheck
+    - unconvert
+    - unused
+  settings:
+    sloglint:
+      # Keep log calls scannable and free of accidental formatting.
+      no-mixed-args: true
+      attr-only: false
+  exclusions:
+    rules:
+      # Tests drive deliberately unusual requests against local servers.
+      - path: _test\.go
+        linters:
+          - gosec
+          - noctx
