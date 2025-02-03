@@ -24,8 +24,10 @@ linters:
       attr-only: false
   exclusions:
     rules:
-      # Tests drive deliberately unusual requests against local servers.
+      # Tests drive deliberately unusual requests against local servers, and
+      # close response bodies through helpers the linter cannot follow.
       - path: _test\.go
         linters:
+          - bodyclose
           - gosec
           - noctx
