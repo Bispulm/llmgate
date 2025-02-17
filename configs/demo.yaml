@@ -1,0 +1,26 @@
+# Local demonstration configuration. Every provider here is the local mock, so
+# nothing in this file can spend money. Credentials come from the environment:
+# scripts/demo.sh sets placeholder values.
+server:
+  listen: 127.0.0.1:18300
+
+auth:
+  dev_key_env: LLMGATE_DEV_KEY
+
+limits:
+  request_timeout: 30s
+  first_event_timeout: 5s
+  stream_idle_timeout: 5s
+
+providers:
+  - name: mock
+    type: openai-compatible
+    base_url: http://127.0.0.1:18301/v1
+    api_key_env: LLMGATE_MOCK_PROVIDER_KEY
+
+models:
+  - alias: demo-fast
+    max_output_tokens: 256
+    routes:
+      - provider: mock
+        model: alpha
