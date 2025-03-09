@@ -38,9 +38,11 @@ type Request struct {
 	// MaxOutputTokens is the client's limit, or 0 if it set none. The API layer
 	// replaces 0 with the alias's limit, so an adapter always has a real bound.
 	MaxOutputTokens int64
-	Temperature     *float64
-	TopP            *float64
-	Stop            []string
+	// MaxOutputParam is the field the client used for the limit, for errors.
+	MaxOutputParam string
+	Temperature    *float64
+	TopP           *float64
+	Stop           []string
 
 	Stream       bool
 	IncludeUsage bool
@@ -293,8 +295,10 @@ func (s *requestState) finish() (*Request, error) {
 		return nil, invalidValue("max_tokens", "cannot be combined with max_completion_tokens")
 	case s.maxCompletion != nil:
 		s.req.MaxOutputTokens = *s.maxCompletion
+		s.req.MaxOutputParam = "max_completion_tokens"
 	case s.maxTokens != nil:
 		s.req.MaxOutputTokens = *s.maxTokens
+		s.req.MaxOutputParam = "max_tokens"
 	}
 	if err := validateOrder(s.req.Messages); err != nil {
 		return nil, err

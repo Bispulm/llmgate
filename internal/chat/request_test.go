@@ -39,6 +39,7 @@ func TestDecodeRequestAcceptsTheContract(t *testing.T) {
 					{RoleSystem, "s"}, {RoleDeveloper, "d"}, {RoleUser, "u"}, {RoleAssistant, "a"}, {RoleUser, "u2"},
 				},
 				MaxOutputTokens: 5,
+				MaxOutputParam:  "max_completion_tokens",
 				Temperature:     float(0.5),
 				TopP:            float(0.25),
 				Stop:            []string{"x", "y"},
@@ -49,7 +50,7 @@ func TestDecodeRequestAcceptsTheContract(t *testing.T) {
 		{
 			name: "max_tokens is a synonym",
 			body: `{"model":"fast","messages":[{"role":"user","content":"hi"}],"max_tokens":7}`,
-			want: Request{Model: "fast", Messages: []Message{{RoleUser, "hi"}}, MaxOutputTokens: 7},
+			want: Request{Model: "fast", Messages: []Message{{RoleUser, "hi"}}, MaxOutputTokens: 7, MaxOutputParam: "max_tokens"},
 		},
 		{
 			name: "stop as a string",

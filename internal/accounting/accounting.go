@@ -57,8 +57,8 @@ type Attempt struct {
 	UpstreamCode   string
 
 	// Usage is nil when the provider reported nothing. That means unknown, not
-	// zero: the attempt may have cost money. TextEvents and OutputBytes describe
-	// what was delivered, which reconciliation can use for an estimate.
+	// zero: the attempt may have cost money. TextEvents and OutputBytes count the
+	// generated text received, which reconciliation can use for an estimate.
 	Usage       *chat.Usage
 	TextEvents  int
 	OutputBytes int64
@@ -69,6 +69,9 @@ type Attempt struct {
 
 // Recorder receives finished attempts. Callers pass a context separate from the
 // request's, so that a canceled request can't prevent its own accounting.
+//
+// RecordAttempt runs before the request's handler returns, so an implementation
+// must return by the context's deadline or it holds the response open.
 type Recorder interface {
 	RecordAttempt(ctx context.Context, a Attempt)
 }
