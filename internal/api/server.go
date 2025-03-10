@@ -87,6 +87,9 @@ func New(opts Options) *Server {
 // request. Otherwise a deadline left by an earlier response would fail a later
 // request on the same connection. It stays set after the handler returns because
 // that bounds the final write of the response, even to a client that has stalled.
+//
+// The timeout limits how long one write can block, not how long a provider can
+// take, so anything writing after a wait must call extendWriteDeadline first.
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	s.extendWriteDeadline(http.NewResponseController(w))
 	s.mux.ServeHTTP(w, r)

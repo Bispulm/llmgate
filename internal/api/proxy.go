@@ -85,6 +85,8 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 
 	rc := http.NewResponseController(w)
 	body, apiErr := s.readBody(w, r, rc)
+	// Reading the body can use up the deadline set when the request arrived.
+	s.extendWriteDeadline(rc)
 	if apiErr != nil {
 		writeError(w, apiErr)
 		return
@@ -236,6 +238,7 @@ func (s *Server) failAttempt(x *exchange, failure *provider.Error) {
 		return
 	}
 	x.attempt.Outcome = accounting.OutcomeFailed
+	s.extendWriteDeadline(x.rc)
 	writeError(x.w, upstreamError(failure))
 }
 
@@ -299,6 +302,7 @@ func (s *Server) proxyCompletion(ctx context.Context, x *exchange) {
 	}
 
 	x.attempt.Committed = true
+	s.extendWriteDeadline(x.rc)
 	x.w.Header().Set("Content-Type", "application/json")
 	x.w.WriteHeader(http.StatusOK)
 	if _, err := x.w.Write(body); err != nil {
