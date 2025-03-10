@@ -1,14 +1,18 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/Bispulm/llmgate/internal/mock"
 )
 
 const testConfig = `
@@ -79,6 +83,114 @@ func TestServeRunsUntilCanceled(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("server did not stop after cancel")
+	}
+}
+
+// startServe runs the gateway command with the given configuration, stopping it
+// when the test ends.
+func startServe(t *testing.T, config string) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(path, []byte(config), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	addrs := make(chan string, 1)
+	done := make(chan error, 1)
+	go func() {
+		done <- run(ctx, []string{"serve", "-config", path}, testEnv, io.Discard, func(addr string) { addrs <- addr })
+	}()
+	t.Cleanup(func() {
+		cancel()
+		if err := <-done; err != nil {
+			t.Errorf("run returned %v", err)
+		}
+	})
+
+	select {
+	case addr := <-addrs:
+		return addr
+	case err := <-done:
+		done <- err
+		t.Fatalf("run returned early: %v", err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("server did not start")
+	}
+	return ""
+}
+
+func TestServeProxiesToTheConfiguredProvider(t *testing.T) {
+	upstream := httptest.NewServer(mock.New())
+	defer upstream.Close()
+
+	config := strings.Replace(testConfig, "http://127.0.0.1:18301/v1", upstream.URL+"/v1", 1)
+	addr := startServe(t, config)
+
+	post := func(t *testing.T, key, body string) (*http.Response, string) {
+		t.Helper()
+		req, err := http.NewRequest(http.MethodPost, "http://"+addr+"/v1/chat/completions", strings.NewReader(body))
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header.Set("Authorization", "Bearer "+key)
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = resp.Body.Close() }()
+		raw, err := io.ReadAll(resp.Body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return resp, string(raw)
+	}
+	const message = `"messages":[{"role":"user","content":"hello"}]`
+
+	t.Run("non-streaming", func(t *testing.T) {
+		resp, body := post(t, "dev", `{"model":"fast",`+message+`}`)
+		if resp.StatusCode != http.StatusOK || !strings.Contains(body, "[alpha]") {
+			t.Fatalf("status %d, body %s", resp.StatusCode, body)
+		}
+	})
+	t.Run("streaming", func(t *testing.T) {
+		resp, body := post(t, "dev", `{"model":"fast","stream":true,`+message+`}`)
+		if resp.StatusCode != http.StatusOK || !strings.Contains(body, "[alpha]") || !strings.HasSuffix(body, "data: [DONE]\n\n") {
+			t.Fatalf("status %d, body %s", resp.StatusCode, body)
+		}
+	})
+	t.Run("the configured client key is required", func(t *testing.T) {
+		if resp, _ := post(t, "wrong", `{"model":"fast",`+message+`}`); resp.StatusCode != http.StatusUnauthorized {
+			t.Fatalf("status %d", resp.StatusCode)
+		}
+	})
+	t.Run("the configured output limit applies", func(t *testing.T) {
+		if resp, _ := post(t, "dev", `{"model":"fast","max_tokens":65,`+message+`}`); resp.StatusCode != http.StatusBadRequest {
+			t.Fatalf("status %d", resp.StatusCode)
+		}
+	})
+}
+
+func TestServeLogsThatBudgetsAreNotEnforced(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var logs bytes.Buffer
+	started := make(chan struct{})
+	done := make(chan error, 1)
+	go func() {
+		done <- run(ctx, []string{"serve", "-config", writeTestConfig(t)}, testEnv, &logs, func(string) { close(started) })
+	}()
+	select {
+	case <-started:
+	case err := <-done:
+		t.Fatalf("run returned early: %v", err)
+	}
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(logs.String(), "budgets are not enforced") {
+		t.Fatalf("logs = %s", logs.String())
 	}
 }
 
