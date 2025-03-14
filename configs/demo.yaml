@@ -1,6 +1,8 @@
 # Local demonstration configuration. Every provider here is the local mock, so
 # nothing in this file can spend money. Credentials come from the environment:
 # scripts/demo.sh sets placeholder values.
+#
+# The upstream model strings select mock scenarios. See internal/mock/scenario.go.
 server:
   listen: 127.0.0.1:18300
 
@@ -23,4 +25,32 @@ models:
     max_output_tokens: 256
     routes:
       - provider: mock
-        model: alpha
+        model: alpha;tokens=5;interval=100ms
+
+  # The provider fails after its prelude, before any content.
+  - alias: demo-fails-before-content
+    max_output_tokens: 256
+    routes:
+      - provider: mock
+        model: beta;fail=disconnect;after=0
+
+  # The provider fails after two words of content.
+  - alias: demo-fails-midstream
+    max_output_tokens: 256
+    routes:
+      - provider: mock
+        model: gamma;fail=disconnect;after=2;tokens=5
+
+  # The provider is rate limiting.
+  - alias: demo-rate-limited
+    max_output_tokens: 256
+    routes:
+      - provider: mock
+        model: delta;fail=status;status=429;retry_after=2
+
+  # The provider is slow to start and streams slowly, for the cancellation demo.
+  - alias: demo-slow
+    max_output_tokens: 1000
+    routes:
+      - provider: mock
+        model: slow;tokens=1000;interval=100ms
