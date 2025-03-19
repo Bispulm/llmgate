@@ -158,18 +158,31 @@ All errors use the OpenAI envelope, with `x-request-id` set on the response:
 | 400 | `invalid_request_error` | `invalid_json` | Malformed JSON or invalid UTF-8 |
 | 400 | `invalid_request_error` | `output_limit_exceeded` | Limit above the alias's maximum |
 | 401 | `authentication_error` | `invalid_api_key` | Missing or unknown key |
+| 400 | `invalid_request_error` | `request_unreadable` | The body could not be read |
+| 400 | `invalid_request_error` | `upstream_rejected` | Provider rejected the request, such as a prompt over its context limit |
 | 404 | `invalid_request_error` | `model_not_found` | Unknown alias |
 | 405 | `invalid_request_error` | `method_not_allowed` | Not a POST |
+| 408 | `invalid_request_error` | `request_timeout` | The body did not arrive in time |
 | 413 | `invalid_request_error` | `request_too_large` | Body over the configured limit |
 | 429 | `rate_limit_error` | `upstream_rate_limited` | Provider rate limit, with `Retry-After` when known |
 | 502 | `upstream_error` | `upstream_failed` | Connection failure, or provider 5xx |
 | 502 | `upstream_error` | `upstream_protocol_error` | Malformed provider response |
-| 502 | `upstream_error` | `upstream_rejected` | Provider rejected the translated request |
 | 502 | `upstream_error` | `upstream_misconfigured` | Provider rejected the gateway's credentials or model |
 | 503 | `upstream_error` | `upstream_overloaded` | Provider reports overload |
 | 504 | `upstream_error` | `upstream_timeout` | A deadline passed before commit |
 
-The gateway does not forward provider error messages, which can contain account details. It logs the provider's status and error code, and returns the code on `upstream_rejected` when it is a short identifier.
+`upstream_rejected` is a 400 rather than a 5xx because the same request will keep failing, and client SDKs automatically retry a 5xx.
+
+The gateway does not forward provider error messages, which can contain account details. It logs the provider's status and error code, and includes the code in the message of `upstream_rejected` when it is a short identifier.
+
+## Response headers
+
+| Header | Meaning |
+|---|---|
+| `X-Request-Id` | The gateway's ID for this request. It also appears in the logs. |
+| `X-Llmgate-Route` | The serving `provider/model`, once one was chosen |
+| `X-Llmgate-Attempts` | How many upstream attempts were made |
+| `X-Llmgate-Budget-Enforcement` | `none` until budgets exist. See [ADR 0002](adr/0002-postgres-is-the-budget-authority.md). |
 
 ## Provider capabilities
 
