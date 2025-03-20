@@ -1092,6 +1092,80 @@ func TestSlowRequestBodyIsCutOff(t *testing.T) {
 	}
 }
 
+// A request rejected without reading its body must not wait for that body, because
+// net/http drains an unread body before replying. Without this, any caller could
+// hold a connection and a goroutine open without authenticating.
+func TestRejectionsDoNotWaitForAnUnreadBody(t *testing.T) {
+	tests := []struct {
+		name, method, path, auth string
+		status                   int
+	}{
+		{"no credential", http.MethodPost, "/v1/chat/completions", "", 401},
+		{"wrong credential", http.MethodPost, "/v1/chat/completions", "Authorization: Bearer wrong\r\n", 401},
+		{"wrong method", http.MethodPut, "/v1/chat/completions", "", 405},
+		{"unknown path", http.MethodPost, "/nope", "", 404},
+		{"health check", http.MethodGet, "/healthz", "", 200},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			g := newGateway(t, "alpha", func(o *Options) { o.Limits.BodyReadTimeout = 200 * time.Millisecond })
+			conn, err := net.Dial("tcp", strings.TrimPrefix(g.url, "http://"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = conn.Close() }()
+			if _, err := fmt.Fprintf(conn, "%s %s HTTP/1.1\r\nHost: test\r\n%sContent-Length: 1000\r\n\r\n", tt.method, tt.path, tt.auth); err != nil {
+				t.Fatal(err)
+			}
+			if err := conn.SetReadDeadline(time.Now().Add(3 * time.Second)); err != nil {
+				t.Fatal(err)
+			}
+			reader := bufio.NewReader(conn)
+			resp, err := http.ReadResponse(reader, nil)
+			if err != nil {
+				t.Fatalf("no response while the body is outstanding: %v", err)
+			}
+			defer func() { _ = resp.Body.Close() }()
+			if resp.StatusCode != tt.status {
+				t.Fatalf("status = %d, want %d", resp.StatusCode, tt.status)
+			}
+			if _, err := io.Copy(io.Discard, resp.Body); err != nil {
+				t.Fatal(err)
+			}
+			// The server must also release the connection on its own, while this client
+			// keeps it open and never sends the body.
+			if _, err := reader.ReadByte(); !errors.Is(err, io.EOF) {
+				t.Fatalf("connection not released: read returned %v", err)
+			}
+		})
+	}
+
+	t.Run("a client that did send its body still gets a clean rejection", func(t *testing.T) {
+		g := newGateway(t, "alpha")
+		req, err := http.NewRequest(http.MethodPost, g.url+"/v1/chat/completions", strings.NewReader(chatBody(false, "")))
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp, err := g.client.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = resp.Body.Close() }()
+		expectError(t, resp, 401, "authentication_error", "invalid_api_key")
+	})
+	t.Run("requests without a body keep their connection", func(t *testing.T) {
+		g := newGateway(t, "alpha")
+		resp, err := g.client.Get(g.url + "/healthz")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = resp.Body.Close() }()
+		if resp.Close {
+			t.Fatal("the connection was closed for a request with no body")
+		}
+	})
+}
+
 // Both timers start around the same moment, so the response to a stalled body must
 // not need the write deadline set when the request arrived.
 func TestSlowRequestBodyGetsAResponseWhenBothTimeoutsExpire(t *testing.T) {
