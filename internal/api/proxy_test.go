@@ -1374,6 +1374,51 @@ func TestResponseEncoding(t *testing.T) {
 	})
 }
 
+// brokenWriter fails every write, the way a connection does once a client has gone.
+type brokenWriter struct {
+	header http.Header
+}
+
+func (w *brokenWriter) Header() http.Header { return w.header }
+
+func (w *brokenWriter) WriteHeader(int) {}
+
+func (w *brokenWriter) Write([]byte) (int, error) { return 0, errors.New("broken pipe") }
+
+// What the upstream sent cost money whether or not the client received it.
+func TestAccountingCountsTheFirstEventWhenItCannotBeDelivered(t *testing.T) {
+	rec := &attemptRecorder{attempts: make(chan recordedAttempt, 1)}
+	fake := &fakeProvider{events: []chat.StreamEvent{{
+		Content: "hello",
+		Usage:   &chat.Usage{State: chat.UsageReported, PromptTokens: 1, CompletionTokens: 1, TotalTokens: 2},
+	}}}
+	server := New(Options{
+		Auth:     auth.NewDevKey(testAPIKey),
+		Recorder: rec,
+		Limits:   testLimits(),
+		Routes: routing.NewTable([]routing.Alias{{
+			Name:            "fast",
+			MaxOutputTokens: 100,
+			Routes:          []routing.Route{{ProviderName: "fake", Provider: fake, Model: "m"}},
+		}}),
+	})
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(chatBody(true, "")))
+	req.Header.Set("Authorization", "Bearer "+testAPIKey)
+	server.ServeHTTP(&brokenWriter{header: http.Header{}}, req)
+
+	a := rec.wait(t)
+	if !a.Committed || a.Outcome != accounting.OutcomeClientCanceled {
+		t.Fatalf("attempt = %+v", a)
+	}
+	if a.TextEvents != 1 || a.OutputBytes != 5 {
+		t.Fatalf("output = %d events, %d bytes: the undelivered event wasn't counted", a.TextEvents, a.OutputBytes)
+	}
+	if a.Usage == nil || a.Usage.TotalTokens != 2 {
+		t.Fatalf("usage = %+v", a.Usage)
+	}
+}
+
 type syncBuffer struct {
 	mu  sync.Mutex
 	buf bytes.Buffer
