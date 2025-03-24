@@ -58,11 +58,18 @@ type Completion struct {
 }
 
 // StreamEvent is one normalized stream event. Adapters only emit events that
-// carry something, so role-only chunks, pings, and similar never reach the
-// gateway. That is what lets receiving an event mean the stream has really begun.
+// carry something, so role-only chunks, pings, and similar never reach the gateway.
 type StreamEvent struct {
 	Content      string
 	Refusal      string
 	FinishReason FinishReason
 	Usage        *Usage
+}
+
+// HasOutput reports whether the event is part of the response itself, rather than
+// only a usage report. Only output can commit a response or show that a stream is
+// making progress. Some servers report usage on every chunk, including role-only
+// ones sent before inference has really begun.
+func (e StreamEvent) HasOutput() bool {
+	return e.Content != "" || e.Refusal != "" || e.FinishReason != ""
 }
