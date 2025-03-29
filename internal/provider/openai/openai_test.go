@@ -382,6 +382,62 @@ func TestCompleteClassifiesStatuses(t *testing.T) {
 	}
 }
 
+// Retrying won't restore access in these cases, so they must not read as an
+// ordinary rate limit. The codes come from the provider's error code guide.
+func TestBillingFailuresAreNotRateLimits(t *testing.T) {
+	billing := []struct {
+		name, status, body string
+	}{
+		{"credit balance exhausted", "429", `{"error":{"message":"m","type":"insufficient_quota","code":"credit_balance_exhausted"}}`},
+		{"organization spend limit", "429", `{"error":{"message":"m","type":"insufficient_quota","code":"organization_spend_limit_exceeded"}}`},
+		{"project spend limit", "429", `{"error":{"message":"m","type":"insufficient_quota","code":"project_spend_limit_exceeded"}}`},
+		{"organization usage limit", "429", `{"error":{"message":"m","type":"insufficient_quota","code":"organization_usage_limit_exceeded"}}`},
+		{"only the broad type", "429", `{"error":{"message":"m","type":"insufficient_quota","code":null}}`},
+		{"the type with an unknown code", "429", `{"error":{"message":"m","type":"insufficient_quota","code":"some_future_code"}}`},
+		{"a billing status", "402", `{"error":{"message":"m","type":"billing_error","code":null}}`},
+	}
+	for _, tt := range billing {
+		t.Run(tt.name, func(t *testing.T) {
+			var status int
+			if _, err := fmt.Sscan(tt.status, &status); err != nil {
+				t.Fatal(err)
+			}
+			url := staticServer(t, status, "application/json", tt.body)
+			_, err := newProvider(t, url).Complete(context.Background(), request(), "m")
+			if got := asProviderError(t, err).Kind; got != provider.KindBilling {
+				t.Fatalf("kind = %q", got)
+			}
+		})
+	}
+
+	for name, body := range map[string]string{
+		"a rate limit with no code": `{"error":{"message":"m","type":"rate_limit_error","code":null}}`,
+		"slowing down":              `{"error":{"message":"m","type":"rate_limit_error","code":"slow_down"}}`,
+		"an unreadable body":        `<html>too many requests</html>`,
+	} {
+		t.Run("still a rate limit: "+name, func(t *testing.T) {
+			url := staticServer(t, 429, "application/json", body)
+			_, err := newProvider(t, url).Complete(context.Background(), request(), "m")
+			if got := asProviderError(t, err).Kind; got != provider.KindRateLimited {
+				t.Fatalf("kind = %q", got)
+			}
+		})
+	}
+
+	t.Run("reported inside a stream", func(t *testing.T) {
+		url := staticServer(t, 200, "text/event-stream", sseBody(`{"error":{"message":"m","type":"insufficient_quota","code":"credit_balance_exhausted"}}`))
+		st, err := newProvider(t, url).Stream(context.Background(), streamRequest(), "m")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = st.Close() }()
+		_, _, err = drain(st)
+		if got := asProviderError(t, err).Kind; got != provider.KindBilling {
+			t.Fatalf("kind = %q", got)
+		}
+	})
+}
+
 func TestRetryHints(t *testing.T) {
 	p, _ := withMock(t)
 
