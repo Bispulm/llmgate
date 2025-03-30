@@ -1457,6 +1457,86 @@ func TestUsageReportsAreNotOutput(t *testing.T) {
 	})
 }
 
+// blockingProvider holds a request until released.
+type blockingProvider struct {
+	fakeProvider
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (p *blockingProvider) Complete(context.Context, *chat.Request, string) (*chat.Completion, error) {
+	close(p.entered)
+	<-p.release
+	return &chat.Completion{Content: "a", FinishReason: chat.FinishStop}, nil
+}
+
+// http.Server.Close doesn't wait for handlers, and each handler records its attempt
+// as it finishes, so shutdown needs this to avoid exiting before the record is made.
+func TestWaitForRequests(t *testing.T) {
+	rec := &attemptRecorder{attempts: make(chan recordedAttempt, 1)}
+	p := &blockingProvider{entered: make(chan struct{}), release: make(chan struct{})}
+	server := New(Options{
+		Auth:     auth.NewDevKey(testAPIKey),
+		Recorder: rec,
+		Limits:   testLimits(),
+		Routes: routing.NewTable([]routing.Alias{{
+			Name:            "fast",
+			MaxOutputTokens: 100,
+			Routes:          []routing.Route{{ProviderName: "fake", Provider: p, Model: "m"}},
+		}}),
+	})
+	ts := httptest.NewServer(server)
+	defer ts.Close()
+	client := &http.Client{Transport: &http.Transport{}}
+	defer client.CloseIdleConnections()
+
+	idle, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := server.WaitForRequests(idle); err != nil {
+		t.Fatalf("waiting with nothing in flight: %v", err)
+	}
+
+	finished := make(chan struct{})
+	go func() {
+		defer close(finished)
+		req, err := http.NewRequest(http.MethodPost, ts.URL+"/v1/chat/completions", strings.NewReader(chatBody(false, "")))
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		req.Header.Set("Authorization", "Bearer "+testAPIKey)
+		resp, err := client.Do(req)
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		_ = resp.Body.Close()
+	}()
+	<-p.entered
+
+	short, cancelShort := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancelShort()
+	if err := server.WaitForRequests(short); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("waiting with a request in flight: %v", err)
+	}
+
+	close(p.release)
+	long, cancelLong := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancelLong()
+	if err := server.WaitForRequests(long); err != nil {
+		t.Fatalf("waiting after the request was released: %v", err)
+	}
+	select {
+	case a := <-rec.attempts:
+		if a.Outcome != accounting.OutcomeCompleted {
+			t.Fatalf("attempt = %+v", a)
+		}
+	default:
+		t.Fatal("the wait ended before the attempt was recorded")
+	}
+	<-finished
+}
+
 // brokenWriter fails every write, the way a connection does once a client has gone.
 type brokenWriter struct {
 	header http.Header

@@ -24,7 +24,12 @@ import (
 	"github.com/Bispulm/llmgate/internal/routing"
 )
 
-const usage = "usage: llmgate serve -config <path>"
+const (
+	usage = "usage: llmgate serve -config <path>"
+
+	// requestExitTimeout bounds the wait for canceled requests to finish recording.
+	requestExitTimeout = 10 * time.Second
+)
 
 func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -134,6 +139,14 @@ func serve(ctx context.Context, args []string, getenv func(string) string, stder
 		logger.Warn("drain timed out, closing remaining requests", "error", err.Error())
 		cancelRequests()
 		_ = server.Close()
+
+		// Close doesn't wait for handlers, and each one records its attempt as it
+		// finishes. Exiting now would lose those records.
+		exitCtx, cancelExit := context.WithTimeout(context.WithoutCancel(ctx), requestExitTimeout)
+		defer cancelExit()
+		if err := handler.WaitForRequests(exitCtx); err != nil {
+			logger.Error("exiting with requests still running, so their attempts may be unrecorded", "error", err.Error())
+		}
 	}
 	if err := <-serveErr; !errors.Is(err, http.ErrServerClosed) {
 		return fmt.Errorf("serving: %w", err)

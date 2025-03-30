@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -207,7 +208,7 @@ func lastEvent(decoder *sse.Decoder) string {
 }
 
 func TestShutdown(t *testing.T) {
-	serveWith := func(t *testing.T, upstreamURL, model, drain string) (string, context.CancelFunc, chan error) {
+	serveWith := func(t *testing.T, logs io.Writer, upstreamURL, model, drain string) (string, context.CancelFunc, chan error) {
 		t.Helper()
 		config := strings.Replace(testConfig, "http://127.0.0.1:18301/v1", upstreamURL+"/v1", 1)
 		config = strings.Replace(config, "model: alpha", "model: "+quoteYAML(model), 1)
@@ -221,7 +222,7 @@ func TestShutdown(t *testing.T) {
 		addrs := make(chan string, 1)
 		done := make(chan error, 1)
 		go func() {
-			done <- run(ctx, []string{"serve", "-config", path}, testEnv, io.Discard, func(addr string) { addrs <- addr })
+			done <- run(ctx, []string{"serve", "-config", path}, testEnv, logs, func(addr string) { addrs <- addr })
 		}()
 		select {
 		case addr := <-addrs:
@@ -248,7 +249,7 @@ func TestShutdown(t *testing.T) {
 	t.Run("a stream that finishes within the drain timeout completes", func(t *testing.T) {
 		upstream := httptest.NewServer(mock.New())
 		defer upstream.Close()
-		addr, cancel, done := serveWith(t, upstream.URL, "alpha;tokens=6;interval=50ms", "5s")
+		addr, cancel, done := serveWith(t, io.Discard, upstream.URL, "alpha;tokens=6;interval=50ms", "5s")
 		_, decoder := startStream(t, addr)
 		cancel()
 		if got := lastEvent(decoder); got != "[DONE]" {
@@ -260,7 +261,8 @@ func TestShutdown(t *testing.T) {
 		m := mock.New()
 		upstream := httptest.NewServer(m)
 		defer upstream.Close()
-		addr, cancel, done := serveWith(t, upstream.URL, "stuck;tokens=64;interval=1s", "200ms")
+		var logs syncWriter
+		addr, cancel, done := serveWith(t, &logs, upstream.URL, "stuck;tokens=64;interval=1s", "200ms")
 		_, decoder := startStream(t, addr)
 
 		start := time.Now()
@@ -268,6 +270,10 @@ func TestShutdown(t *testing.T) {
 		waitForRun(t, done)
 		if got := time.Since(start); got > 5*time.Second {
 			t.Fatalf("shutdown took %v", got)
+		}
+		// The process may exit as soon as run returns, so the record must exist by now.
+		if !strings.Contains(logs.String(), `"msg":"upstream attempt"`) {
+			t.Fatalf("the ended stream's attempt was not recorded before exit:\n%s", logs.String())
 		}
 		if got := lastEvent(decoder); got == "[DONE]" {
 			t.Fatal("a stream ended by shutdown looks successful")
@@ -283,6 +289,24 @@ func TestShutdown(t *testing.T) {
 }
 
 func quoteYAML(s string) string { return "'" + s + "'" }
+
+// syncWriter is a log destination that can be read while handlers still write.
+type syncWriter struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (w *syncWriter) Write(p []byte) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.buf.Write(p)
+}
+
+func (w *syncWriter) String() string {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.buf.String()
+}
 
 func TestServeLogsThatBudgetsAreNotEnforced(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
