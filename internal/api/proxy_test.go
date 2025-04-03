@@ -591,6 +591,7 @@ func TestFailuresBeforeCommitAreOrdinaryHTTPErrors(t *testing.T) {
 		{"server error", "a;fail=status;status=500", 502, "upstream_error", "upstream_failed", provider.KindServer, provider.DeliveryConfirmed},
 		{"provider rejected the credential", "a;fail=status;status=401", 502, "upstream_error", "upstream_misconfigured", provider.KindAuth, provider.DeliveryConfirmed},
 		{"provider has no such model", "a;fail=status;status=404", 502, "upstream_error", "upstream_misconfigured", provider.KindNotFound, provider.DeliveryConfirmed},
+		{"provider account has a billing problem", "a;fail=status;status=402", 502, "upstream_error", "upstream_account_limit", provider.KindBilling, provider.DeliveryConfirmed},
 		{"provider rejected the request", "a;fail=status;status=400", 400, "invalid_request_error", "upstream_rejected", provider.KindInvalidRequest, provider.DeliveryConfirmed},
 		{"provider reported a timeout", "a;fail=status;status=408", 504, "upstream_error", "upstream_timeout", provider.KindTimeout, provider.DeliveryConfirmed},
 		{"connection dropped", "a;fail=drop_before_headers", 502, "upstream_error", "upstream_failed", provider.KindConnection, provider.DeliveryUncertain},
@@ -1092,6 +1093,80 @@ func TestSlowRequestBodyIsCutOff(t *testing.T) {
 	}
 }
 
+// A request rejected without reading its body must not wait for that body, because
+// net/http drains an unread body before replying. Without this, any caller could
+// hold a connection and a goroutine open without authenticating.
+func TestRejectionsDoNotWaitForAnUnreadBody(t *testing.T) {
+	tests := []struct {
+		name, method, path, auth string
+		status                   int
+	}{
+		{"no credential", http.MethodPost, "/v1/chat/completions", "", 401},
+		{"wrong credential", http.MethodPost, "/v1/chat/completions", "Authorization: Bearer wrong\r\n", 401},
+		{"wrong method", http.MethodPut, "/v1/chat/completions", "", 405},
+		{"unknown path", http.MethodPost, "/nope", "", 404},
+		{"health check", http.MethodGet, "/healthz", "", 200},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			g := newGateway(t, "alpha", func(o *Options) { o.Limits.BodyReadTimeout = 200 * time.Millisecond })
+			conn, err := net.Dial("tcp", strings.TrimPrefix(g.url, "http://"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = conn.Close() }()
+			if _, err := fmt.Fprintf(conn, "%s %s HTTP/1.1\r\nHost: test\r\n%sContent-Length: 1000\r\n\r\n", tt.method, tt.path, tt.auth); err != nil {
+				t.Fatal(err)
+			}
+			if err := conn.SetReadDeadline(time.Now().Add(3 * time.Second)); err != nil {
+				t.Fatal(err)
+			}
+			reader := bufio.NewReader(conn)
+			resp, err := http.ReadResponse(reader, nil)
+			if err != nil {
+				t.Fatalf("no response while the body is outstanding: %v", err)
+			}
+			defer func() { _ = resp.Body.Close() }()
+			if resp.StatusCode != tt.status {
+				t.Fatalf("status = %d, want %d", resp.StatusCode, tt.status)
+			}
+			if _, err := io.Copy(io.Discard, resp.Body); err != nil {
+				t.Fatal(err)
+			}
+			// The server must also release the connection on its own, while this client
+			// keeps it open and never sends the body.
+			if _, err := reader.ReadByte(); !errors.Is(err, io.EOF) {
+				t.Fatalf("connection not released: read returned %v", err)
+			}
+		})
+	}
+
+	t.Run("a client that did send its body still gets a clean rejection", func(t *testing.T) {
+		g := newGateway(t, "alpha")
+		req, err := http.NewRequest(http.MethodPost, g.url+"/v1/chat/completions", strings.NewReader(chatBody(false, "")))
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp, err := g.client.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = resp.Body.Close() }()
+		expectError(t, resp, 401, "authentication_error", "invalid_api_key")
+	})
+	t.Run("requests without a body keep their connection", func(t *testing.T) {
+		g := newGateway(t, "alpha")
+		resp, err := g.client.Get(g.url + "/healthz")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = resp.Body.Close() }()
+		if resp.Close {
+			t.Fatal("the connection was closed for a request with no body")
+		}
+	})
+}
+
 // Both timers start around the same moment, so the response to a stalled body must
 // not need the write deadline set when the request arrived.
 func TestSlowRequestBodyGetsAResponseWhenBothTimeoutsExpire(t *testing.T) {
@@ -1153,6 +1228,7 @@ func TestStreamFramingFromUpstreamDoesNotChangeOutput(t *testing.T) {
 type fakeProvider struct {
 	completion *chat.Completion
 	events     []chat.StreamEvent
+	streamErr  error // ends the stream after events, instead of io.EOF
 }
 
 func (f *fakeProvider) Complete(context.Context, *chat.Request, string) (*chat.Completion, error) {
@@ -1160,15 +1236,19 @@ func (f *fakeProvider) Complete(context.Context, *chat.Request, string) (*chat.C
 }
 
 func (f *fakeProvider) Stream(context.Context, *chat.Request, string) (provider.Stream, error) {
-	return &fakeStream{events: f.events}, nil
+	return &fakeStream{events: f.events, err: f.streamErr}, nil
 }
 
 type fakeStream struct {
 	events []chat.StreamEvent
+	err    error
 }
 
 func (s *fakeStream) Next() (chat.StreamEvent, error) {
 	if len(s.events) == 0 {
+		if s.err != nil {
+			return chat.StreamEvent{}, s.err
+		}
 		return chat.StreamEvent{}, io.EOF
 	}
 	ev := s.events[0]
@@ -1298,6 +1378,208 @@ func TestResponseEncoding(t *testing.T) {
 			t.Fatalf("attempt usage = %+v", a.Usage)
 		}
 	})
+}
+
+// usageServer streams chunks that carry usage but no output, as servers with
+// continuous usage reporting do. The optional first chunk comes before them.
+func usageServer(t *testing.T, first string) string {
+	t.Helper()
+	const usageChunk = `{"choices":[{"index":0,"delta":{"role":"assistant"}}],"usage":{"prompt_tokens":1,"completion_tokens":0,"total_tokens":1}}`
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		if first != "" {
+			_, _ = io.WriteString(w, "data: "+first+"\n\n")
+		}
+		for {
+			_, _ = io.WriteString(w, "data: "+usageChunk+"\n\n")
+			_ = http.NewResponseController(w).Flush()
+			select {
+			case <-r.Context().Done():
+				return
+			case <-time.After(10 * time.Millisecond):
+			}
+		}
+	}))
+	t.Cleanup(ts.Close)
+	return ts.URL
+}
+
+func TestUsageReportsAreNotOutput(t *testing.T) {
+	usage := &chat.Usage{State: chat.UsageReported, PromptTokens: 1, TotalTokens: 1}
+	shortTimers := func(o *Options) {
+		o.Limits.FirstEventTimeout = 200 * time.Millisecond
+		o.Limits.StreamIdleTimeout = 200 * time.Millisecond
+	}
+	gatewayFor := func(t *testing.T, url string) *gateway {
+		t.Helper()
+		adapter, err := openai.New(openai.Options{BaseURL: url, APIKey: "k", MaxResponseBytes: 1 << 16, MaxEventBytes: 1 << 16})
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(adapter.CloseIdleConnections)
+		return startGateway(t, adapter, "m", nil, shortTimers)
+	}
+
+	t.Run("a report before any output doesn't commit the response", func(t *testing.T) {
+		g := startGateway(t, &fakeProvider{
+			events:    []chat.StreamEvent{{Usage: usage}},
+			streamErr: &provider.Error{Kind: provider.KindServer, Delivery: provider.DeliveryConfirmed},
+		}, "m", nil)
+		expectError(t, g.post(t, chatBody(true, "")), 502, "upstream_error", "upstream_failed")
+		a := g.recorder.wait(t)
+		if a.Committed || a.Outcome != accounting.OutcomeFailed {
+			t.Fatalf("attempt = %+v", a)
+		}
+		if a.Usage == nil {
+			t.Fatal("the usage report was lost")
+		}
+	})
+	t.Run("reports alone don't keep the first-event window open", func(t *testing.T) {
+		g := gatewayFor(t, usageServer(t, ""))
+		expectError(t, g.post(t, chatBody(true, "")), 504, "upstream_error", "upstream_timeout")
+		if a := g.recorder.wait(t); a.Committed || a.Usage == nil {
+			t.Fatalf("attempt = %+v", a)
+		}
+	})
+	t.Run("reports alone don't keep a stalled stream alive", func(t *testing.T) {
+		g := gatewayFor(t, usageServer(t, `{"choices":[{"index":0,"delta":{"content":"a"}}]}`))
+		start := time.Now()
+		s := readStream(t, g.post(t, chatBody(true, "")).Body)
+		if s.done || s.err == nil {
+			t.Fatalf("stream = %+v", s)
+		}
+		if got := time.Since(start); got > 5*time.Second {
+			t.Fatalf("the stall was detected after %v", got)
+		}
+		if a := g.recorder.wait(t); a.ErrorKind != provider.KindTimeout || a.Usage == nil {
+			t.Fatalf("attempt = %+v", a)
+		}
+	})
+}
+
+// blockingProvider holds a request until released.
+type blockingProvider struct {
+	fakeProvider
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (p *blockingProvider) Complete(context.Context, *chat.Request, string) (*chat.Completion, error) {
+	close(p.entered)
+	<-p.release
+	return &chat.Completion{Content: "a", FinishReason: chat.FinishStop}, nil
+}
+
+// http.Server.Close doesn't wait for handlers, and each handler records its attempt
+// as it finishes, so shutdown needs this to avoid exiting before the record is made.
+func TestWaitForRequests(t *testing.T) {
+	rec := &attemptRecorder{attempts: make(chan recordedAttempt, 1)}
+	p := &blockingProvider{entered: make(chan struct{}), release: make(chan struct{})}
+	server := New(Options{
+		Auth:     auth.NewDevKey(testAPIKey),
+		Recorder: rec,
+		Limits:   testLimits(),
+		Routes: routing.NewTable([]routing.Alias{{
+			Name:            "fast",
+			MaxOutputTokens: 100,
+			Routes:          []routing.Route{{ProviderName: "fake", Provider: p, Model: "m"}},
+		}}),
+	})
+	ts := httptest.NewServer(server)
+	defer ts.Close()
+	client := &http.Client{Transport: &http.Transport{}}
+	defer client.CloseIdleConnections()
+
+	idle, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := server.WaitForRequests(idle); err != nil {
+		t.Fatalf("waiting with nothing in flight: %v", err)
+	}
+
+	finished := make(chan struct{})
+	go func() {
+		defer close(finished)
+		req, err := http.NewRequest(http.MethodPost, ts.URL+"/v1/chat/completions", strings.NewReader(chatBody(false, "")))
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		req.Header.Set("Authorization", "Bearer "+testAPIKey)
+		resp, err := client.Do(req)
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		_ = resp.Body.Close()
+	}()
+	<-p.entered
+
+	short, cancelShort := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancelShort()
+	if err := server.WaitForRequests(short); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("waiting with a request in flight: %v", err)
+	}
+
+	close(p.release)
+	long, cancelLong := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancelLong()
+	if err := server.WaitForRequests(long); err != nil {
+		t.Fatalf("waiting after the request was released: %v", err)
+	}
+	select {
+	case a := <-rec.attempts:
+		if a.Outcome != accounting.OutcomeCompleted {
+			t.Fatalf("attempt = %+v", a)
+		}
+	default:
+		t.Fatal("the wait ended before the attempt was recorded")
+	}
+	<-finished
+}
+
+// brokenWriter fails every write, the way a connection does once a client has gone.
+type brokenWriter struct {
+	header http.Header
+}
+
+func (w *brokenWriter) Header() http.Header { return w.header }
+
+func (w *brokenWriter) WriteHeader(int) {}
+
+func (w *brokenWriter) Write([]byte) (int, error) { return 0, errors.New("broken pipe") }
+
+// What the upstream sent cost money whether or not the client received it.
+func TestAccountingCountsTheFirstEventWhenItCannotBeDelivered(t *testing.T) {
+	rec := &attemptRecorder{attempts: make(chan recordedAttempt, 1)}
+	fake := &fakeProvider{events: []chat.StreamEvent{{
+		Content: "hello",
+		Usage:   &chat.Usage{State: chat.UsageReported, PromptTokens: 1, CompletionTokens: 1, TotalTokens: 2},
+	}}}
+	server := New(Options{
+		Auth:     auth.NewDevKey(testAPIKey),
+		Recorder: rec,
+		Limits:   testLimits(),
+		Routes: routing.NewTable([]routing.Alias{{
+			Name:            "fast",
+			MaxOutputTokens: 100,
+			Routes:          []routing.Route{{ProviderName: "fake", Provider: fake, Model: "m"}},
+		}}),
+	})
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(chatBody(true, "")))
+	req.Header.Set("Authorization", "Bearer "+testAPIKey)
+	server.ServeHTTP(&brokenWriter{header: http.Header{}}, req)
+
+	a := rec.wait(t)
+	if !a.Committed || a.Outcome != accounting.OutcomeClientCanceled {
+		t.Fatalf("attempt = %+v", a)
+	}
+	if a.TextEvents != 1 || a.OutputBytes != 5 {
+		t.Fatalf("output = %d events, %d bytes: the undelivered event wasn't counted", a.TextEvents, a.OutputBytes)
+	}
+	if a.Usage == nil || a.Usage.TotalTokens != 2 {
+		t.Fatalf("usage = %+v", a.Usage)
+	}
 }
 
 type syncBuffer struct {
