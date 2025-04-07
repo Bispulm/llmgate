@@ -2,6 +2,7 @@ package mock
 
 import (
 	"encoding/json"
+	"maps"
 	"net/http"
 	"strings"
 )
@@ -111,43 +112,61 @@ func (anthropicWire) writeError(w http.ResponseWriter, e *apiError) {
 }
 
 func anthropicStopReason(resp response) string {
+	if resp.scenario.finish != "" {
+		return resp.scenario.finish
+	}
 	if resp.limited {
 		return "max_tokens"
 	}
 	return "end_turn"
 }
 
+// anthropicInputUsage reports input as Anthropic does: input_tokens excludes
+// whatever came from or went to the cache.
+func anthropicInputUsage(resp response) map[string]any {
+	sc := resp.scenario
+	usage := map[string]any{"input_tokens": resp.promptTokens}
+	if sc.cacheRead > 0 {
+		usage["cache_read_input_tokens"] = sc.cacheRead
+	}
+	if sc.cacheWrite > 0 {
+		usage["cache_creation_input_tokens"] = sc.cacheWrite
+	}
+	return usage
+}
+
+func anthropicOutputUsage(resp response) map[string]any {
+	usage := map[string]any{"output_tokens": resp.outputTokens()}
+	if resp.thinking > 0 {
+		usage["output_tokens_details"] = map[string]any{"thinking_tokens": resp.thinking}
+	}
+	return usage
+}
+
 func (anthropicWire) completion(resp response) []byte {
-	type textBlock struct {
-		Type string `json:"type"`
-		Text string `json:"text"`
+	content := []map[string]any{}
+	if resp.thinking > 0 {
+		content = append(content, map[string]any{"type": "thinking", "thinking": "", "signature": "mocksignature"})
 	}
-	type usage struct {
-		Input  int `json:"input_tokens"`
-		Output int `json:"output_tokens"`
+	if resp.tokens > 0 {
+		content = append(content, map[string]any{"type": "text", "text": resp.text()})
 	}
-	out := struct {
-		ID           string      `json:"id"`
-		Type         string      `json:"type"`
-		Role         string      `json:"role"`
-		Content      []textBlock `json:"content"`
-		Model        string      `json:"model"`
-		StopReason   string      `json:"stop_reason"`
-		StopSequence *string     `json:"stop_sequence"`
-		Usage        *usage      `json:"usage,omitempty"`
-	}{
-		ID:         "msg_mock_" + resp.scenario.label,
-		Type:       "message",
-		Role:       "assistant",
-		Content:    []textBlock{{Type: "text", Text: resp.text()}},
-		Model:      resp.scenario.label,
-		StopReason: anthropicStopReason(resp),
+	out := map[string]any{
+		"id":            "msg_mock_" + resp.scenario.label,
+		"type":          "message",
+		"role":          "assistant",
+		"content":       content,
+		"model":         resp.scenario.label,
+		"stop_reason":   anthropicStopReason(resp),
+		"stop_sequence": nil,
 	}
 	switch resp.scenario.usage {
 	case usageReported:
-		out.Usage = &usage{resp.promptTokens, resp.tokens}
+		usage := anthropicInputUsage(resp)
+		maps.Copy(usage, anthropicOutputUsage(resp))
+		out["usage"] = usage
 	case usageInconsistent:
-		out.Usage = &usage{-1, resp.tokens}
+		out["usage"] = map[string]any{"input_tokens": -1, "output_tokens": resp.outputTokens()}
 	}
 	return mustMarshal(out)
 }
@@ -169,49 +188,88 @@ func (a anthropicWire) stream(resp response) streamParts {
 		"stop_reason":   nil,
 		"stop_sequence": nil,
 	}
-	finalUsage := map[string]any{"output_tokens": resp.tokens}
 	switch sc.usage {
 	case usageReported:
-		message["usage"] = map[string]any{"input_tokens": resp.promptTokens, "output_tokens": 1}
+		usage := anthropicInputUsage(resp)
+		usage["output_tokens"] = 1
+		message["usage"] = usage
 	case usageInconsistent:
 		// Usage in message_delta is cumulative, so counts must never fall.
-		message["usage"] = map[string]any{"input_tokens": resp.promptTokens, "output_tokens": resp.tokens + 5}
+		usage := anthropicInputUsage(resp)
+		usage["output_tokens"] = resp.outputTokens() + 5
+		message["usage"] = usage
+	}
+
+	prelude := [][]byte{a.event(sc, "message_start", map[string]any{"message": message})}
+	if sc.unknownEvents {
+		prelude = append(prelude, a.event(sc, "future_event", map[string]any{"detail": "ignore me"}))
+	}
+
+	ping := a.event(sc, "ping", map[string]any{})
+	pinged := false
+	textIndex := 0
+	if resp.thinking > 0 {
+		prelude = append(prelude, a.event(sc, "content_block_start", map[string]any{
+			"index":         0,
+			"content_block": map[string]any{"type": "thinking", "thinking": "", "signature": ""},
+		}), ping)
+		pinged = true
+		for range resp.thinking {
+			prelude = append(prelude, a.event(sc, "content_block_delta", map[string]any{
+				"index": 0,
+				"delta": map[string]any{"type": "thinking_delta", "thinking": ""},
+			}))
+		}
+		prelude = append(prelude,
+			a.event(sc, "content_block_delta", map[string]any{
+				"index": 0,
+				"delta": map[string]any{"type": "signature_delta", "signature": "mocksignature"},
+			}),
+			a.event(sc, "content_block_stop", map[string]any{"index": 0}),
+		)
+		textIndex = 1
+	}
+	if resp.tokens > 0 {
+		prelude = append(prelude, a.event(sc, "content_block_start", map[string]any{
+			"index":         textIndex,
+			"content_block": map[string]any{"type": "text", "text": ""},
+		}))
+	}
+	if !pinged {
+		prelude = append(prelude, ping)
 	}
 
 	parts := streamParts{
-		prelude: [][]byte{
-			a.event(sc, "message_start", map[string]any{"message": message}),
-			a.event(sc, "content_block_start", map[string]any{
-				"index":         0,
-				"content_block": map[string]any{"type": "text", "text": ""},
-			}),
-			a.event(sc, "ping", map[string]any{}),
-		},
-		textFrame: func(i int) []byte { return a.textDelta(sc, sc.delta(i)) },
+		prelude:   prelude,
+		textFrame: func(i int) []byte { return a.textDelta(sc, textIndex, sc.delta(i)) },
 	}
 
 	delta := map[string]any{"delta": map[string]any{"stop_reason": anthropicStopReason(resp), "stop_sequence": nil}}
 	if sc.usage != usageNone {
-		delta["usage"] = finalUsage
+		delta["usage"] = anthropicOutputUsage(resp)
 	}
-	parts.epilogue = [][]byte{
-		a.event(sc, "content_block_stop", map[string]any{"index": 0}),
-		a.event(sc, "message_delta", delta),
+	if resp.tokens > 0 {
+		parts.epilogue = append(parts.epilogue, a.event(sc, "content_block_stop", map[string]any{"index": textIndex}))
 	}
+	parts.epilogue = append(parts.epilogue, a.event(sc, "message_delta", delta))
 	parts.terminator = [][]byte{a.event(sc, "message_stop", map[string]any{})}
 	return parts
 }
 
-func (a anthropicWire) textDelta(sc scenario, text string) []byte {
+func (a anthropicWire) textDelta(sc scenario, index int, text string) []byte {
 	return a.event(sc, "content_block_delta", map[string]any{
-		"index": 0,
+		"index": index,
 		"delta": map[string]any{"type": "text_delta", "text": text},
 	})
 }
 
 func (a anthropicWire) streamErrorFrame(sc scenario) []byte {
+	errType := sc.errorType
+	if errType == "" {
+		errType = "overloaded_error"
+	}
 	return a.event(sc, "error", map[string]any{
-		"error": map[string]any{"type": "overloaded_error", "message": "Overloaded"},
+		"error": map[string]any{"type": errType, "message": "mock stream failure"},
 	})
 }
 
@@ -220,5 +278,5 @@ func (anthropicWire) malformedFrame(sc scenario) []byte {
 }
 
 func (a anthropicWire) oversizedFrame(sc scenario) []byte {
-	return a.textDelta(sc, strings.Repeat("x", sc.size))
+	return a.textDelta(sc, 0, strings.Repeat("x", sc.size))
 }
