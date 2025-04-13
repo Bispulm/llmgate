@@ -79,6 +79,11 @@ func New(opts Options) (*Provider, error) {
 	}, nil
 }
 
+// Capabilities implements provider.Provider.
+func (p *Provider) Capabilities() provider.Capabilities {
+	return provider.Capabilities{Sampling: true}
+}
+
 // CloseIdleConnections releases idle upstream connections.
 func (p *Provider) CloseIdleConnections() { p.client.CloseIdleConnections() }
 
