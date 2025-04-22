@@ -193,10 +193,25 @@ The gateway does not forward provider error messages, which can contain account 
 |---|---|---|
 | `temperature`, `top_p` | Yes | **No.** The API returns 400 on every model. |
 | `stop` | Yes | Yes, as `stop_sequences` |
-| `system` and `developer` roles | Yes, unchanged | Combined into the top-level `system` field |
+| `system` and `developer` roles | Yes, unchanged | Combined in order into the top-level `system` field, separated by a blank line |
 | Explicit output limit | Yes | Yes, and required |
 
-Routing will skip any route that can't satisfy the request (M2). A request with `temperature` set can't fall back to an Anthropic route, so it fails if no capable route is healthy. The alternative, dropping the parameter and returning a successful response, is what this contract exists to prevent.
+A request with `temperature` set can't be served by an Anthropic route. The alternative, dropping the parameter and returning a successful response, is what this contract exists to prevent.
+
+## How Anthropic responses map onto the contract
+
+| Anthropic | Client sees |
+|---|---|
+| `end_turn`, `stop_sequence` | `finish_reason: "stop"` |
+| `max_tokens`, `model_context_window_exceeded` | `finish_reason: "length"` |
+| `refusal` | `finish_reason: "content_filter"`, possibly with no content |
+| `tool_use`, `pause_turn`, anything unknown | The attempt fails as a protocol error |
+| Thinking blocks | Nothing, but they count in `completion_tokens` and in `completion_tokens_details.reasoning_tokens` |
+| `input_tokens` + `cache_read_input_tokens` + `cache_creation_input_tokens` | `prompt_tokens`, with the cache parts in `prompt_tokens_details` |
+
+Thinking counts against the output limit on models that use it, so a small limit can produce `finish_reason: "length"` with little or no text. Models differ in whether thinking is on by default, and the gateway doesn't change that default.
+
+Anthropic reports some account problems in ways the gateway can't separate from ordinary failures. A tier spend cap arrives as a 429 and a workspace spend limit as a 400, so those surface as `upstream_rate_limited` and `upstream_rejected`.
 
 ## Implementation status
 
@@ -204,7 +219,7 @@ Routing will skip any route that can't satisfy the request (M2). A request with 
 |---|---|
 | Request validation | Implemented |
 | OpenAI-compatible adapter, streaming and non-streaming | Implemented, tested against the local mock only |
-| Anthropic adapter | Not implemented (M2) |
+| Anthropic adapter, streaming and non-streaming | Implemented, tested against the local mock only |
 | Capability filtering and fallback | Not implemented (M2) |
 
 No test in this repository has been run against a live provider. Tests use the local mock and synthetic fixtures.

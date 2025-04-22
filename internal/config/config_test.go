@@ -77,7 +77,6 @@ func TestLoadRejectsInvalidConfig(t *testing.T) {
 		{"unsupported scheme", "base_url: http://127.0.0.1:18301/v1", "base_url: ftp://example.com", "base_url"},
 		{"plaintext to a remote host", "base_url: http://127.0.0.1:18301/v1", "base_url: http://api.example.com/v1", "https"},
 		{"unknown provider type", "type: openai-compatible", "type: nonsense", "type"},
-		{"provider type not built yet", "type: openai-compatible", "type: anthropic", "not implemented"},
 		{"no api key env", "api_key_env: PRIMARY_KEY", "api_key_env: ''", "api_key_env"},
 		{"bad max_tokens_param", "api_key_env: PRIMARY_KEY", "api_key_env: PRIMARY_KEY\n    max_tokens_param: nope", "max_tokens_param"},
 		{"route to unknown provider", "provider: primary", "provider: missing", "missing"},
@@ -141,6 +140,17 @@ func TestLoadAcceptsLoopbackListeners(t *testing.T) {
 }
 
 func quoteYAML(s string) string { return "'" + s + "'" }
+
+func TestLoadAcceptsAnAnthropicProvider(t *testing.T) {
+	content := strings.Replace(validYAML, "type: openai-compatible", "type: anthropic", 1)
+	cfg, err := Load(writeConfig(t, content))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Providers[0].Type != ProviderAnthropic {
+		t.Fatalf("type = %q", cfg.Providers[0].Type)
+	}
+}
 
 func TestLoadAcceptsHTTPSToRemoteHosts(t *testing.T) {
 	content := strings.Replace(validYAML, "http://127.0.0.1:18301/v1", "https://api.example.com/v1", 1)

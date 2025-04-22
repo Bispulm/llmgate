@@ -271,9 +271,7 @@ func (l Limits) validate() error {
 
 func (p Provider) validate() error {
 	switch p.Type {
-	case ProviderOpenAICompatible:
-	case ProviderAnthropic:
-		return errors.New("type anthropic is not implemented yet")
+	case ProviderOpenAICompatible, ProviderAnthropic:
 	default:
 		return fmt.Errorf("unknown type %q", p.Type)
 	}
