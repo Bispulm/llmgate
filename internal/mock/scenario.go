@@ -60,6 +60,15 @@ type scenario struct {
 	pad    int // extra bytes added to each text event
 	size   int // size of an oversized event
 
+	thinking   int    // thinking tokens generated before the text
+	finish     string // raw finish or stop reason, overriding the normal one
+	cacheRead  int    // prompt tokens served from the provider's cache
+	cacheWrite int    // prompt tokens written to the provider's cache
+	failFirst  int    // apply fail only to this many requests for this scenario
+	errorType  string // error type in a stream_error event
+
+	unknownEvents bool // add an event type the client has never seen
+
 	chunk     int    // write size in bytes, each write flushed; 0 writes whole events
 	usage     string // usageReported, usageNone, or usageInconsistent
 	noEnd     bool   // omit [DONE] or message_stop
@@ -93,6 +102,9 @@ func parseScenario(model string) (scenario, error) {
 	}
 	if sc.fail == failStatus && (sc.status < 400 || sc.status > 599) {
 		return sc, fmt.Errorf("fail=status needs a status from 400 to 599")
+	}
+	if sc.failFirst > 0 && sc.fail == "" {
+		return sc, fmt.Errorf("fail_first needs a fail option")
 	}
 	return sc, nil
 }
@@ -155,6 +167,20 @@ func (sc *scenario) set(key, value string) error {
 		default:
 			return fmt.Errorf("unknown line ending %q", value)
 		}
+	case "thinking":
+		sc.thinking, err = parseCount(value)
+	case "finish":
+		sc.finish = value
+	case "cache_read":
+		sc.cacheRead, err = parseCount(value)
+	case "cache_write":
+		sc.cacheWrite, err = parseCount(value)
+	case "fail_first":
+		sc.failFirst, err = parseCount(value)
+	case "error_type":
+		sc.errorType = value
+	case "unknown_events":
+		sc.unknownEvents, err = strconv.ParseBool(value)
 	case "comments":
 		sc.comments, err = strconv.ParseBool(value)
 	case "multiline":

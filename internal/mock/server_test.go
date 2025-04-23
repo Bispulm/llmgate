@@ -993,3 +993,271 @@ func TestSlowConsumerStallsWrites(t *testing.T) {
 	cancel()
 	waitForStats(t, h.server, "slow", func(s LabelStats) bool { return s.Canceled == 1 })
 }
+
+func TestThinkingScenario(t *testing.T) {
+	h := newHarness(t)
+
+	t.Run("anthropic streams a thinking block before the text", func(t *testing.T) {
+		resp := h.post(t, anthropicPath, anthropicBody("alpha;tokens=2;thinking=3", true, ""), nil)
+		events, err := readEvents(t, resp.Body)
+		if !errors.Is(err, io.EOF) {
+			t.Fatalf("stream end: %v", err)
+		}
+		var names []string
+		for _, ev := range events {
+			names = append(names, ev.name)
+		}
+		want := []string{
+			"message_start",
+			"content_block_start", "ping",
+			"content_block_delta", "content_block_delta", "content_block_delta", "content_block_delta",
+			"content_block_stop",
+			"content_block_start", "content_block_delta", "content_block_delta", "content_block_stop",
+			"message_delta", "message_stop",
+		}
+		if !slices.Equal(names, want) {
+			t.Fatalf("events = %v\nwant %v", names, want)
+		}
+		if !strings.Contains(events[1].data, `"type":"thinking"`) || !strings.Contains(events[3].data, `"thinking_delta"`) || !strings.Contains(events[6].data, `"signature_delta"`) {
+			t.Fatalf("thinking block: %q, %q, %q", events[1].data, events[3].data, events[6].data)
+		}
+		if !strings.Contains(events[9].data, `"index":1`) {
+			t.Fatalf("text block index: %q", events[9].data)
+		}
+		var delta struct {
+			Usage struct {
+				Output  int64 `json:"output_tokens"`
+				Details struct {
+					Thinking int64 `json:"thinking_tokens"`
+				} `json:"output_tokens_details"`
+			} `json:"usage"`
+		}
+		if err := json.Unmarshal([]byte(events[12].data), &delta); err != nil {
+			t.Fatal(err)
+		}
+		if delta.Usage.Output != 5 || delta.Usage.Details.Thinking != 3 {
+			t.Fatalf("usage = %+v: output tokens include thinking", delta.Usage)
+		}
+	})
+	t.Run("anthropic non-streaming has a thinking block", func(t *testing.T) {
+		resp := h.post(t, anthropicPath, anthropicBody("alpha;tokens=2;thinking=3", false, ""), nil)
+		var got struct {
+			Content []struct {
+				Type string `json:"type"`
+			} `json:"content"`
+			Usage struct {
+				Output int64 `json:"output_tokens"`
+			} `json:"usage"`
+		}
+		if err := json.NewDecoder(resp.Body).Decode(&got); err != nil {
+			t.Fatal(err)
+		}
+		if len(got.Content) != 2 || got.Content[0].Type != "thinking" || got.Content[1].Type != "text" || got.Usage.Output != 5 {
+			t.Fatalf("response = %+v", got)
+		}
+	})
+	t.Run("thinking uses up the output limit", func(t *testing.T) {
+		resp := h.post(t, anthropicPath, `{"model":"alpha;tokens=5;thinking=3","max_tokens":4,"messages":[{"role":"user","content":"x"}]}`, nil)
+		var got struct {
+			StopReason string `json:"stop_reason"`
+			Usage      struct {
+				Output int64 `json:"output_tokens"`
+			} `json:"usage"`
+		}
+		if err := json.NewDecoder(resp.Body).Decode(&got); err != nil {
+			t.Fatal(err)
+		}
+		if got.StopReason != "max_tokens" || got.Usage.Output != 4 {
+			t.Fatalf("response = %+v", got)
+		}
+	})
+	t.Run("openai reports it as reasoning tokens", func(t *testing.T) {
+		resp := h.post(t, openAIPath, openAIBody("alpha;tokens=2;thinking=3", false, ""), nil)
+		var got struct {
+			Usage struct {
+				Completion int64 `json:"completion_tokens"`
+				Details    struct {
+					Reasoning int64 `json:"reasoning_tokens"`
+				} `json:"completion_tokens_details"`
+			} `json:"usage"`
+		}
+		if err := json.NewDecoder(resp.Body).Decode(&got); err != nil {
+			t.Fatal(err)
+		}
+		if got.Usage.Completion != 5 || got.Usage.Details.Reasoning != 3 {
+			t.Fatalf("usage = %+v", got.Usage)
+		}
+	})
+}
+
+func TestFinishScenario(t *testing.T) {
+	h := newHarness(t)
+
+	t.Run("anthropic refusal has no content", func(t *testing.T) {
+		resp := h.post(t, anthropicPath, anthropicBody("alpha;tokens=0;finish=refusal", false, ""), nil)
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("status = %d", resp.StatusCode)
+		}
+		var got struct {
+			Content    []json.RawMessage `json:"content"`
+			StopReason string            `json:"stop_reason"`
+			Usage      struct {
+				Output *int64 `json:"output_tokens"`
+			} `json:"usage"`
+		}
+		if err := json.NewDecoder(resp.Body).Decode(&got); err != nil {
+			t.Fatal(err)
+		}
+		if len(got.Content) != 0 || got.StopReason != "refusal" || *got.Usage.Output != 0 {
+			t.Fatalf("response = %+v", got)
+		}
+	})
+	t.Run("anthropic streamed stop with no content has no text block", func(t *testing.T) {
+		resp := h.post(t, anthropicPath, anthropicBody("alpha;tokens=0;finish=refusal", true, ""), nil)
+		events, err := readEvents(t, resp.Body)
+		if !errors.Is(err, io.EOF) {
+			t.Fatalf("stream end: %v", err)
+		}
+		for _, ev := range events {
+			if ev.name == "content_block_start" {
+				t.Fatalf("unexpected block: %s", ev.data)
+			}
+		}
+		if !strings.Contains(events[len(events)-2].data, `"stop_reason":"refusal"`) {
+			t.Fatalf("events = %+v", events)
+		}
+	})
+	t.Run("openai uses the given finish reason", func(t *testing.T) {
+		resp := h.post(t, openAIPath, openAIBody("alpha;tokens=1;finish=content_filter", true, ""), nil)
+		events, err := readEvents(t, resp.Body)
+		if !errors.Is(err, io.EOF) {
+			t.Fatalf("stream end: %v", err)
+		}
+		_, chunks, _ := collectOpenAI(t, events)
+		last := chunks[len(chunks)-1]
+		if last.Choices[0].FinishReason == nil || *last.Choices[0].FinishReason != "content_filter" {
+			t.Fatalf("last chunk = %+v", last)
+		}
+	})
+}
+
+func TestCacheUsageScenario(t *testing.T) {
+	h := newHarness(t)
+
+	t.Run("anthropic keeps cache tokens out of input_tokens", func(t *testing.T) {
+		plain := h.post(t, anthropicPath, anthropicBody("alpha", false, ""), nil)
+		var base struct {
+			Usage struct {
+				Input int64 `json:"input_tokens"`
+			} `json:"usage"`
+		}
+		if err := json.NewDecoder(plain.Body).Decode(&base); err != nil {
+			t.Fatal(err)
+		}
+
+		resp := h.post(t, anthropicPath, anthropicBody("alpha;cache_read=7;cache_write=2", false, ""), nil)
+		var got struct {
+			Usage struct {
+				Input int64 `json:"input_tokens"`
+				Read  int64 `json:"cache_read_input_tokens"`
+				Write int64 `json:"cache_creation_input_tokens"`
+			} `json:"usage"`
+		}
+		if err := json.NewDecoder(resp.Body).Decode(&got); err != nil {
+			t.Fatal(err)
+		}
+		if got.Usage.Input != base.Usage.Input || got.Usage.Read != 7 || got.Usage.Write != 2 {
+			t.Fatalf("usage = %+v, base input %d", got.Usage, base.Usage.Input)
+		}
+	})
+	t.Run("anthropic streams them in message_start", func(t *testing.T) {
+		resp := h.post(t, anthropicPath, anthropicBody("alpha;cache_read=7;cache_write=2", true, ""), nil)
+		events, err := readEvents(t, resp.Body)
+		if !errors.Is(err, io.EOF) {
+			t.Fatalf("stream end: %v", err)
+		}
+		if !strings.Contains(events[0].data, `"cache_read_input_tokens":7`) || !strings.Contains(events[0].data, `"cache_creation_input_tokens":2`) {
+			t.Fatalf("message_start = %s", events[0].data)
+		}
+	})
+	t.Run("openai includes them in prompt_tokens", func(t *testing.T) {
+		plain := h.post(t, openAIPath, openAIBody("alpha", false, ""), nil)
+		var base struct {
+			Usage struct {
+				Prompt int64 `json:"prompt_tokens"`
+			} `json:"usage"`
+		}
+		if err := json.NewDecoder(plain.Body).Decode(&base); err != nil {
+			t.Fatal(err)
+		}
+
+		resp := h.post(t, openAIPath, openAIBody("alpha;cache_read=7;cache_write=2", false, ""), nil)
+		var got struct {
+			Usage struct {
+				Prompt  int64 `json:"prompt_tokens"`
+				Details struct {
+					Cached int64 `json:"cached_tokens"`
+					Write  int64 `json:"cache_write_tokens"`
+				} `json:"prompt_tokens_details"`
+			} `json:"usage"`
+		}
+		if err := json.NewDecoder(resp.Body).Decode(&got); err != nil {
+			t.Fatal(err)
+		}
+		if got.Usage.Prompt != base.Usage.Prompt+9 || got.Usage.Details.Cached != 7 || got.Usage.Details.Write != 2 {
+			t.Fatalf("usage = %+v, base prompt %d", got.Usage, base.Usage.Prompt)
+		}
+	})
+}
+
+func TestFailFirstScenarioRecovers(t *testing.T) {
+	h := newHarness(t)
+	const model = "alpha;fail=status;status=500;fail_first=2"
+
+	for i, want := range []int{500, 500, 200, 200} {
+		resp := h.post(t, openAIPath, openAIBody(model, false, ""), nil)
+		if resp.StatusCode != want {
+			t.Fatalf("request %d: status = %d, want %d", i, resp.StatusCode, want)
+		}
+	}
+	t.Run("the count is per scenario", func(t *testing.T) {
+		resp := h.post(t, openAIPath, openAIBody("alpha;fail=status;status=500;fail_first=1;tokens=1", false, ""), nil)
+		if resp.StatusCode != 500 {
+			t.Fatalf("status = %d", resp.StatusCode)
+		}
+	})
+	t.Run("it requires a failure", func(t *testing.T) {
+		if resp := h.post(t, openAIPath, openAIBody("alpha;fail_first=1", false, ""), nil); resp.StatusCode != 400 {
+			t.Fatalf("status = %d", resp.StatusCode)
+		}
+	})
+}
+
+func TestStreamErrorTypeAndUnknownEvents(t *testing.T) {
+	h := newHarness(t)
+
+	t.Run("the error type can be chosen", func(t *testing.T) {
+		resp := h.post(t, anthropicPath, anthropicBody("alpha;fail=stream_error;after=1;error_type=rate_limit_error", true, ""), nil)
+		events, err := readEvents(t, resp.Body)
+		if !errors.Is(err, io.EOF) {
+			t.Fatalf("stream end: %v", err)
+		}
+		if last := events[len(events)-1]; !strings.Contains(last.data, "rate_limit_error") {
+			t.Fatalf("last event = %+v", last)
+		}
+	})
+	t.Run("unknown events can be added", func(t *testing.T) {
+		resp := h.post(t, anthropicPath, anthropicBody("alpha;unknown_events=true", true, ""), nil)
+		events, err := readEvents(t, resp.Body)
+		if !errors.Is(err, io.EOF) {
+			t.Fatalf("stream end: %v", err)
+		}
+		found := false
+		for _, ev := range events {
+			found = found || ev.name == "future_event"
+		}
+		if !found {
+			t.Fatalf("events = %+v", events)
+		}
+	})
+}

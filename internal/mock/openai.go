@@ -89,28 +89,52 @@ func (openAIWire) writeError(w http.ResponseWriter, e *apiError) {
 	_, _ = w.Write(mustMarshal(body))
 }
 
+type openAIPromptDetails struct {
+	CachedTokens     int `json:"cached_tokens"`
+	CacheWriteTokens int `json:"cache_write_tokens"`
+}
+
+type openAICompletionDetails struct {
+	ReasoningTokens int `json:"reasoning_tokens"`
+}
+
 type openAIUsage struct {
-	PromptTokens     int `json:"prompt_tokens"`
-	CompletionTokens int `json:"completion_tokens"`
-	TotalTokens      int `json:"total_tokens"`
+	PromptTokens      int                      `json:"prompt_tokens"`
+	CompletionTokens  int                      `json:"completion_tokens"`
+	TotalTokens       int                      `json:"total_tokens"`
+	PromptDetails     *openAIPromptDetails     `json:"prompt_tokens_details,omitempty"`
+	CompletionDetails *openAICompletionDetails `json:"completion_tokens_details,omitempty"`
 }
 
 func (openAIWire) usage(resp response) *openAIUsage {
-	if resp.scenario.usage == usageNone {
+	sc := resp.scenario
+	if sc.usage == usageNone {
 		return nil
 	}
+	// OpenAI's prompt_tokens includes cached tokens, and its completion_tokens
+	// includes reasoning.
+	prompt := resp.promptTokens + sc.cacheRead + sc.cacheWrite
 	u := openAIUsage{
-		PromptTokens:     resp.promptTokens,
-		CompletionTokens: resp.tokens,
-		TotalTokens:      resp.promptTokens + resp.tokens,
+		PromptTokens:     prompt,
+		CompletionTokens: resp.outputTokens(),
+		TotalTokens:      prompt + resp.outputTokens(),
 	}
-	if resp.scenario.usage == usageInconsistent {
+	if sc.cacheRead > 0 || sc.cacheWrite > 0 {
+		u.PromptDetails = &openAIPromptDetails{CachedTokens: sc.cacheRead, CacheWriteTokens: sc.cacheWrite}
+	}
+	if resp.thinking > 0 {
+		u.CompletionDetails = &openAICompletionDetails{ReasoningTokens: resp.thinking}
+	}
+	if sc.usage == usageInconsistent {
 		u.TotalTokens += 7
 	}
 	return &u
 }
 
 func openAIFinishReason(resp response) string {
+	if resp.scenario.finish != "" {
+		return resp.scenario.finish
+	}
 	if resp.limited {
 		return "length"
 	}
@@ -211,11 +235,15 @@ func (o openAIWire) stream(resp response) streamParts {
 }
 
 func (openAIWire) streamErrorFrame(sc scenario) []byte {
+	errType := sc.errorType
+	if errType == "" {
+		errType = "server_error"
+	}
 	return sc.frame("", mustMarshal(map[string]any{"error": map[string]any{
 		"message": "mock stream failure",
-		"type":    "server_error",
+		"type":    errType,
 		"param":   nil,
-		"code":    "server_error",
+		"code":    errType,
 	}}))
 }
 
