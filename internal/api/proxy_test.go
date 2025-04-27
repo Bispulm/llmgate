@@ -122,7 +122,7 @@ func startGateway(t *testing.T, p provider.Provider, model string, m *mock.Serve
 			Name:            "fast",
 			MaxOutputTokens: 100,
 			Routes:          []routing.Route{{ProviderName: "mock", Provider: p, Model: model}},
-		}}),
+		}}, routing.Options{}),
 	}
 	for _, f := range options {
 		f(&opts)
@@ -970,7 +970,7 @@ func routingWithLimit(table *routing.Table, limit int64) *routing.Table {
 	alias, _ := table.Resolve("fast")
 	updated := *alias
 	updated.MaxOutputTokens = limit
-	return routing.NewTable([]routing.Alias{updated})
+	return routing.NewTable([]routing.Alias{updated}, routing.Options{})
 }
 
 // The write timeout limits how long one write can block. It must never limit how
@@ -1521,7 +1521,7 @@ func TestWaitForRequests(t *testing.T) {
 			Name:            "fast",
 			MaxOutputTokens: 100,
 			Routes:          []routing.Route{{ProviderName: "fake", Provider: p, Model: "m"}},
-		}}),
+		}}, routing.Options{}),
 	})
 	ts := httptest.NewServer(server)
 	defer ts.Close()
@@ -1719,7 +1719,7 @@ func TestAccountingCountsTheFirstEventWhenItCannotBeDelivered(t *testing.T) {
 			Name:            "fast",
 			MaxOutputTokens: 100,
 			Routes:          []routing.Route{{ProviderName: "fake", Provider: fake, Model: "m"}},
-		}}),
+		}}, routing.Options{}),
 	})
 
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(chatBody(true, "")))
