@@ -20,6 +20,7 @@ import (
 	"github.com/Bispulm/llmgate/internal/auth"
 	"github.com/Bispulm/llmgate/internal/config"
 	"github.com/Bispulm/llmgate/internal/provider"
+	"github.com/Bispulm/llmgate/internal/provider/anthropic"
 	"github.com/Bispulm/llmgate/internal/provider/openai"
 	"github.com/Bispulm/llmgate/internal/routing"
 )
@@ -158,13 +159,7 @@ func serve(ctx context.Context, args []string, getenv func(string) string, stder
 func buildRoutes(cfg *config.Config, secrets *config.Secrets) (*routing.Table, error) {
 	providers := make(map[string]provider.Provider, len(cfg.Providers))
 	for _, p := range cfg.Providers {
-		adapter, err := openai.New(openai.Options{
-			BaseURL:          p.BaseURL,
-			APIKey:           secrets.ProviderKeys[p.Name],
-			UseMaxTokens:     p.MaxTokensParam == config.MaxTokens,
-			MaxResponseBytes: cfg.Limits.MaxResponseBytes,
-			MaxEventBytes:    cfg.Limits.MaxEventBytes,
-		})
+		adapter, err := newProvider(p, secrets.ProviderKeys[p.Name], cfg.Limits)
 		if err != nil {
 			return nil, fmt.Errorf("provider %q: %w", p.Name, err)
 		}
@@ -180,4 +175,24 @@ func buildRoutes(cfg *config.Config, secrets *config.Secrets) (*routing.Table, e
 		aliases[i] = routing.Alias{Name: m.Alias, MaxOutputTokens: m.MaxOutputTokens, Routes: routes}
 	}
 	return routing.NewTable(aliases), nil
+}
+
+func newProvider(p config.Provider, apiKey string, limits config.Limits) (provider.Provider, error) {
+	switch p.Type {
+	case config.ProviderAnthropic:
+		return anthropic.New(anthropic.Options{
+			BaseURL:          p.BaseURL,
+			APIKey:           apiKey,
+			MaxResponseBytes: limits.MaxResponseBytes,
+			MaxEventBytes:    limits.MaxEventBytes,
+		})
+	default:
+		return openai.New(openai.Options{
+			BaseURL:          p.BaseURL,
+			APIKey:           apiKey,
+			UseMaxTokens:     p.MaxTokensParam == config.MaxTokens,
+			MaxResponseBytes: limits.MaxResponseBytes,
+			MaxEventBytes:    limits.MaxEventBytes,
+		})
+	}
 }

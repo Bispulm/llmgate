@@ -15,6 +15,10 @@ import (
 // Provider performs one upstream attempt. It does not retry: deciding whether
 // another attempt is safe and affordable belongs to the caller.
 type Provider interface {
+	// Capabilities says which optional request features this provider can honor.
+	// A route that can't honor a request isn't used for it.
+	Capabilities() Capabilities
+
 	// Complete performs a non-streaming attempt. Failures are *Error.
 	Complete(ctx context.Context, req *chat.Request, model string) (*chat.Completion, error)
 
@@ -24,6 +28,12 @@ type Provider interface {
 	//
 	// The stream is bound to ctx. Canceling ctx cancels the upstream request.
 	Stream(ctx context.Context, req *chat.Request, model string) (Stream, error)
+}
+
+// Capabilities lists optional request features a provider can honor.
+type Capabilities struct {
+	// Sampling means temperature and top_p are accepted.
+	Sampling bool
 }
 
 // Stream is an in-progress streaming attempt. It must be closed, which cancels
