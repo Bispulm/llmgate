@@ -80,7 +80,12 @@ section "An unsupported field is rejected by name, and never reaches the provide
 ask demo-fast ',"tools":[]'
 status
 
-section "The provider fails before any content: an ordinary HTTP error"
+section "The first route fails before any content: the request falls back"
+ask demo-failover ',"stream":true'
+status
+grep -iE '^x-llmgate-(route|attempts)' "$WORK/headers" | tr -d '\r'
+
+section "Every route fails before any content: an ordinary HTTP error"
 ask demo-fails-before-content ',"stream":true'
 status
 

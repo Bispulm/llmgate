@@ -122,7 +122,7 @@ func startGateway(t *testing.T, p provider.Provider, model string, m *mock.Serve
 			Name:            "fast",
 			MaxOutputTokens: 100,
 			Routes:          []routing.Route{{ProviderName: "mock", Provider: p, Model: model}},
-		}}),
+		}}, routing.Options{}),
 	}
 	for _, f := range options {
 		f(&opts)
@@ -970,7 +970,7 @@ func routingWithLimit(table *routing.Table, limit int64) *routing.Table {
 	alias, _ := table.Resolve("fast")
 	updated := *alias
 	updated.MaxOutputTokens = limit
-	return routing.NewTable([]routing.Alias{updated})
+	return routing.NewTable([]routing.Alias{updated}, routing.Options{})
 }
 
 // The write timeout limits how long one write can block. It must never limit how
@@ -1521,7 +1521,7 @@ func TestWaitForRequests(t *testing.T) {
 			Name:            "fast",
 			MaxOutputTokens: 100,
 			Routes:          []routing.Route{{ProviderName: "fake", Provider: p, Model: "m"}},
-		}}),
+		}}, routing.Options{}),
 	})
 	ts := httptest.NewServer(server)
 	defer ts.Close()
@@ -1683,12 +1683,9 @@ func TestAnthropicThroughTheGateway(t *testing.T) {
 	})
 	t.Run("temperature is refused, never dropped", func(t *testing.T) {
 		g := newAnthropicGateway(t, "temp-check")
-		expectError(t, g.post(t, chatBody(false, `,"temperature":0.5`)), 400, "invalid_request_error", "upstream_rejected")
+		expectError(t, g.post(t, chatBody(false, `,"temperature":0.5`)), 400, "invalid_request_error", "no_capable_route")
 		if requests := g.mock.Stats()["temp-check"].Requests; requests != 0 {
 			t.Fatalf("upstream saw %d requests", requests)
-		}
-		if a := g.recorder.wait(t); a.Delivery != provider.DeliveryNotSent {
-			t.Fatalf("attempt = %+v", a)
 		}
 	})
 }
@@ -1719,7 +1716,7 @@ func TestAccountingCountsTheFirstEventWhenItCannotBeDelivered(t *testing.T) {
 			Name:            "fast",
 			MaxOutputTokens: 100,
 			Routes:          []routing.Route{{ProviderName: "fake", Provider: fake, Model: "m"}},
-		}}),
+		}}, routing.Options{}),
 	})
 
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(chatBody(true, "")))

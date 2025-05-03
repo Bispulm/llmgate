@@ -27,6 +27,17 @@ models:
       - provider: mock
         model: alpha;tokens=5;interval=100ms
 
+  # The first route fails before any content, and the second serves the request.
+  - alias: demo-failover
+    max_output_tokens: 256
+    routes:
+      - provider: mock
+        model: primary;fail=status;status=500
+        tier: 0
+      - provider: mock
+        model: backup;tokens=4
+        tier: 1
+
   # The provider fails after its prelude, before any content.
   - alias: demo-fails-before-content
     max_output_tokens: 256

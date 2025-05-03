@@ -8,7 +8,7 @@ An OpenAI-compatible gateway for LLM providers, built around three hard problems
 
 The aim is depth on those problems, not a long list of providers.
 
-**Status: early development, not ready for production.** The streaming and non-streaming proxy path works against a local mock. Budgets, tenant keys, fallback, and the Anthropic adapter are designed but not built yet, so nothing here controls spending. See [What works today](#what-works-today).
+**Status: early development, not ready for production.** Streaming and non-streaming proxying, both provider adapters, fallback, and circuit breakers work against a local mock. Budgets and tenant keys are designed but not built yet, so nothing here controls spending. See [What works today](#what-works-today).
 
 ## Quick start
 
@@ -22,7 +22,8 @@ It starts the mock and the gateway on `127.0.0.1:18301` and `127.0.0.1:18300`, t
 
 - Streaming and non-streaming requests through the gateway.
 - An unsupported field rejected by name.
-- A provider failing before any content, which is an ordinary HTTP error.
+- A provider failing before any content, with the request falling back to another route.
+- Every route failing before any content, which is an ordinary HTTP error.
 - A provider failing after content, which is one error event and no `[DONE]`.
 - A client disconnect canceling the upstream request.
 - What the gateway recorded for each attempt.
@@ -56,7 +57,8 @@ flowchart LR
 Three decisions shape the design:
 
 - **A request either fits the declared contract or is rejected by name.** Nothing is silently dropped. See [compatibility.md](docs/compatibility.md) and [ADR 0001](docs/adr/0001-reject-what-the-contract-cannot-honor.md).
-- **Failover stops at a precise commitment point.** Once response headers or stream bytes have gone out, no other provider can serve that response. Headers wait for the first event with real content, so a provider that sends a prelude and then dies is still a clean error. See [ADR 0003](docs/adr/0003-downstream-commitment-point.md).
+- **Failover stops at a precise commitment point.** Once response headers or stream bytes have gone out, no other provider can serve that response. Headers wait for the first event with real content, so a provider that sends a prelude and then dies can still fall back. See [ADR 0003](docs/adr/0003-downstream-commitment-point.md).
+- **What happens next depends on what went wrong.** An invalid request isn't retried and a client's behavior never affects a provider's health. See [ADR 0004](docs/adr/0004-routing-and-failure-handling.md).
 - **Postgres alone will decide spending.** Redis never becomes a competing authority for money. See [ADR 0002](docs/adr/0002-postgres-is-the-budget-authority.md).
 
 ## What works today
@@ -64,12 +66,13 @@ Three decisions shape the design:
 | Area | Status |
 |---|---|
 | Request validation against the declared contract | Implemented |
-| OpenAI-compatible adapter, streaming and non-streaming | Implemented, tested against the local mock only |
+| OpenAI-compatible and Anthropic adapters, streaming and non-streaming | Implemented, tested against the local mock only |
+| Capability filtering, weights, fallback, and circuit breakers | Implemented. Breakers are per process. |
 | Commitment boundary, deadlines, cancellation, slow clients | Implemented |
 | Attempt records, including uncertain usage | Logged only, not durable |
 | Deterministic mock provider, both wire formats | Implemented |
 | Authentication | One development key, loopback only |
-| Anthropic adapter, fallback, circuit breakers | Not built (M2) |
+| Provider concurrency limits and fair admission | Not built (M2) |
 | Tenant keys, rate limits, budgets, durable ledger | Designed, not built (M3) |
 | Response cache, metrics, traces, usage CLI | Not built (M4) |
 | Helm chart, load tests, overhead measurements | Not built (M5) |
@@ -80,7 +83,6 @@ No test in this repository has run against a live provider. No overhead numbers 
 
 - **No spending control.** Responses carry `X-Llmgate-Budget-Enforcement: none`, and the gateway logs a warning at startup.
 - **Loopback only.** Configuration refuses other listeners until tenant authentication exists.
-- **One route per alias.** Configuration refuses more until fallback exists, so a config can't imply failover that isn't there.
 - **Text chat only.** Tools, images, audio, and structured output are rejected.
 
 ## Development

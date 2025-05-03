@@ -84,11 +84,18 @@ func TestLoadRejectsInvalidConfig(t *testing.T) {
 		{"negative timeout", "request_timeout: 45s", "request_timeout: -1s", "request_timeout"},
 		{"empty alias", "alias: fast", "alias: ''", "alias"},
 		{
-			"several routes before fallback exists",
+			"the same route twice",
 			"        model: alpha",
-			"        model: alpha\n      - provider: primary\n        model: beta",
-			"one route",
+			"        model: alpha\n      - provider: primary\n        model: alpha",
+			"duplicates",
 		},
+		{"negative tier", "        model: alpha", "        model: alpha\n        tier: -1", "tier"},
+		{"negative weight", "        model: alpha", "        model: alpha\n        weight: -1", "weight"},
+		{"too many attempts", "max_output_tokens: 1024", "max_output_tokens: 1024\n    max_attempts: 11", "max_attempts"},
+		{"negative attempts", "max_output_tokens: 1024", "max_output_tokens: 1024\n    max_attempts: -1", "max_attempts"},
+		{"error rate over 1", "limits:", "circuit_breaker:\n  error_rate: 1.5\nlimits:", "error_rate"},
+		{"negative cooldown", "limits:", "circuit_breaker:\n  cooldown: -1s\nlimits:", "circuit_breaker"},
+		{"negative probes", "limits:", "circuit_breaker:\n  half_open_probes: -1\nlimits:", "circuit_breaker"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -140,6 +147,33 @@ func TestLoadAcceptsLoopbackListeners(t *testing.T) {
 }
 
 func quoteYAML(s string) string { return "'" + s + "'" }
+
+func TestLoadAcceptsFallbackRoutes(t *testing.T) {
+	content := strings.Replace(validYAML, "        model: alpha", `        model: alpha
+        weight: 3
+      - provider: primary
+        model: beta
+        tier: 1`, 1)
+	content = strings.Replace(content, "max_output_tokens: 1024", "max_output_tokens: 1024\n    max_attempts: 3", 1)
+	content = strings.Replace(content, "limits:", `circuit_breaker:
+  window: 30s
+  min_requests: 5
+  error_rate: 0.25
+  cooldown: 10s
+  half_open_probes: 1
+limits:`, 1)
+	cfg, err := Load(writeConfig(t, content))
+	if err != nil {
+		t.Fatal(err)
+	}
+	model := cfg.Models[0]
+	if model.MaxAttempts != 3 || len(model.Routes) != 2 || model.Routes[0].Weight != 3 || model.Routes[1].Tier != 1 {
+		t.Fatalf("model = %+v", model)
+	}
+	if b := cfg.CircuitBreaker; b.MinRequests != 5 || b.ErrorRate != 0.25 || b.Cooldown != 10*time.Second || b.HalfOpenProbes != 1 || b.Window != 30*time.Second {
+		t.Fatalf("breaker = %+v", b)
+	}
+}
 
 func TestLoadAcceptsAnAnthropicProvider(t *testing.T) {
 	content := strings.Replace(validYAML, "type: openai-compatible", "type: anthropic", 1)

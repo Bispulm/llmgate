@@ -30,25 +30,25 @@ const (
 	budgetEnforcementNone = "none"
 )
 
-// Causes for canceling a stream, which separate a timeout from a client leaving.
+// Causes for canceling an attempt, which separate a timeout from a client leaving.
 var (
 	errFirstEventTimeout = errors.New("no content arrived within the first-event timeout")
 	errStreamIdleTimeout = errors.New("the stream stalled past the idle timeout")
 )
 
-// exchange is one request being proxied.
+// exchange is one logical request, which may make several upstream attempts.
 type exchange struct {
 	w  http.ResponseWriter
 	r  *http.Request
 	rc *http.ResponseController
 
-	id      string
-	alias   string
-	created int64
-	start   time.Time
-	req     *chat.Request
-	route   routing.Route
-	attempt accounting.Attempt
+	id        string
+	alias     string
+	created   int64
+	start     time.Time
+	req       *chat.Request
+	principal auth.Principal
+	attempts  int
 }
 
 func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
@@ -113,41 +113,42 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		writeError(w, apiErr)
 		return
 	}
-
-	route := alias.Routes[0]
-	header.Set(headerRoute, route.ProviderName+"/"+route.Model)
-	header.Set(headerAttempts, strconv.Itoa(1))
-
-	x := &exchange{
-		w:       w,
-		r:       r,
-		rc:      rc,
-		id:      id,
-		alias:   alias.Name,
-		created: start.Unix(),
-		start:   start,
-		req:     limited,
-		route:   route,
-		attempt: accounting.Attempt{
-			RequestID: id,
-			TeamID:    principal.TeamID,
-			KeyID:     principal.KeyID,
-			Alias:     alias.Name,
-			Provider:  route.ProviderName,
-			Model:     route.Model,
-			Number:    1,
-			Stream:    req.Stream,
-		},
-	}
-	defer s.record(r.Context(), x)
-
-	ctx, cancel := s.requestContext(r.Context())
-	defer cancel()
-	if req.Stream {
-		s.proxyStream(ctx, x)
+	plan := alias.Plan(limited)
+	if plan.NoCapableRoute() {
+		writeError(w, noCapableRoute(limited))
 		return
 	}
-	s.proxyCompletion(ctx, x)
+
+	x := &exchange{
+		w:         w,
+		r:         r,
+		rc:        rc,
+		id:        id,
+		alias:     alias.Name,
+		created:   start.Unix(),
+		start:     start,
+		req:       limited,
+		principal: principal,
+	}
+	ctx, cancel := s.requestContext(r.Context())
+	defer cancel()
+	s.runAttempts(ctx, x, alias, plan)
+}
+
+// noCapableRoute names the parameter that no route can honor. The client can fix
+// this by removing it, which is why it's a 400 and not a provider outage.
+func noCapableRoute(req *chat.Request) *apiError {
+	param := "top_p"
+	if req.Temperature != nil {
+		param = "temperature"
+	}
+	return &apiError{
+		Status:  http.StatusBadRequest,
+		Type:    errTypeInvalidRequest,
+		Code:    codeNoCapableRoute,
+		Param:   param,
+		Message: "no route for this model can honor " + param,
+	}
 }
 
 func (s *Server) requestContext(parent context.Context) (context.Context, context.CancelFunc) {
@@ -157,13 +158,95 @@ func (s *Server) requestContext(parent context.Context) (context.Context, contex
 	return context.WithCancel(parent)
 }
 
-// record reports the attempt on a context of its own: the request may already be
+// runAttempts tries routes until one serves the response, or until the attempt
+// limit, the deadline, or the kind of failure says to stop. Reaching the end of this
+// loop means nothing has been sent to the client. See ADR 0004.
+func (s *Server) runAttempts(ctx context.Context, x *exchange, alias *routing.Alias, plan *routing.Plan) {
+	var last *provider.Error
+	lastRoute := ""
+	reason := accounting.ReasonPrimary
+
+	for x.attempts < alias.Attempts() {
+		selected, ok := plan.Next()
+		if !ok {
+			// Every route was tried or is unusable. A provider's hint is only honored here,
+			// and only when it fits within the attempt limit and the deadline.
+			wait := plan.EarliestRetry()
+			if last == nil || wait <= 0 || !fitsDeadline(ctx, wait) || !sleep(ctx, wait) {
+				break
+			}
+			plan.Rewind()
+			reason = accounting.ReasonRetryAfter
+			continue
+		}
+
+		x.attempts++
+		lastRoute = routeName(selected.Route)
+		failure := s.attempt(ctx, x, selected, reason)
+		if failure == nil {
+			return
+		}
+		last = failure
+		reason = accounting.ReasonFallback
+		if !routing.Classify(failure).Failover || ctx.Err() != nil {
+			break
+		}
+	}
+	s.failRequest(x, plan, last, lastRoute)
+}
+
+func routeName(route routing.Route) string { return route.ProviderName + "/" + route.Model }
+
+func fitsDeadline(ctx context.Context, wait time.Duration) bool {
+	deadline, ok := ctx.Deadline()
+	return !ok || time.Until(deadline) > wait
+}
+
+// sleep waits for d, reporting false if ctx ended first.
+func sleep(ctx context.Context, d time.Duration) bool {
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+		return true
+	case <-ctx.Done():
+		return false
+	}
+}
+
+// attempt makes one upstream attempt and records it. A nil result means the response
+// is finished with, even if it failed partway: only a failure from before commit is
+// returned, because that's the only kind another route could still rescue.
+func (s *Server) attempt(ctx context.Context, x *exchange, selected *routing.Selected, reason accounting.Reason) *provider.Error {
+	start := time.Now()
+	record := accounting.Attempt{
+		RequestID: x.id,
+		TeamID:    x.principal.TeamID,
+		KeyID:     x.principal.KeyID,
+		Alias:     x.alias,
+		Provider:  selected.Route.ProviderName,
+		Model:     selected.Route.Model,
+		Number:    x.attempts,
+		Stream:    x.req.Stream,
+		Reason:    reason,
+	}
+	defer func() {
+		record.Duration = time.Since(start)
+		s.record(ctx, record)
+	}()
+
+	if x.req.Stream {
+		return s.streamAttempt(ctx, x, selected, &record)
+	}
+	return s.completionAttempt(ctx, x, selected, &record)
+}
+
+// record reports an attempt on a context of its own: the request may already be
 // canceled, and that is exactly when the record matters.
-func (s *Server) record(requestCtx context.Context, x *exchange) {
-	x.attempt.Duration = time.Since(x.start)
+func (s *Server) record(requestCtx context.Context, record accounting.Attempt) {
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(requestCtx), recordTimeout)
 	defer cancel()
-	s.recorder.RecordAttempt(ctx, x.attempt)
+	s.recorder.RecordAttempt(ctx, record)
 }
 
 func (s *Server) readBody(w http.ResponseWriter, r *http.Request) ([]byte, *apiError) {
@@ -211,25 +294,49 @@ func applyOutputLimit(req *chat.Request, alias *routing.Alias) (*chat.Request, *
 	return &limited, nil
 }
 
-// failAttempt records a failure with the client still uninformed, and tells the
-// client if it is still there.
-func (s *Server) failAttempt(x *exchange, failure *provider.Error) {
-	x.attempt.ErrorKind = failure.Kind
-	x.attempt.Delivery = failure.Delivery
-	x.attempt.UpstreamStatus = failure.Status
-	x.attempt.UpstreamCode = failure.UpstreamCode
+// noteFailure records a failure from before commit, and reports it to routing. A
+// client leaving says nothing about the route, whatever the failure looks like.
+func noteFailure(x *exchange, selected *routing.Selected, record *accounting.Attempt, failure *provider.Error) {
+	record.ErrorKind = failure.Kind
+	record.Delivery = failure.Delivery
+	record.UpstreamStatus = failure.Status
+	record.UpstreamCode = failure.UpstreamCode
 
 	if x.r.Context().Err() != nil {
-		x.attempt.Outcome = accounting.OutcomeClientCanceled
+		record.Outcome = accounting.OutcomeClientCanceled
+		selected.Abandon()
 		return
 	}
-	x.attempt.Outcome = accounting.OutcomeFailed
-	s.extendWriteDeadline(x.rc)
-	writeError(x.w, upstreamError(failure))
+	record.Outcome = accounting.OutcomeFailed
+	selected.Finish(failure)
 }
 
-// providerFailure normalizes an attempt's error, and applies the reason the
-// gateway itself canceled the attempt, which the adapter can't know.
+// failRequest answers a request that no attempt served. Nothing has been sent yet.
+func (s *Server) failRequest(x *exchange, plan *routing.Plan, last *provider.Error, lastRoute string) {
+	if x.r.Context().Err() != nil {
+		return // Nobody is left to tell.
+	}
+	s.extendWriteDeadline(x.rc)
+	header := x.w.Header()
+	header.Set(headerAttempts, strconv.Itoa(x.attempts))
+	if lastRoute != "" {
+		header.Set(headerRoute, lastRoute)
+	}
+	if last != nil {
+		writeError(x.w, upstreamError(last))
+		return
+	}
+	writeError(x.w, &apiError{
+		Status:     http.StatusServiceUnavailable,
+		Type:       errTypeUpstream,
+		Code:       codeNoRouteAvailable,
+		Message:    "no route for this model is available right now",
+		RetryAfter: plan.RetryAfter(),
+	})
+}
+
+// providerFailure normalizes an attempt's error, and applies the reason the gateway
+// itself canceled the attempt, which the adapter can't know.
 func providerFailure(ctx context.Context, err error) *provider.Error {
 	var failure *provider.Error
 	if !errors.As(err, &failure) {
@@ -245,24 +352,33 @@ func providerFailure(ctx context.Context, err error) *provider.Error {
 }
 
 // clientWriteFailed records why a write to the client failed. Any write failure
-// cancels the request's context, so only the error tells a stalled client from
-// one that left.
-func (x *exchange) clientWriteFailed(err error) {
+// cancels the request's context, so only the error tells a stalled client from one
+// that left. Neither says anything about the route.
+func clientWriteFailed(selected *routing.Selected, record *accounting.Attempt, err error) {
+	selected.Abandon()
 	if errors.Is(err, os.ErrDeadlineExceeded) {
-		x.attempt.Outcome = accounting.OutcomeClientStalled
+		record.Outcome = accounting.OutcomeClientStalled
 		return
 	}
-	x.attempt.Outcome = accounting.OutcomeClientCanceled
+	record.Outcome = accounting.OutcomeClientCanceled
 }
 
-func (s *Server) proxyCompletion(ctx context.Context, x *exchange) {
-	completion, err := x.route.Provider.Complete(ctx, x.req, x.route.Model)
+func (x *exchange) setRouteHeaders(selected *routing.Selected) {
+	header := x.w.Header()
+	header.Set(headerRoute, routeName(selected.Route))
+	header.Set(headerAttempts, strconv.Itoa(x.attempts))
+}
+
+func (s *Server) completionAttempt(ctx context.Context, x *exchange, selected *routing.Selected, record *accounting.Attempt) *provider.Error {
+	completion, err := selected.Route.Provider.Complete(ctx, x.req, selected.Route.Model)
 	if err != nil {
-		s.failAttempt(x, providerFailure(ctx, err))
-		return
+		failure := providerFailure(ctx, err)
+		noteFailure(x, selected, record, failure)
+		return failure
 	}
-	x.attempt.Usage = completion.Usage
-	x.attempt.OutputBytes = int64(len(completion.Content) + len(completion.Refusal))
+	record.Usage = completion.Usage
+	record.OutputBytes = int64(len(completion.Content) + len(completion.Refusal))
+	selected.Finish(nil)
 
 	message := wireMessage{Role: roleAssistant}
 	if completion.Content != "" || completion.Refusal == "" {
@@ -283,39 +399,50 @@ func (s *Server) proxyCompletion(ctx context.Context, x *exchange) {
 		Usage: newWireUsage(completion.Usage),
 	})
 	if err != nil {
-		s.failAttempt(x, &provider.Error{Kind: provider.KindServer, Delivery: provider.DeliveryConfirmed, Err: err})
-		return
+		failure := &provider.Error{Kind: provider.KindServer, Delivery: provider.DeliveryConfirmed, Err: err}
+		record.ErrorKind = failure.Kind
+		record.Delivery = failure.Delivery
+		record.Outcome = accounting.OutcomeFailed
+		return failure
 	}
 
-	x.attempt.Committed = true
+	record.Committed = true
 	s.extendWriteDeadline(x.rc)
+	x.setRouteHeaders(selected)
 	x.w.Header().Set("Content-Type", "application/json")
 	x.w.WriteHeader(http.StatusOK)
 	if _, err := x.w.Write(body); err != nil {
-		x.clientWriteFailed(err)
-		return
+		if errors.Is(err, os.ErrDeadlineExceeded) {
+			record.Outcome = accounting.OutcomeClientStalled
+		} else {
+			record.Outcome = accounting.OutcomeClientCanceled
+		}
+		return nil
 	}
-	x.attempt.Outcome = accounting.OutcomeCompleted
+	record.Outcome = accounting.OutcomeCompleted
+	return nil
 }
 
-// proxyStream runs a streaming attempt. Everything before the first write can
-// still become an ordinary HTTP error. After it, this attempt's provider is the
-// only one that will ever serve this response.
-func (s *Server) proxyStream(parent context.Context, x *exchange) {
+// streamAttempt runs one streaming attempt. Everything before the first write can
+// still become another attempt or an ordinary HTTP error. After it, this attempt's
+// provider is the only one that will ever serve this response, which is why every
+// path past the commitment point returns nil.
+func (s *Server) streamAttempt(parent context.Context, x *exchange, selected *routing.Selected, record *accounting.Attempt) *provider.Error {
 	ctx, cancel := context.WithCancelCause(parent)
 	defer cancel(nil)
 
 	watchdog := newWatchdog(s.limits.FirstEventTimeout, func() { cancel(errFirstEventTimeout) })
 	defer watchdog.stop()
 
-	stream, err := x.route.Provider.Stream(ctx, x.req, x.route.Model)
+	stream, err := selected.Route.Provider.Stream(ctx, x.req, selected.Route.Model)
 	if err != nil {
-		s.failAttempt(x, providerFailure(ctx, err))
-		return
+		failure := providerFailure(ctx, err)
+		noteFailure(x, selected, record, failure)
+		return failure
 	}
 	defer func() { _ = stream.Close() }()
 
-	first, err := x.awaitFirstOutput(stream)
+	first, err := awaitFirstOutput(stream, record)
 	if errors.Is(err, io.EOF) {
 		// Adapters report a finish reason as an event, so this breaks their contract.
 		err = &provider.Error{
@@ -325,18 +452,20 @@ func (s *Server) proxyStream(parent context.Context, x *exchange) {
 		}
 	}
 	if err != nil {
-		s.failAttempt(x, providerFailure(ctx, err))
-		return
+		failure := providerFailure(ctx, err)
+		noteFailure(x, selected, record, failure)
+		return failure
 	}
 	watchdog.stop()
-	x.attempt.TimeToFirstEvent = time.Since(x.start)
+	record.TimeToFirstEvent = time.Since(x.start)
 
 	// This is the commitment point. See ADR 0003.
-	x.attempt.Committed = true
+	record.Committed = true
+	x.setRouteHeaders(selected)
 	out := newStreamWriter(x, s)
 	if err := out.commit(first); err != nil {
-		x.clientWriteFailed(err)
-		return
+		clientWriteFailed(selected, record, err)
+		return nil
 	}
 
 	idle := newWatchdog(s.limits.StreamIdleTimeout, func() { cancel(errStreamIdleTimeout) })
@@ -345,19 +474,20 @@ func (s *Server) proxyStream(parent context.Context, x *exchange) {
 		event, err := stream.Next()
 		if errors.Is(err, io.EOF) {
 			idle.stop()
-			if err := out.finish(x.attempt.Usage); err != nil {
-				x.clientWriteFailed(err)
-				return
+			selected.Finish(nil)
+			if err := out.finish(record.Usage); err != nil {
+				clientWriteFailed(selected, record, err)
+				return nil
 			}
-			x.attempt.Outcome = accounting.OutcomeCompleted
-			return
+			record.Outcome = accounting.OutcomeCompleted
+			return nil
 		}
 		if err != nil {
 			idle.stop()
-			s.interruptStream(ctx, x, out, err)
-			return
+			s.interruptStream(ctx, x, selected, record, out, err)
+			return nil
 		}
-		x.observe(event)
+		observe(record, event)
 		if !event.HasOutput() {
 			continue // Not progress, so the idle timer keeps running.
 		}
@@ -365,57 +495,59 @@ func (s *Server) proxyStream(parent context.Context, x *exchange) {
 		// A slow client isn't the upstream stalling, so writing doesn't count as idle.
 		idle.stop()
 		if err := out.write(event); err != nil {
-			x.clientWriteFailed(err)
-			return
+			clientWriteFailed(selected, record, err)
+			return nil
 		}
 		idle.reset(s.limits.StreamIdleTimeout)
 	}
 }
 
-// awaitFirstOutput reads until an event with output arrives, which is what may
-// commit the response. The first-event timeout bounds how long this can take,
-// however many usage reports arrive in the meantime.
-func (x *exchange) awaitFirstOutput(stream provider.Stream) (chat.StreamEvent, error) {
+// awaitFirstOutput reads until an event with output arrives, which is what may commit
+// the response. The first-event timeout bounds how long this can take, however many
+// usage reports arrive in the meantime.
+func awaitFirstOutput(stream provider.Stream, record *accounting.Attempt) (chat.StreamEvent, error) {
 	for {
 		event, err := stream.Next()
 		if err != nil {
 			return chat.StreamEvent{}, err
 		}
-		x.observe(event)
+		observe(record, event)
 		if event.HasOutput() {
 			return event, nil
 		}
 	}
 }
 
-// interruptStream handles an upstream failure after commit. No other provider may
-// be tried, and the stream must not appear to have succeeded.
-func (s *Server) interruptStream(ctx context.Context, x *exchange, out *streamWriter, err error) {
+// interruptStream handles an upstream failure after commit. No other provider may be
+// tried, and the stream must not appear to have succeeded.
+func (s *Server) interruptStream(ctx context.Context, x *exchange, selected *routing.Selected, record *accounting.Attempt, out *streamWriter, err error) {
 	failure := providerFailure(ctx, err)
-	x.attempt.ErrorKind = failure.Kind
-	x.attempt.Delivery = failure.Delivery
-	x.attempt.UpstreamStatus = failure.Status
-	x.attempt.UpstreamCode = failure.UpstreamCode
+	record.ErrorKind = failure.Kind
+	record.Delivery = failure.Delivery
+	record.UpstreamStatus = failure.Status
+	record.UpstreamCode = failure.UpstreamCode
 
 	if x.r.Context().Err() != nil {
-		x.attempt.Outcome = accounting.OutcomeClientCanceled
+		record.Outcome = accounting.OutcomeClientCanceled
+		selected.Abandon()
 		return
 	}
-	x.attempt.Outcome = accounting.OutcomeInterrupted
+	record.Outcome = accounting.OutcomeInterrupted
+	selected.Finish(failure)
 	if err := out.writeError(streamInterrupted()); err != nil {
 		s.logger.LogAttrs(ctx, slogLevelDebug, "could not deliver stream error", attrRequestID(x.id))
 	}
 }
 
-// observe updates the attempt's accounting from an event. It runs whether or not
-// the event reaches the client, since the cost was incurred either way.
-func (x *exchange) observe(event chat.StreamEvent) {
+// observe updates an attempt's accounting from an event. It runs whether or not the
+// event reaches the client, since the cost was incurred either way.
+func observe(record *accounting.Attempt, event chat.StreamEvent) {
 	if event.Content != "" {
-		x.attempt.TextEvents++
+		record.TextEvents++
 	}
-	x.attempt.OutputBytes += int64(len(event.Content) + len(event.Refusal))
+	record.OutputBytes += int64(len(event.Content) + len(event.Refusal))
 	if event.Usage != nil {
-		x.attempt.Usage = event.Usage
+		record.Usage = event.Usage
 	}
 }
 
