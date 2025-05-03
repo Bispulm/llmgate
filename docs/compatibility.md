@@ -118,7 +118,7 @@ Provider fields outside this contract, such as `obfuscation`, `system_fingerprin
 
 The gateway may not switch providers once it has committed the response. See [ADR 0003](adr/0003-downstream-commitment-point.md).
 
-Before commit, the client gets an ordinary HTTP error.
+Before commit, another route may be tried. See [ADR 0004](adr/0004-routing-and-failure-handling.md). If none can serve the request, the client gets an ordinary HTTP error for the last failure.
 
 After commit, the client gets one event, then the stream ends without `[DONE]`:
 
@@ -157,6 +157,7 @@ All errors use the OpenAI envelope, with `x-request-id` set on the response:
 | 400 | `invalid_request_error` | `duplicate_parameter` | Repeated key |
 | 400 | `invalid_request_error` | `invalid_json` | Malformed JSON or invalid UTF-8 |
 | 400 | `invalid_request_error` | `output_limit_exceeded` | Limit above the alias's maximum |
+| 400 | `invalid_request_error` | `no_capable_route` | No route for this alias can honor the request, such as `temperature` with only Anthropic routes |
 | 401 | `authentication_error` | `invalid_api_key` | Missing or unknown key |
 | 400 | `invalid_request_error` | `request_unreadable` | The body could not be read |
 | 400 | `invalid_request_error` | `upstream_rejected` | Provider rejected the request, such as a prompt over its context limit |
@@ -170,6 +171,7 @@ All errors use the OpenAI envelope, with `x-request-id` set on the response:
 | 502 | `upstream_error` | `upstream_misconfigured` | Provider rejected the gateway's credentials or model |
 | 502 | `upstream_error` | `upstream_account_limit` | The provider account is out of credit or over a spend limit |
 | 503 | `upstream_error` | `upstream_overloaded` | Provider reports overload |
+| 503 | `upstream_error` | `no_route_available` | Every route is unavailable right now, with `Retry-After` when known |
 | 504 | `upstream_error` | `upstream_timeout` | A deadline passed before commit |
 
 `upstream_rejected` is a 400 rather than a 5xx because the same request will keep failing, and client SDKs automatically retry a 5xx.
@@ -184,7 +186,7 @@ The gateway does not forward provider error messages, which can contain account 
 |---|---|
 | `X-Request-Id` | The gateway's ID for this request. It also appears in the logs. |
 | `X-Llmgate-Route` | The serving `provider/model`, once one was chosen |
-| `X-Llmgate-Attempts` | How many upstream attempts were made |
+| `X-Llmgate-Attempts` | How many upstream attempts were made, including failed ones |
 | `X-Llmgate-Budget-Enforcement` | `none` until budgets exist. See [ADR 0002](adr/0002-postgres-is-the-budget-authority.md). |
 
 ## Provider capabilities
@@ -220,6 +222,6 @@ Anthropic reports some account problems in ways the gateway can't separate from 
 | Request validation | Implemented |
 | OpenAI-compatible adapter, streaming and non-streaming | Implemented, tested against the local mock only |
 | Anthropic adapter, streaming and non-streaming | Implemented, tested against the local mock only |
-| Capability filtering and fallback | Not implemented (M2) |
+| Capability filtering, weights, fallback, circuit breakers | Implemented |
 
 No test in this repository has been run against a live provider. Tests use the local mock and synthetic fixtures.

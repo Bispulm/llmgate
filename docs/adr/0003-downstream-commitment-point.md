@@ -1,6 +1,6 @@
 # ADR 0003: The downstream commitment point
 
-**Status:** Accepted, 2026-11-05. The boundary is implemented. Fallback across providers arrives in M2.
+**Status:** Accepted, 2026-11-05. Implemented, including fallback before commit. See [ADR 0004](0004-routing-and-failure-handling.md).
 
 ## Context
 
