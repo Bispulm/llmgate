@@ -39,6 +39,7 @@ const (
 	codeStreamInterrupted     = "stream_interrupted"
 	codeNoCapableRoute        = "no_capable_route"
 	codeNoRouteAvailable      = "no_route_available"
+	codeCapacityExceeded      = "capacity_exceeded"
 )
 
 // apiError is an error returned to a client.

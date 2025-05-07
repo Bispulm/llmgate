@@ -172,6 +172,7 @@ All errors use the OpenAI envelope, with `x-request-id` set on the response:
 | 502 | `upstream_error` | `upstream_account_limit` | The provider account is out of credit or over a spend limit |
 | 503 | `upstream_error` | `upstream_overloaded` | Provider reports overload |
 | 503 | `upstream_error` | `no_route_available` | Every route is unavailable right now, with `Retry-After` when known |
+| 503 | `upstream_error` | `capacity_exceeded` | Every usable route is at its concurrency limit, with `Retry-After` |
 | 504 | `upstream_error` | `upstream_timeout` | A deadline passed before commit |
 
 `upstream_rejected` is a 400 rather than a 5xx because the same request will keep failing, and client SDKs automatically retry a 5xx.

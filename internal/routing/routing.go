@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/Bispulm/llmgate/internal/chat"
+	"github.com/Bispulm/llmgate/internal/limits"
 	"github.com/Bispulm/llmgate/internal/provider"
 )
 
@@ -27,6 +28,9 @@ type Route struct {
 	Tier int
 	// Weight shares traffic within a tier. Zero means 1.
 	Weight int
+	// Limiter bounds concurrent attempts, usually shared by a provider's routes. Nil
+	// means no limit.
+	Limiter *limits.FairLimiter
 }
 
 // Alias is a client-visible model name.
@@ -130,6 +134,7 @@ const (
 	SkipCapability  SkipReason = "capability"
 	SkipBreakerOpen SkipReason = "breaker_open"
 	SkipHeld        SkipReason = "rate_limit_hold"
+	SkipSaturated   SkipReason = "saturated"
 )
 
 // Plan is the routes a request may use, in order. It isn't safe for concurrent use,
@@ -195,6 +200,9 @@ func (p *Plan) skip(reason SkipReason) {
 	}
 	p.skipped[reason]++
 }
+
+// NoteSaturated records that an offered route had no capacity.
+func (p *Plan) NoteSaturated() { p.skip(SkipSaturated) }
 
 // Skipped counts why routes weren't offered.
 func (p *Plan) Skipped() map[SkipReason]int { return p.skipped }

@@ -13,6 +13,7 @@ import (
 	"github.com/Bispulm/llmgate/internal/accounting"
 	"github.com/Bispulm/llmgate/internal/auth"
 	"github.com/Bispulm/llmgate/internal/chat"
+	"github.com/Bispulm/llmgate/internal/limits"
 	"github.com/Bispulm/llmgate/internal/provider"
 	"github.com/Bispulm/llmgate/internal/routing"
 )
@@ -28,6 +29,9 @@ const (
 
 	// budgetEnforcementNone says plainly that no budget protects this request.
 	budgetEnforcementNone = "none"
+
+	// capacityRetryAfter is a short hint, because a slot could free at any moment.
+	capacityRetryAfter = time.Second
 )
 
 // Causes for canceling an attempt, which separate a timeout from a client leaving.
@@ -180,9 +184,22 @@ func (s *Server) runAttempts(ctx context.Context, x *exchange, alias *routing.Al
 			continue
 		}
 
+		// Capacity comes before the attempt, because a route that was never called
+		// isn't an attempt, costs nothing, and says nothing about the route's health.
+		release, err := selected.Route.Limiter.Acquire(ctx, x.principal.TeamID)
+		if err != nil {
+			selected.Abandon()
+			plan.NoteSaturated()
+			if errors.Is(err, limits.ErrShed) {
+				continue
+			}
+			break
+		}
+
 		x.attempts++
 		lastRoute = routeName(selected.Route)
 		failure := s.attempt(ctx, x, selected, reason)
+		release()
 		if failure == nil {
 			return
 		}
@@ -324,6 +341,16 @@ func (s *Server) failRequest(x *exchange, plan *routing.Plan, last *provider.Err
 	}
 	if last != nil {
 		writeError(x.w, upstreamError(last))
+		return
+	}
+	if plan.Skipped()[routing.SkipSaturated] > 0 {
+		writeError(x.w, &apiError{
+			Status:     http.StatusServiceUnavailable,
+			Type:       errTypeUpstream,
+			Code:       codeCapacityExceeded,
+			Message:    "the gateway has no capacity for this model right now",
+			RetryAfter: capacityRetryAfter,
+		})
 		return
 	}
 	writeError(x.w, &apiError{
