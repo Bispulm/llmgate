@@ -67,12 +67,11 @@ Three decisions shape the design:
 |---|---|
 | Request validation against the declared contract | Implemented |
 | OpenAI-compatible and Anthropic adapters, streaming and non-streaming | Implemented, tested against the local mock only |
-| Capability filtering, weights, fallback, and circuit breakers | Implemented. Breakers are per process. |
+| Capability filtering, weights, fallback, circuit breakers, concurrency limits, and fair admission | Implemented. Breakers and concurrency limits are per process. |
 | Commitment boundary, deadlines, cancellation, slow clients | Implemented |
 | Attempt records, including uncertain usage | Logged only, not durable |
 | Deterministic mock provider, both wire formats | Implemented |
 | Authentication | One development key, loopback only |
-| Provider concurrency limits and fair admission | Not built (M2) |
 | Tenant keys, rate limits, budgets, durable ledger | Designed, not built (M3) |
 | Response cache, metrics, traces, usage CLI | Not built (M4) |
 | Helm chart, load tests, overhead measurements | Not built (M5) |
