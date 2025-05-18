@@ -83,6 +83,7 @@ type Limits struct {
 	RequestTimeout     time.Duration `yaml:"request_timeout"`
 	FirstEventTimeout  time.Duration `yaml:"first_event_timeout"`
 	StreamIdleTimeout  time.Duration `yaml:"stream_idle_timeout"`
+	CompletionTimeout  time.Duration `yaml:"completion_timeout"`
 	ClientWriteTimeout time.Duration `yaml:"client_write_timeout"`
 	BodyReadTimeout    time.Duration `yaml:"body_read_timeout"`
 }
@@ -179,7 +180,10 @@ func (c *Config) applyDefaults() {
 	setDefault(&c.Limits.MaxResponseBytes, DefaultMaxResponseBytes)
 	setDefault(&c.Limits.MaxEventBytes, DefaultMaxEventBytes)
 	setDefault(&c.Limits.RequestTimeout, DefaultRequestTimeout)
-	setDefault(&c.Limits.FirstEventTimeout, DefaultFirstEventTimeout)
+	// These stay within the request's deadline, or they could never fire. Half of it
+	// leaves a hung non-streaming attempt time to fall back.
+	setDefault(&c.Limits.FirstEventTimeout, min(DefaultFirstEventTimeout, c.Limits.RequestTimeout))
+	setDefault(&c.Limits.CompletionTimeout, c.Limits.RequestTimeout/2)
 	setDefault(&c.Limits.StreamIdleTimeout, DefaultStreamIdleTimeout)
 	setDefault(&c.Limits.ClientWriteTimeout, DefaultClientWriteTimeout)
 	setDefault(&c.Limits.BodyReadTimeout, DefaultBodyReadTimeout)
@@ -291,6 +295,7 @@ func (l Limits) validate() error {
 	}{
 		{"request_timeout", l.RequestTimeout},
 		{"first_event_timeout", l.FirstEventTimeout},
+		{"completion_timeout", l.CompletionTimeout},
 		{"stream_idle_timeout", l.StreamIdleTimeout},
 		{"client_write_timeout", l.ClientWriteTimeout},
 		{"body_read_timeout", l.BodyReadTimeout},
@@ -299,6 +304,14 @@ func (l Limits) validate() error {
 		if t.value < 0 {
 			return fmt.Errorf("limits.%s must be positive", t.name)
 		}
+	}
+	// An attempt's own timers are what tell a hung provider from a long request. Past the
+	// request's deadline they could never fire, so a hung provider would never count.
+	if l.FirstEventTimeout > l.RequestTimeout {
+		return errors.New("limits.first_event_timeout must not exceed limits.request_timeout")
+	}
+	if l.CompletionTimeout > l.RequestTimeout {
+		return errors.New("limits.completion_timeout must not exceed limits.request_timeout")
 	}
 	return nil
 }
