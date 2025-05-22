@@ -182,7 +182,11 @@ func TestPlanSkipsHeldRoutesUntilTheHintPasses(t *testing.T) {
 	if plan.Skipped()[SkipHeld] != 1 {
 		t.Fatalf("skips = %v", plan.Skipped())
 	}
-	if got := plan.EarliestRetry(); got != 5*time.Second {
+	if got := plan.RetryAfter(); got != 5*time.Second {
+		t.Fatalf("RetryAfter = %v", got)
+	}
+	// Another request's hint is a reason to skip the route, but not to wait for it.
+	if got := plan.EarliestRetry(); got != 0 {
 		t.Fatalf("EarliestRetry = %v", got)
 	}
 
@@ -203,18 +207,42 @@ func TestHoldIsCapped(t *testing.T) {
 	}
 }
 
-func TestRewindOffersRoutesAgain(t *testing.T) {
-	alias, _ := testTable(t, route("a", 0, 1))
+// There is no same-route retry except for a hint this request was given.
+func TestRewindOnlyOffersRoutesThatGaveThisPlanAHint(t *testing.T) {
+	alias, clock := testTable(t, route("failed", 0, 1), route("hinted", 1, 1), route("worked", 2, 1))
 	plan := alias.Plan(&chat.Request{})
-	if len(order(plan)) != 1 {
-		t.Fatal("no route")
-	}
+
+	failed, _ := plan.Next()
+	failed.Finish(&provider.Error{Kind: provider.KindServer})
+	hinted, _ := plan.Next()
+	hinted.Finish(&provider.Error{Kind: provider.KindRateLimited, RetryAfter: 2 * time.Second})
+	worked, _ := plan.Next()
+	worked.Abandon()
+
 	if _, ok := plan.Next(); ok {
 		t.Fatal("offered a route twice without a rewind")
 	}
+	if got := plan.EarliestRetry(); got != 2*time.Second {
+		t.Fatalf("EarliestRetry = %v", got)
+	}
+
+	clock.Advance(2 * time.Second)
 	plan.Rewind()
-	if _, ok := plan.Next(); !ok {
-		t.Fatal("no route after a rewind")
+	if got := order(plan); len(got) != 1 || got[0] != "hinted" {
+		t.Fatalf("a rewind offered %v", got)
+	}
+	if got := plan.EarliestRetry(); got != 0 {
+		t.Fatalf("EarliestRetry after the retry = %v", got)
+	}
+}
+
+func TestARateLimitWithoutAHintGivesNothingToWaitFor(t *testing.T) {
+	alias, _ := testTable(t, route("a", 0, 1))
+	plan := alias.Plan(&chat.Request{})
+	next, _ := plan.Next()
+	next.Finish(&provider.Error{Kind: provider.KindRateLimited})
+	if got := plan.EarliestRetry(); got != 0 {
+		t.Fatalf("EarliestRetry = %v", got)
 	}
 }
 
