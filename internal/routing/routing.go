@@ -141,9 +141,11 @@ const (
 // but belongs to one request.
 type Plan struct {
 	alias   *Alias
-	ordered []planEntry
+	all     []planEntry // every route that can honor the request
+	ordered []planEntry // what Next offers from
 	cursor  int
 	skipped map[SkipReason]int
+	hinted  []planEntry // routes that gave this request a Retry-After
 }
 
 type planEntry struct {
@@ -165,6 +167,7 @@ func (a *Alias) Plan(req *chat.Request) *Plan {
 		plan.ordered = append(plan.ordered, planEntry{state: a.routeStates[i], route: route})
 	}
 	a.shuffle(plan.ordered)
+	plan.all = plan.ordered
 	return plan
 }
 
@@ -209,7 +212,7 @@ func (p *Plan) Skipped() map[SkipReason]int { return p.skipped }
 
 // NoCapableRoute reports that no configured route can honor the request at all, as
 // opposed to being unhealthy just now.
-func (p *Plan) NoCapableRoute() bool { return len(p.ordered) == 0 }
+func (p *Plan) NoCapableRoute() bool { return len(p.all) == 0 }
 
 // Next offers the next usable route, or false if none remain. A route that's offered
 // must be finished with Finish or Abandon.
@@ -227,20 +230,30 @@ func (p *Plan) Next() (*Selected, bool) {
 			p.skip(SkipBreakerOpen)
 			continue
 		}
-		return &Selected{Route: entry.route, state: entry.state, permit: permit, table: p.alias.table}, true
+		return &Selected{Route: entry.route, state: entry.state, permit: permit, table: p.alias.table, plan: p, entry: entry}, true
 	}
 	return nil, false
 }
 
-// Rewind lets routes be offered again, for a retry after a hint has passed.
-func (p *Plan) Rewind() { p.cursor = 0 }
+// Rewind offers again only the routes that gave this request a Retry-After. Any other
+// route that failed isn't retried, and a hold from another request's hint is no reason
+// to wait.
+func (p *Plan) Rewind() {
+	p.ordered = p.hinted
+	p.hinted = nil
+	p.cursor = 0
+}
 
-// EarliestRetry returns the shortest time until a held route in this plan becomes
-// usable, or 0 if none is held.
+// EarliestRetry returns how long until a route that gave this request a hint can be
+// retried, or 0 if there's no such route.
 func (p *Plan) EarliestRetry() time.Duration {
+	return p.earliestHold(p.hinted)
+}
+
+func (p *Plan) earliestHold(entries []planEntry) time.Duration {
 	now := p.alias.table.now().UnixNano()
 	var earliest time.Duration
-	for _, entry := range p.ordered {
+	for _, entry := range entries {
 		until := entry.state.holdUntil.Load()
 		if until <= now {
 			continue
@@ -252,11 +265,11 @@ func (p *Plan) EarliestRetry() time.Duration {
 	return earliest
 }
 
-// RetryAfter returns the shortest time until any route in this plan may be usable,
-// for telling a client when to try again. It returns 0 if that's unknown.
+// RetryAfter returns the shortest time until any route may be usable, for telling a
+// client when to try again. It returns 0 if that's unknown.
 func (p *Plan) RetryAfter() time.Duration {
-	earliest := p.EarliestRetry()
-	for _, entry := range p.ordered {
+	earliest := p.earliestHold(p.all)
+	for _, entry := range p.all {
 		if wait := entry.state.breaker.RetryIn(); wait > 0 && (earliest == 0 || wait < earliest) {
 			earliest = wait
 		}
@@ -270,6 +283,8 @@ type Selected struct {
 	state  *routeState
 	permit Permit
 	table  *Table
+	plan   *Plan
+	entry  planEntry
 	done   bool
 }
 
@@ -288,11 +303,13 @@ func (s *Selected) Finish(failure *provider.Error) {
 	if failure.Kind == provider.KindRateLimited && failure.RetryAfter > 0 {
 		hold := min(failure.RetryAfter, MaxHold)
 		s.state.holdUntil.Store(s.table.now().Add(hold).UnixNano())
+		s.plan.hinted = append(s.plan.hinted, s.entry)
 	}
 }
 
 // Abandon ends an attempt without saying anything about the route, such as when the
-// client went away.
+// client went away. It does nothing if the outcome was already reported, so it's safe
+// to defer as a backstop.
 func (s *Selected) Abandon() {
 	if s.done {
 		return

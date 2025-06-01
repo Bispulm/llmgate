@@ -38,6 +38,7 @@ const (
 var (
 	errFirstEventTimeout = errors.New("no content arrived within the first-event timeout")
 	errStreamIdleTimeout = errors.New("the stream stalled past the idle timeout")
+	errCompletionTimeout = errors.New("no response arrived within the completion timeout")
 )
 
 // exchange is one logical request, which may make several upstream attempts.
@@ -173,10 +174,10 @@ func (s *Server) runAttempts(ctx context.Context, x *exchange, alias *routing.Al
 	for x.attempts < alias.Attempts() {
 		selected, ok := plan.Next()
 		if !ok {
-			// Every route was tried or is unusable. A provider's hint is only honored here,
-			// and only when it fits within the attempt limit and the deadline.
+			// Every route was tried or is unusable. A hint this request was given is only
+			// honored here, and only when it fits within the attempt limit and the deadline.
 			wait := plan.EarliestRetry()
-			if last == nil || wait <= 0 || !fitsDeadline(ctx, wait) || !sleep(ctx, wait) {
+			if wait <= 0 || !fitsDeadline(ctx, wait) || !sleep(ctx, wait) {
 				break
 			}
 			plan.Rewind()
@@ -189,17 +190,19 @@ func (s *Server) runAttempts(ctx context.Context, x *exchange, alias *routing.Al
 		release, err := selected.Route.Limiter.Acquire(ctx, x.principal.TeamID)
 		if err != nil {
 			selected.Abandon()
-			plan.NoteSaturated()
 			if errors.Is(err, limits.ErrShed) {
+				plan.NoteSaturated()
 				continue
 			}
+			// The wait ended with the request. That's a timeout, and not overload, so the
+			// client shouldn't be told to come straight back.
+			last = &provider.Error{Kind: provider.KindTimeout, Delivery: provider.DeliveryNotSent, Err: err}
 			break
 		}
 
 		x.attempts++
 		lastRoute = routeName(selected.Route)
-		failure := s.attempt(ctx, x, selected, reason)
-		release()
+		failure := s.attemptWithSlot(ctx, x, selected, reason, release)
 		if failure == nil {
 			return
 		}
@@ -229,6 +232,15 @@ func sleep(ctx context.Context, d time.Duration) bool {
 	case <-ctx.Done():
 		return false
 	}
+}
+
+// attemptWithSlot runs an attempt holding what it was given. net/http recovers a panic
+// and keeps serving, so these have to come back even then, or capacity and breaker
+// probes would drain away until the gateway stopped serving.
+func (s *Server) attemptWithSlot(ctx context.Context, x *exchange, selected *routing.Selected, reason accounting.Reason, release func()) *provider.Error {
+	defer release()
+	defer selected.Abandon()
+	return s.attempt(ctx, x, selected, reason)
 }
 
 // attempt makes one upstream attempt and records it. A nil result means the response
@@ -311,20 +323,35 @@ func applyOutputLimit(req *chat.Request, alias *routing.Alias) (*chat.Request, *
 	return &limited, nil
 }
 
-// noteFailure records a failure from before commit, and reports it to routing. A
-// client leaving says nothing about the route, whatever the failure looks like.
-func noteFailure(x *exchange, selected *routing.Selected, record *accounting.Attempt, failure *provider.Error) {
-	record.ErrorKind = failure.Kind
-	record.Delivery = failure.Delivery
-	record.UpstreamStatus = failure.Status
-	record.UpstreamCode = failure.UpstreamCode
-
+// noteFailure records a failure from before commit, and reports it to routing.
+func noteFailure(ctx context.Context, x *exchange, selected *routing.Selected, record *accounting.Attempt, failure *provider.Error) {
+	fillFailure(record, failure)
 	if x.r.Context().Err() != nil {
 		record.Outcome = accounting.OutcomeClientCanceled
 		selected.Abandon()
 		return
 	}
 	record.Outcome = accounting.OutcomeFailed
+	reportToRouting(ctx, selected, failure)
+}
+
+func fillFailure(record *accounting.Attempt, failure *provider.Error) {
+	record.ErrorKind = failure.Kind
+	record.Delivery = failure.Delivery
+	record.UpstreamStatus = failure.Status
+	record.UpstreamCode = failure.UpstreamCode
+}
+
+// reportToRouting tells routing how an attempt failed, unless the failure says nothing
+// about the route. Running out of the time a whole request is allowed is one such case:
+// a client asking for a long output is its own choice, and counting it would let one
+// team's long requests open a breaker for every team. The attempt's own timers do count,
+// and those are what catch a provider that has hung.
+func reportToRouting(ctx context.Context, selected *routing.Selected, failure *provider.Error) {
+	if errors.Is(context.Cause(ctx), context.DeadlineExceeded) {
+		selected.Abandon()
+		return
+	}
 	selected.Finish(failure)
 }
 
@@ -370,7 +397,7 @@ func providerFailure(ctx context.Context, err error) *provider.Error {
 		failure = &provider.Error{Kind: provider.KindServer, Delivery: provider.DeliveryUncertain, Err: err}
 	}
 	cause := context.Cause(ctx)
-	if errors.Is(cause, errFirstEventTimeout) || errors.Is(cause, errStreamIdleTimeout) {
+	if errors.Is(cause, errFirstEventTimeout) || errors.Is(cause, errStreamIdleTimeout) || errors.Is(cause, errCompletionTimeout) {
 		timedOut := *failure
 		timedOut.Kind = provider.KindTimeout
 		return &timedOut
@@ -396,11 +423,23 @@ func (x *exchange) setRouteHeaders(selected *routing.Selected) {
 	header.Set(headerAttempts, strconv.Itoa(x.attempts))
 }
 
-func (s *Server) completionAttempt(ctx context.Context, x *exchange, selected *routing.Selected, record *accounting.Attempt) *provider.Error {
+// completionContext gives a non-streaming attempt its own deadline, so that one hung
+// attempt can't use up the time a fallback would need.
+func (s *Server) completionContext(parent context.Context) (context.Context, context.CancelFunc) {
+	if s.limits.CompletionTimeout > 0 {
+		return context.WithTimeoutCause(parent, s.limits.CompletionTimeout, errCompletionTimeout)
+	}
+	return context.WithCancel(parent)
+}
+
+func (s *Server) completionAttempt(parent context.Context, x *exchange, selected *routing.Selected, record *accounting.Attempt) *provider.Error {
+	ctx, cancel := s.completionContext(parent)
+	defer cancel()
+
 	completion, err := selected.Route.Provider.Complete(ctx, x.req, selected.Route.Model)
 	if err != nil {
 		failure := providerFailure(ctx, err)
-		noteFailure(x, selected, record, failure)
+		noteFailure(ctx, x, selected, record, failure)
 		return failure
 	}
 	record.Usage = completion.Usage
@@ -464,7 +503,7 @@ func (s *Server) streamAttempt(parent context.Context, x *exchange, selected *ro
 	stream, err := selected.Route.Provider.Stream(ctx, x.req, selected.Route.Model)
 	if err != nil {
 		failure := providerFailure(ctx, err)
-		noteFailure(x, selected, record, failure)
+		noteFailure(ctx, x, selected, record, failure)
 		return failure
 	}
 	defer func() { _ = stream.Close() }()
@@ -480,7 +519,7 @@ func (s *Server) streamAttempt(parent context.Context, x *exchange, selected *ro
 	}
 	if err != nil {
 		failure := providerFailure(ctx, err)
-		noteFailure(x, selected, record, failure)
+		noteFailure(ctx, x, selected, record, failure)
 		return failure
 	}
 	watchdog.stop()
@@ -549,18 +588,14 @@ func awaitFirstOutput(stream provider.Stream, record *accounting.Attempt) (chat.
 // tried, and the stream must not appear to have succeeded.
 func (s *Server) interruptStream(ctx context.Context, x *exchange, selected *routing.Selected, record *accounting.Attempt, out *streamWriter, err error) {
 	failure := providerFailure(ctx, err)
-	record.ErrorKind = failure.Kind
-	record.Delivery = failure.Delivery
-	record.UpstreamStatus = failure.Status
-	record.UpstreamCode = failure.UpstreamCode
-
+	fillFailure(record, failure)
 	if x.r.Context().Err() != nil {
 		record.Outcome = accounting.OutcomeClientCanceled
 		selected.Abandon()
 		return
 	}
 	record.Outcome = accounting.OutcomeInterrupted
-	selected.Finish(failure)
+	reportToRouting(ctx, selected, failure)
 	if err := out.writeError(streamInterrupted()); err != nil {
 		s.logger.LogAttrs(ctx, slogLevelDebug, "could not deliver stream error", attrRequestID(x.id))
 	}

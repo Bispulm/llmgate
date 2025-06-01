@@ -93,6 +93,7 @@ func serve(ctx context.Context, args []string, getenv func(string) string, stder
 			RequestTimeout:     cfg.Limits.RequestTimeout,
 			FirstEventTimeout:  cfg.Limits.FirstEventTimeout,
 			StreamIdleTimeout:  cfg.Limits.StreamIdleTimeout,
+			CompletionTimeout:  cfg.Limits.CompletionTimeout,
 			ClientWriteTimeout: cfg.Limits.ClientWriteTimeout,
 			BodyReadTimeout:    cfg.Limits.BodyReadTimeout,
 		},
