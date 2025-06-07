@@ -197,6 +197,34 @@ func TestBreakerClosesAfterAllProbesSucceed(t *testing.T) {
 	}
 }
 
+// When the cooldown is shorter than the window, the failures that opened the breaker
+// are still inside the window after it recovers. They must not count, or one more
+// failure would open it again at once.
+func TestRecoveryStartsWithCleanEvidence(t *testing.T) {
+	clock := newFakeClock()
+	cfg := testBreakerConfig()
+	cfg.Window = time.Minute
+	cfg.Cooldown = time.Second
+	b := NewBreaker(cfg, clock.Now)
+	openBreaker(t, b)
+
+	clock.Advance(time.Second)
+	first, _ := b.Allow()
+	second, _ := b.Allow()
+	b.Report(first, HealthSuccess)
+	b.Report(second, HealthSuccess)
+	if b.State() != BreakerClosed {
+		t.Fatalf("state = %s", b.State())
+	}
+
+	for range 3 {
+		record(t, b, HealthFailure)
+	}
+	if b.State() != BreakerClosed {
+		t.Fatalf("state = %s: failures from before recovery counted", b.State())
+	}
+}
+
 func TestBreakerReopensOnAFailedProbe(t *testing.T) {
 	b, clock := newTestBreaker(t)
 	openBreaker(t, b)
