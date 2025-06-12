@@ -14,6 +14,7 @@ import (
 
 	"github.com/Bispulm/llmgate/internal/accounting"
 	"github.com/Bispulm/llmgate/internal/auth"
+	"github.com/Bispulm/llmgate/internal/limits"
 	"github.com/Bispulm/llmgate/internal/routing"
 )
 
@@ -37,37 +38,58 @@ type Limits struct {
 	BodyReadTimeout time.Duration
 }
 
+// Ledger is the authority for money, and the only thing that can admit an attempt.
+type Ledger interface {
+	Reserve(ctx context.Context, r accounting.ReserveRequest) (*accounting.Reservation, error)
+	MarkDispatched(ctx context.Context, attemptID string, lease time.Duration) error
+	Finish(ctx context.Context, f accounting.FinishRequest) (accounting.Settlement, error)
+}
+
+// TeamLimiter applies the limits a team is promised across replicas.
+type TeamLimiter interface {
+	Admit(ctx context.Context, team string, cfg limits.TeamLimits, requestID string, hold time.Duration) (limits.Decision, func(), error)
+	DebitTokens(ctx context.Context, team string, cfg limits.TeamLimits, tokens int64) error
+}
+
 // Options configures a Server.
 type Options struct {
 	Logger   *slog.Logger
 	Auth     auth.Authenticator
 	Routes   *routing.Table
 	Recorder accounting.Recorder
-	Limits   Limits
+	// Ledger enforces budgets. Without one, nothing does, and every response says so.
+	Ledger Ledger
+	// TeamLimiter applies team limits. Without one, teams have none.
+	TeamLimiter TeamLimiter
+	Limits      Limits
 }
 
 // Server handles client requests. Use New to create one.
 type Server struct {
-	logger   *slog.Logger
-	auth     auth.Authenticator
-	routes   *routing.Table
-	recorder accounting.Recorder
-	limits   Limits
-	mux      *http.ServeMux
-	draining atomic.Bool
-	inflight atomic.Int64
+	logger      *slog.Logger
+	auth        auth.Authenticator
+	routes      *routing.Table
+	recorder    accounting.Recorder
+	ledger      Ledger
+	teamLimiter TeamLimiter
+	limits      Limits
+	mux         *http.ServeMux
+	draining    atomic.Bool
+	inflight    atomic.Int64
 }
 
 // New returns a Server. Without an Authenticator every request is rejected, so a
 // partly configured server can't serve traffic by accident.
 func New(opts Options) *Server {
 	s := &Server{
-		logger:   opts.Logger,
-		auth:     opts.Auth,
-		routes:   opts.Routes,
-		recorder: opts.Recorder,
-		limits:   opts.Limits,
-		mux:      http.NewServeMux(),
+		logger:      opts.Logger,
+		auth:        opts.Auth,
+		routes:      opts.Routes,
+		recorder:    opts.Recorder,
+		ledger:      opts.Ledger,
+		teamLimiter: opts.TeamLimiter,
+		limits:      opts.Limits,
+		mux:         http.NewServeMux(),
 	}
 	if s.logger == nil {
 		s.logger = slog.New(slog.DiscardHandler)
