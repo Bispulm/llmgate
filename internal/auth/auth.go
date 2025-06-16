@@ -18,6 +18,14 @@ var ErrInvalidCredential = errors.New("auth: invalid credential")
 type Principal struct {
 	TeamID string
 	KeyID  string
+	Limits TeamLimits
+}
+
+// TeamLimits are a team's limits that aren't about money. Zero means no limit.
+type TeamLimits struct {
+	RequestsPerMinute int64
+	TokensPerMinute   int64
+	MaxInFlight       int64
 }
 
 // Authenticator resolves a bearer token to its principal.
