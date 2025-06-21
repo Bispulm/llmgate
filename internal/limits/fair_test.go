@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -271,6 +272,41 @@ func TestCanceledWaiterLeavesTheQueue(t *testing.T) {
 	next.release()
 	if got := l.Stats(); got.InFlight != 0 || got.Queued != 0 {
 		t.Fatalf("stats = %+v", got)
+	}
+}
+
+// A slot can be granted at the moment a waiter's context ends. Both are then ready, and
+// the waiter may see the cancellation first. It has to give that slot back, or capacity
+// would drain away. This repeats because which one wins is up to the scheduler.
+func TestAGrantRacingCancellationGivesTheSlotBack(t *testing.T) {
+	l := NewFairLimiter(Config{MaxConcurrency: 1, MaxQueue: 1})
+	lost := 0
+	for range 3000 {
+		holder := mustAcquire(t, l, "a")
+		ctx, cancel := context.WithCancel(context.Background())
+		done := make(chan error, 1)
+		var release func()
+		go func() {
+			r, err := l.Acquire(ctx, "b")
+			release = r
+			done <- err
+		}()
+		for l.Stats().Queued == 0 {
+			runtime.Gosched()
+		}
+		cancel()
+		holder()
+		if err := <-done; err != nil {
+			lost++
+		} else {
+			release()
+		}
+		if got := l.Stats(); got.InFlight != 0 || got.Queued != 0 {
+			t.Fatalf("after a race: %+v", got)
+		}
+	}
+	if lost == 0 {
+		t.Log("the waiter never saw the cancellation first, so this run proved less than it could")
 	}
 }
 
