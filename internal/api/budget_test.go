@@ -307,6 +307,32 @@ func TestARevokedKeyStopsWithinTheCacheBound(t *testing.T) {
 	}
 }
 
+type brokenAuth struct{}
+
+func (brokenAuth) Authenticate(context.Context, string) (auth.Principal, error) {
+	return auth.Principal{}, fmt.Errorf("%w: connection refused", auth.ErrUnavailable)
+}
+
+// A valid key isn't invalid just because it couldn't be checked: a client told so might
+// throw away a good key, and an operator would look in the wrong place.
+func TestAnAuthenticationOutageIsNotAnInvalidKey(t *testing.T) {
+	ts := httptest.NewServer(New(Options{Auth: brokenAuth{}, Limits: testLimits()}))
+	defer ts.Close()
+	resp, body := call(t, ts.Client(), ts.URL, "lgk_abc_def", chatBody(false, ""))
+	if resp.StatusCode != http.StatusServiceUnavailable || !strings.Contains(body, codeAuthUnavailable) {
+		t.Fatalf("status = %d: %s", resp.StatusCode, body)
+	}
+	if strings.Contains(body, "connection refused") {
+		t.Fatalf("an internal error reached the client: %s", body)
+	}
+	if got := resp.Header.Get("WWW-Authenticate"); got != "" {
+		t.Fatalf("WWW-Authenticate = %q", got)
+	}
+	if got := resp.Header.Get("Retry-After"); got == "" {
+		t.Fatal("no Retry-After")
+	}
+}
+
 func TestATeamCantBeChosenByTheRequest(t *testing.T) {
 	e := newTenantEnv(t, "alpha;tokens=1")
 	key := e.addTeam("mine", 100_000)
