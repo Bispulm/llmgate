@@ -23,9 +23,9 @@ type Principal struct {
 
 // TeamLimits are a team's limits that aren't about money. Zero means no limit.
 type TeamLimits struct {
-	RequestsPerMinute int64
-	TokensPerMinute   int64
-	MaxInFlight       int64
+	RequestsPerMinute int64 `json:"requests_per_minute"`
+	TokensPerMinute   int64 `json:"tokens_per_minute"`
+	MaxInFlight       int64 `json:"max_in_flight"`
 }
 
 // Authenticator resolves a bearer token to its principal.
