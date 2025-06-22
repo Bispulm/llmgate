@@ -135,6 +135,7 @@ const (
 	SkipBreakerOpen SkipReason = "breaker_open"
 	SkipHeld        SkipReason = "rate_limit_hold"
 	SkipSaturated   SkipReason = "saturated"
+	SkipUnpriced    SkipReason = "unpriced"
 )
 
 // Plan is the routes a request may use, in order. It isn't safe for concurrent use,
@@ -206,6 +207,9 @@ func (p *Plan) skip(reason SkipReason) {
 
 // NoteSaturated records that an offered route had no capacity.
 func (p *Plan) NoteSaturated() { p.skip(SkipSaturated) }
+
+// NoteUnpriced records that an offered route has no price, so its cost can't be bounded.
+func (p *Plan) NoteUnpriced() { p.skip(SkipUnpriced) }
 
 // Skipped counts why routes weren't offered.
 func (p *Plan) Skipped() map[SkipReason]int { return p.skipped }
