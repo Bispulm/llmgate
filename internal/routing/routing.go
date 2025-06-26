@@ -5,7 +5,9 @@ package routing
 
 import (
 	"math/rand/v2"
+	"slices"
 	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -114,6 +116,16 @@ func NewTable(aliases []Alias, opts Options) *Table {
 func (t *Table) Resolve(name string) (*Alias, bool) {
 	a, ok := t.aliases[name]
 	return a, ok
+}
+
+// Aliases returns every alias, in name order.
+func (t *Table) Aliases() []*Alias {
+	out := make([]*Alias, 0, len(t.aliases))
+	for _, a := range t.aliases {
+		out = append(out, a)
+	}
+	slices.SortFunc(out, func(a, b *Alias) int { return strings.Compare(a.Name, b.Name) })
+	return out
 }
 
 func (t *Table) randomFloat() float64 {
