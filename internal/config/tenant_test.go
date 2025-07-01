@@ -52,6 +52,9 @@ func TestTenantModeLoadsWithDefaults(t *testing.T) {
 		cfg.Accounting.UncertainGrace != DefaultUncertainGrace || cfg.Accounting.RejectedAttemptCharge != RejectedChargeNone {
 		t.Fatalf("defaults: %+v %+v", cfg.Auth, cfg.Accounting)
 	}
+	if cfg.Redis.KeyPrefix != DefaultRedisKeyPrefix {
+		t.Fatalf("key_prefix = %q", cfg.Redis.KeyPrefix)
+	}
 	if cfg.RateLimits.OnRedisFailure != RedisFailureClosed {
 		t.Fatalf("on_redis_failure = %q: the default has to be closed", cfg.RateLimits.OnRedisFailure)
 	}
@@ -144,6 +147,17 @@ func TestTenantModeRejectsInvalidConfig(t *testing.T) {
 				t.Fatalf("err = %v, want it to mention %q", err, tt.wantInMessage)
 			}
 		})
+	}
+}
+
+func TestTenantModeAllowsAnyFreePortForBoth(t *testing.T) {
+	yaml := strings.Replace(strings.Replace(tenantYAML, "listen: 127.0.0.1:18302", "listen: 127.0.0.1:0", 1), "listen: 0.0.0.0:18300", "listen: 127.0.0.1:0", 1)
+	if _, err := Load(writeConfig(t, yaml)); err != nil {
+		t.Fatal(err)
+	}
+	same := strings.Replace(strings.Replace(tenantYAML, "listen: 127.0.0.1:18302", "listen: 127.0.0.1:18300", 1), "listen: 0.0.0.0:18300", "listen: 127.0.0.1:18300", 1)
+	if _, err := Load(writeConfig(t, same)); err == nil || !strings.Contains(err.Error(), "same address") {
+		t.Fatalf("err = %v", err)
 	}
 }
 
