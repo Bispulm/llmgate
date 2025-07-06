@@ -192,3 +192,9 @@ func TestDevModeRejectsTenantSettings(t *testing.T) {
 	}
 	_ = time.Second
 }
+
+func TestTheTenantExampleLoads(t *testing.T) {
+	if _, err := Load("../../configs/tenant.yaml"); err != nil {
+		t.Fatal(err)
+	}
+}

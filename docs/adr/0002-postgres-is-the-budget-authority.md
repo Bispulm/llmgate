@@ -1,6 +1,6 @@
 # ADR 0002: Postgres is the budget authority
 
-**Status:** Accepted, 2026-11-05. Implementation is planned for M3. Until then the gateway enforces no budgets and says so: see [Pre-M3 behavior](#pre-m3-behavior).
+**Status:** Accepted and implemented, 2026-11-05. Tenant mode enforces it. Development mode enforces no budget and says so: see [Development mode](#development-mode).
 
 ## Context
 
@@ -45,7 +45,7 @@ reservation  = cost(input_bound at the highest input-class rate)
 ```
 
 - The highest input-class rate covers cache writes, which can cost more than plain input.
-- OpenAI's `max_completion_tokens` documents that it includes reasoning tokens. Anthropic's `max_tokens` is to be confirmed for thinking tokens when that adapter is written.
+- OpenAI's `max_completion_tokens` documents that it includes reasoning tokens. Anthropic's `max_tokens` is a strict limit that includes thinking tokens, and its `output_tokens` is the inclusive billing total, so the same output bound covers both. Checked against Anthropic's documentation on 2026-11-05.
 - A price entry missing for any route is a rejection in strict mode, not a zero.
 
 **What is guaranteed:** the invariant above holds for the reservation amounts, across replicas, crashes, and retries.
@@ -81,7 +81,8 @@ stateDiagram-v2
 The rule is that dispatch intent commits **before** the request is sent. A `reserved` row therefore proves nothing was sent, and every other state assumes money may have been spent.
 
 - **Lease expiry** transfers who may reconcile an attempt. It never releases money.
-- **Absent usage** is `uncertain`, never zero. The default conservative charge is the full reservation, adjustable by a documented estimate policy, and is recorded as an estimate.
+- **Absent usage** is `uncertain`, never zero. After a grace period, `accounting.uncertain_grace`, the charge is the full reservation, recorded as `conservative`. Late usage corrects it once, through a `late_adjustment` entry. No estimate policy is offered: an estimate could undercharge, and the full reservation can't.
+- **A refusal with no usage**, such as a provider's 4xx or 5xx before any output, is charged nothing by default and recorded as `rejected`. Providers don't normally bill for those, but that's a policy rather than something they guarantee, so `accounting.rejected_attempt_charge: conservative` treats them as unknown instead.
 - **Settlement** is one transaction: a conditional state transition plus a ledger insert with a unique `(attempt_id, entry_kind)`. Repeat callbacks, retries, and reconcilers change nothing the second time.
 
 ### Periods and limit changes
@@ -93,7 +94,7 @@ A reservation stays with the period that admitted it. Rollover opens a new perio
 | Failure | Behavior |
 |---|---|
 | Postgres unavailable | Admission fails closed with 503. In-flight requests continue. Settlement retries with a separate bounded context, and the reconciler picks up what remains. |
-| Redis unavailable | Rate limiting fails closed by default. A bounded fail-open mode may be offered, but budget checks stay active because they never depended on Redis. |
+| Redis unavailable | Team limits fail closed by default, with 503 `rate_limit_unavailable`. `rate_limits.on_redis_failure: open` falls back to each team's limits enforced per replica, so the worst case is that rate times the number of replicas. Budget checks stay active either way, because they never depended on Redis. |
 | Client cancels | Upstream is canceled. Accounting runs on a separate bounded context. Cancellation does not imply zero cost. |
 
 ## Alternatives considered
@@ -108,6 +109,22 @@ A reservation stays with the period that admitted it. Rollover opens a new perio
 - Budget accounting stays conservative: a crash can hold or charge liability that no provider actually billed, until reconciled. That favors the budget limit over the team's available spend.
 - A team with many concurrent large requests can be rejected for reservations it wouldn't have fully used.
 
-## Pre-M3 behavior
+## How the gateway applies this
 
-Until M3 ships, there are no budgets, durable usage records, or tenant keys. Every proxied response carries `x-llmgate-budget-enforcement: none`, usage is only written to logs, and authentication is a single development key restricted to loopback listeners. Nothing built before M3 should be read as spending control.
+Per attempt, in `internal/api`:
+
+1. Take a slot on the route's concurrency limiter. Queueing happens here, so waiting doesn't tie up budget.
+2. `Reserve`, in one transaction that locks the period row. A refusal answers 429 `budget_exhausted`, and the request stops: it never drops to a cheaper route without being asked.
+3. `MarkDispatched`, which only succeeds if the attempt is still `reserved`. If it fails, nothing is sent, and the gateway releases the reservation itself, since it knows nothing went out.
+4. Send.
+5. `Finish`, on a context of its own with a bounded retry. If it never succeeds, the attempt stays open with its liability held, and the reconciler resolves it.
+
+Both admission steps share a five-second bound, so a database that has hung refuses requests quickly rather than holding them until their deadline. Every replica runs the reconciler on an interval.
+
+A non-streaming response is flushed to the client before settlement, so a slow database doesn't delay a finished answer. A client that checks its budget straight away can see the reservation still held for a moment.
+
+An attempt's owner can outlast its lease, so that the reconciler has already charged the full reservation. The owner's usage report then corrects that charge, once.
+
+## Development mode
+
+Without `auth.mode: tenant` there are no budgets, durable usage records, or tenant keys. Every proxied response carries `X-Llmgate-Budget-Enforcement: none`, usage is only written to logs, and authentication is a single development key restricted to loopback listeners. Nothing in development mode should be read as spending control.
