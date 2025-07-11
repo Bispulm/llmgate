@@ -56,7 +56,7 @@ func TestServeRunsUntilCanceled(t *testing.T) {
 	addrs := make(chan string, 1)
 	done := make(chan error, 1)
 	go func() {
-		done <- run(ctx, []string{"serve", "-config", writeTestConfig(t)}, testEnv, io.Discard, func(addr string) { addrs <- addr })
+		done <- run(ctx, []string{"serve", "--config", writeTestConfig(t)}, process{getenv: testEnv, stdout: io.Discard, stderr: io.Discard, started: func(l listening) { addrs <- l.Gateway }})
 	}()
 
 	var addr string
@@ -101,7 +101,7 @@ func startServe(t *testing.T, config string) string {
 	addrs := make(chan string, 1)
 	done := make(chan error, 1)
 	go func() {
-		done <- run(ctx, []string{"serve", "-config", path}, testEnv, io.Discard, func(addr string) { addrs <- addr })
+		done <- run(ctx, []string{"serve", "--config", path}, process{getenv: testEnv, stdout: io.Discard, stderr: io.Discard, started: func(l listening) { addrs <- l.Gateway }})
 	}()
 	t.Cleanup(func() {
 		cancel()
@@ -295,7 +295,7 @@ func TestShutdown(t *testing.T) {
 		addrs := make(chan string, 1)
 		done := make(chan error, 1)
 		go func() {
-			done <- run(ctx, []string{"serve", "-config", path}, testEnv, logs, func(addr string) { addrs <- addr })
+			done <- run(ctx, []string{"serve", "--config", path}, process{getenv: testEnv, stdout: io.Discard, stderr: logs, started: func(l listening) { addrs <- l.Gateway }})
 		}()
 		select {
 		case addr := <-addrs:
@@ -388,7 +388,7 @@ func TestServeLogsThatBudgetsAreNotEnforced(t *testing.T) {
 	started := make(chan struct{})
 	done := make(chan error, 1)
 	go func() {
-		done <- run(ctx, []string{"serve", "-config", writeTestConfig(t)}, testEnv, &logs, func(string) { close(started) })
+		done <- run(ctx, []string{"serve", "--config", writeTestConfig(t)}, process{getenv: testEnv, stdout: io.Discard, stderr: &logs, started: func(listening) { close(started) }})
 	}()
 	select {
 	case <-started:
@@ -412,12 +412,12 @@ func TestRunReportsUsageErrors(t *testing.T) {
 	}{
 		{"no command", nil, "usage"},
 		{"unknown command", []string{"nope"}, "unknown command"},
-		{"serve without a config", []string{"serve"}, "-config"},
+		{"serve without a config", []string{"serve"}, "config"},
 		{"unknown flag", []string{"serve", "-nope"}, "nope"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			err := run(context.Background(), tt.args, testEnv, io.Discard, nil)
+			err := run(context.Background(), tt.args, process{getenv: testEnv, stdout: io.Discard, stderr: io.Discard})
 			if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
 				t.Fatalf("error = %v, want it to mention %q", err, tt.wantErr)
 			}
@@ -426,8 +426,8 @@ func TestRunReportsUsageErrors(t *testing.T) {
 }
 
 func TestServeRefusesToStartWithoutCredentials(t *testing.T) {
-	err := run(context.Background(), []string{"serve", "-config", writeTestConfig(t)},
-		func(string) string { return "" }, io.Discard, nil)
+	err := run(context.Background(), []string{"serve", "--config", writeTestConfig(t)},
+		process{getenv: func(string) string { return "" }, stdout: io.Discard, stderr: io.Discard})
 	if err == nil || !strings.Contains(err.Error(), "TEST_DEV_KEY") {
 		t.Fatalf("error = %v", err)
 	}

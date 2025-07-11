@@ -13,6 +13,8 @@ import (
 	"time"
 
 	"go.yaml.in/yaml/v3"
+
+	"github.com/Bispulm/llmgate/internal/accounting"
 )
 
 // Provider types.
@@ -41,12 +43,48 @@ const (
 	DefaultBodyReadTimeout          = 10 * time.Second
 	DefaultShutdownTimeout          = 30 * time.Second
 	DefaultQueueTimeout             = 5 * time.Second
+	DefaultKeyCacheTTL              = 30 * time.Second
+	DefaultReconcileInterval        = 15 * time.Second
+	DefaultUncertainGrace           = 10 * time.Minute
+	DefaultDatabaseMaxConns         = 20
+	DefaultRedisKeyPrefix           = "llmgate:"
+
+	// MaxKeyCacheTTL bounds how long a revoked key can keep working on another replica.
+	MaxKeyCacheTTL = 5 * time.Minute
+	// MinAdminTokenLength keeps the admin token from being guessable.
+	MinAdminTokenLength = 16
+)
+
+// Authentication modes.
+const (
+	// AuthDev accepts one shared key, enforces no budget, and only listens on loopback.
+	AuthDev = "dev"
+	// AuthTenant uses virtual keys, budgets, and team limits, backed by Postgres and Redis.
+	AuthTenant = "tenant"
+)
+
+// What team limits do when Redis can't be reached. Budgets don't depend on Redis.
+const (
+	RedisFailureClosed = "closed"
+	RedisFailureOpen   = "open"
+)
+
+// How to charge an attempt the provider refused, with no usage report.
+const (
+	RejectedChargeNone         = "none"
+	RejectedChargeConservative = "conservative"
 )
 
 // Config is the validated contents of a configuration file.
 type Config struct {
 	Server         Server         `yaml:"server"`
 	Auth           Auth           `yaml:"auth"`
+	Database       Database       `yaml:"database"`
+	Redis          Redis          `yaml:"redis"`
+	RateLimits     RateLimits     `yaml:"rate_limits"`
+	Admin          Admin          `yaml:"admin"`
+	Pricing        Pricing        `yaml:"pricing"`
+	Accounting     Accounting     `yaml:"accounting"`
 	Limits         Limits         `yaml:"limits"`
 	CircuitBreaker CircuitBreaker `yaml:"circuit_breaker"`
 	Providers      []Provider     `yaml:"providers"`
@@ -69,10 +107,81 @@ type Server struct {
 	ShutdownTimeout time.Duration `yaml:"shutdown_timeout"`
 }
 
-// Auth configures client authentication. Until tenant keys exist this is one
-// development key, which is why Load only accepts loopback listeners.
+// Auth configures client authentication. Development mode accepts one shared key and
+// enforces no budget, which is why it only accepts loopback listeners.
 type Auth struct {
+	Mode      string `yaml:"mode"`
 	DevKeyEnv string `yaml:"dev_key_env"`
+	// KeyCacheTTL is the most a revoked key, or a team's old limits, can keep working.
+	KeyCacheTTL time.Duration `yaml:"key_cache_ttl"`
+}
+
+// Database is the Postgres that holds teams, keys, and the ledger.
+type Database struct {
+	URLEnv   string `yaml:"url_env"`
+	MaxConns int32  `yaml:"max_conns"`
+}
+
+// Redis holds team rate limits.
+type Redis struct {
+	URLEnv string `yaml:"url_env"`
+	// KeyPrefix namespaces the gateway's keys, so that environments can share a Redis.
+	KeyPrefix string `yaml:"key_prefix"`
+}
+
+// RateLimits configures team limits.
+type RateLimits struct {
+	// OnRedisFailure is closed, which refuses requests, or open, which falls back to a
+	// limit in each replica. Budgets stay enforced either way.
+	OnRedisFailure string `yaml:"on_redis_failure"`
+}
+
+// Admin configures the admin API, which has its own listener and token.
+type Admin struct {
+	Listen   string `yaml:"listen"`
+	TokenEnv string `yaml:"token_env"`
+	// AllowNonLoopback has to be set to serve the admin API beyond this machine.
+	AllowNonLoopback bool `yaml:"allow_non_loopback"`
+}
+
+// Pricing is a labeled, immutable price list. Changing a price means a new version.
+type Pricing struct {
+	Version string  `yaml:"version"`
+	Prices  []Price `yaml:"prices"`
+}
+
+// Price is one route's rates, as quoted decimal strings of USD per million tokens.
+type Price struct {
+	Provider    string  `yaml:"provider"`
+	Model       string  `yaml:"model"`
+	Input       Decimal `yaml:"input_usd_per_mtok"`
+	CachedInput Decimal `yaml:"cached_input_usd_per_mtok"`
+	CacheWrite  Decimal `yaml:"cache_write_usd_per_mtok"`
+	Output      Decimal `yaml:"output_usd_per_mtok"`
+}
+
+// Decimal is a number written as a quoted string. An unquoted number is rejected,
+// because YAML reads it as a float, which can't hold most prices exactly.
+type Decimal struct {
+	Value  string
+	quoted bool
+}
+
+// UnmarshalYAML implements yaml.Unmarshaler.
+func (d *Decimal) UnmarshalYAML(node *yaml.Node) error {
+	d.Value = node.Value
+	d.quoted = node.Kind == yaml.ScalarNode && node.Tag == "!!str"
+	return nil
+}
+
+// Accounting configures settlement and reconciliation.
+type Accounting struct {
+	ReconcileInterval time.Duration `yaml:"reconcile_interval"`
+	// UncertainGrace is how long an attempt of unknown cost waits for usage to arrive,
+	// before being charged everything it reserved.
+	UncertainGrace time.Duration `yaml:"uncertain_grace"`
+	// RejectedAttemptCharge is none or conservative, for an attempt the provider refused.
+	RejectedAttemptCharge string `yaml:"rejected_attempt_charge"`
 }
 
 // Limits bounds what one request can consume.
@@ -133,7 +242,13 @@ const maxAttemptsLimit = 10
 type Secrets struct {
 	DevKey       string
 	ProviderKeys map[string]string
+	DatabaseURL  string
+	RedisURL     string
+	AdminToken   string
 }
+
+// Tenant reports whether this configuration uses virtual keys and budgets.
+func (c *Config) Tenant() bool { return c.Auth.Mode == AuthTenant }
 
 // Load reads and validates a configuration file. Unknown fields are errors, so
 // a typo can't silently leave a limit at its default.
@@ -150,6 +265,9 @@ func Load(path string) (*Config, error) {
 	if err := decoder.Decode(&cfg); err != nil {
 		return nil, fmt.Errorf("parsing config: %w", err)
 	}
+	if err := cfg.validateMode(); err != nil {
+		return nil, fmt.Errorf("invalid config: %w", err)
+	}
 	cfg.applyDefaults()
 	if err := cfg.validate(); err != nil {
 		return nil, fmt.Errorf("invalid config: %w", err)
@@ -161,8 +279,23 @@ func Load(path string) (*Config, error) {
 // os.Getenv. It fails if any is unset, so a gateway can't start half configured.
 func (c *Config) ResolveSecrets(getenv func(string) string) (*Secrets, error) {
 	secrets := &Secrets{ProviderKeys: make(map[string]string, len(c.Providers))}
-	if secrets.DevKey = getenv(c.Auth.DevKeyEnv); secrets.DevKey == "" {
-		return nil, fmt.Errorf("environment variable %s is not set", c.Auth.DevKeyEnv)
+	required := []struct {
+		name  string
+		value *string
+	}{{c.Auth.DevKeyEnv, &secrets.DevKey}}
+	if c.Tenant() {
+		required = []struct {
+			name  string
+			value *string
+		}{{c.Database.URLEnv, &secrets.DatabaseURL}, {c.Redis.URLEnv, &secrets.RedisURL}, {c.Admin.TokenEnv, &secrets.AdminToken}}
+	}
+	for _, r := range required {
+		if *r.value = getenv(r.name); *r.value == "" {
+			return nil, fmt.Errorf("environment variable %s is not set", r.name)
+		}
+	}
+	if c.Tenant() && len(secrets.AdminToken) < MinAdminTokenLength {
+		return nil, fmt.Errorf("environment variable %s must hold at least %d characters", c.Admin.TokenEnv, MinAdminTokenLength)
 	}
 	for _, p := range c.Providers {
 		key := getenv(p.APIKeyEnv)
@@ -174,8 +307,36 @@ func (c *Config) ResolveSecrets(getenv func(string) string) (*Secrets, error) {
 	return secrets, nil
 }
 
+// validateMode runs before defaults, so that it can see which settings were written.
+func (c *Config) validateMode() error {
+	setDefault(&c.Auth.Mode, AuthDev)
+	switch c.Auth.Mode {
+	case AuthDev:
+		// Settings like these would look like protection that development mode doesn't give.
+		if c.Database != (Database{}) || c.Redis != (Redis{}) || c.Admin != (Admin{}) || c.Pricing.Version != "" || len(c.Pricing.Prices) > 0 {
+			return errors.New("database, redis, admin, and pricing need auth.mode: tenant")
+		}
+	case AuthTenant:
+		if c.Auth.DevKeyEnv != "" {
+			return errors.New("auth.dev_key_env can't be used with auth.mode: tenant")
+		}
+	default:
+		return fmt.Errorf("auth.mode must be %s or %s", AuthDev, AuthTenant)
+	}
+	return nil
+}
+
 func (c *Config) applyDefaults() {
 	setDefault(&c.Server.ShutdownTimeout, DefaultShutdownTimeout)
+	if c.Tenant() {
+		setDefault(&c.Auth.KeyCacheTTL, DefaultKeyCacheTTL)
+		setDefault(&c.Database.MaxConns, DefaultDatabaseMaxConns)
+		setDefault(&c.Redis.KeyPrefix, DefaultRedisKeyPrefix)
+		setDefault(&c.RateLimits.OnRedisFailure, RedisFailureClosed)
+		setDefault(&c.Accounting.ReconcileInterval, DefaultReconcileInterval)
+		setDefault(&c.Accounting.UncertainGrace, DefaultUncertainGrace)
+		setDefault(&c.Accounting.RejectedAttemptCharge, RejectedChargeNone)
+	}
 	setDefault(&c.Limits.MaxRequestBytes, DefaultMaxRequestBytes)
 	setDefault(&c.Limits.MaxResponseBytes, DefaultMaxResponseBytes)
 	setDefault(&c.Limits.MaxEventBytes, DefaultMaxEventBytes)
@@ -201,10 +362,14 @@ func setDefault[T comparable](field *T, value T) {
 }
 
 func (c *Config) validate() error {
-	if err := validateListen(c.Server.Listen); err != nil {
+	if err := validateListen(c.Server.Listen, c.Tenant()); err != nil {
 		return err
 	}
-	if c.Auth.DevKeyEnv == "" {
+	if c.Tenant() {
+		if err := c.validateTenant(); err != nil {
+			return err
+		}
+	} else if c.Auth.DevKeyEnv == "" {
 		return errors.New("auth.dev_key_env is required")
 	}
 	if err := c.Limits.validate(); err != nil {
@@ -251,9 +416,9 @@ func (c *Config) validate() error {
 	return nil
 }
 
-// validateListen allows loopback addresses only. The only client authentication
-// so far is a shared development key, which must not be reachable from a network.
-func validateListen(listen string) error {
+// validateListen allows loopback addresses only in development mode, because a shared
+// development key must not be reachable from a network.
+func validateListen(listen string, tenant bool) error {
 	if listen == "" {
 		return errors.New("server.listen is required")
 	}
@@ -261,10 +426,128 @@ func validateListen(listen string) error {
 	if err != nil {
 		return fmt.Errorf("server.listen: %w", err)
 	}
-	if !isLoopback(host) {
-		return fmt.Errorf("server.listen %q must be a loopback address until tenant authentication exists", listen)
+	if !tenant && !isLoopback(host) {
+		return fmt.Errorf("server.listen %q must be a loopback address unless auth.mode is tenant", listen)
 	}
 	return nil
+}
+
+func (c *Config) validateTenant() error {
+	switch {
+	case c.Database.URLEnv == "":
+		return errors.New("database.url_env is required")
+	case c.Database.MaxConns < 0:
+		return errors.New("database.max_conns must not be negative")
+	case c.Redis.URLEnv == "":
+		return errors.New("redis.url_env is required")
+	case c.Admin.TokenEnv == "":
+		return errors.New("admin.token_env is required")
+	case c.Auth.KeyCacheTTL < 0 || c.Auth.KeyCacheTTL > MaxKeyCacheTTL:
+		return fmt.Errorf("auth.key_cache_ttl must be between 0 and %v, since it bounds revocation", MaxKeyCacheTTL)
+	case c.Accounting.ReconcileInterval < 0:
+		return errors.New("accounting.reconcile_interval must not be negative")
+	case c.Accounting.UncertainGrace < 0:
+		return errors.New("accounting.uncertain_grace must not be negative")
+	}
+	switch c.RateLimits.OnRedisFailure {
+	case RedisFailureClosed, RedisFailureOpen:
+	default:
+		return fmt.Errorf("rate_limits.on_redis_failure must be %s or %s", RedisFailureClosed, RedisFailureOpen)
+	}
+	switch c.Accounting.RejectedAttemptCharge {
+	case RejectedChargeNone, RejectedChargeConservative:
+	default:
+		return fmt.Errorf("accounting.rejected_attempt_charge must be %s or %s", RejectedChargeNone, RejectedChargeConservative)
+	}
+	if err := c.validateAdminListen(); err != nil {
+		return err
+	}
+	if c.Pricing.Version == "" {
+		return errors.New("pricing.version is required")
+	}
+	if _, err := c.PriceList(); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (c *Config) validateAdminListen() error {
+	if c.Admin.Listen == "" {
+		return errors.New("admin.listen is required")
+	}
+	host, _, err := net.SplitHostPort(c.Admin.Listen)
+	if err != nil {
+		return fmt.Errorf("admin.listen: %w", err)
+	}
+	if !isLoopback(host) && !c.Admin.AllowNonLoopback {
+		return fmt.Errorf("admin.listen %q is not loopback, which needs admin.allow_non_loopback: true", c.Admin.Listen)
+	}
+	// Port 0 asks for any free port, so two of them never collide.
+	_, adminPort, _ := net.SplitHostPort(c.Admin.Listen)
+	serverHost, serverPort, _ := net.SplitHostPort(c.Server.Listen)
+	if adminPort != "0" && adminPort == serverPort && (host == serverHost || isUnspecified(host) || isUnspecified(serverHost)) {
+		return errors.New("admin.listen and server.listen can't be the same address")
+	}
+	return nil
+}
+
+func isUnspecified(host string) bool {
+	if host == "" {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsUnspecified()
+}
+
+// PriceList converts the configured prices, and checks that every route has exactly one.
+// A route without a price couldn't have its cost bounded, so it's a startup error rather
+// than something discovered on a request.
+func (c *Config) PriceList() (accounting.PriceList, error) {
+	list := accounting.PriceList{Label: c.Pricing.Version}
+	priced := make(map[[2]string]bool, len(c.Pricing.Prices))
+	for i, p := range c.Pricing.Prices {
+		key := [2]string{p.Provider, p.Model}
+		if p.Provider == "" || p.Model == "" {
+			return list, fmt.Errorf("pricing.prices[%d] needs a provider and a model", i)
+		}
+		if priced[key] {
+			return list, fmt.Errorf("pricing.prices[%d] duplicates an earlier price", i)
+		}
+		priced[key] = true
+		entry := accounting.PriceEntry{Provider: p.Provider, Model: p.Model}
+		fields := []struct {
+			name  string
+			value Decimal
+			into  *int64
+		}{
+			{"input_usd_per_mtok", p.Input, &entry.Prices.Input},
+			{"cached_input_usd_per_mtok", p.CachedInput, &entry.Prices.CachedInput},
+			{"cache_write_usd_per_mtok", p.CacheWrite, &entry.Prices.CacheWrite},
+			{"output_usd_per_mtok", p.Output, &entry.Prices.Output},
+		}
+		for _, f := range fields {
+			if f.value.Value == "" {
+				return list, fmt.Errorf("pricing.prices[%d].%s is required", i, f.name)
+			}
+			if !f.value.quoted {
+				return list, fmt.Errorf("pricing.prices[%d].%s must be a quoted string, like \"1.25\"", i, f.name)
+			}
+			pico, err := accounting.ParseUSDPerMTok(f.value.Value)
+			if err != nil {
+				return list, fmt.Errorf("pricing.prices[%d].%s: %w", i, f.name, err)
+			}
+			*f.into = pico
+		}
+		list.Entries = append(list.Entries, entry)
+	}
+	for _, m := range c.Models {
+		for _, r := range m.Routes {
+			if !priced[[2]string{r.Provider, r.Model}] {
+				return list, fmt.Errorf("model %q: the route to %s/%s has no price", m.Alias, r.Provider, r.Model)
+			}
+		}
+	}
+	return list, nil
 }
 
 func isLoopback(host string) bool {

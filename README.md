@@ -35,7 +35,7 @@ To run the pieces yourself:
 ```bash
 go run ./cmd/llmgate-mock &
 LLMGATE_DEV_KEY=dev LLMGATE_MOCK_PROVIDER_KEY=mock \
-  go run ./cmd/llmgate serve -config configs/demo.yaml &
+  go run ./cmd/llmgate serve --config configs/demo.yaml &
 
 curl http://127.0.0.1:18300/v1/chat/completions \
   -H 'Authorization: Bearer dev' \

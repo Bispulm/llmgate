@@ -12,6 +12,24 @@ import (
 	"github.com/Bispulm/llmgate/internal/testenv"
 )
 
+func TestCheckCurrentNoticesAnOutdatedSchema(t *testing.T) {
+	ctx := context.Background()
+	pool, err := store.Open(ctx, store.PoolConfig{URL: testenv.UnmigratedPostgresURL(t), MaxConns: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Close()
+	if err := store.CheckCurrent(ctx, pool); !errors.Is(err, store.ErrSchemaOutdated) {
+		t.Fatalf("err = %v", err)
+	}
+	if err := store.Migrate(ctx, pool); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.CheckCurrent(ctx, pool); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestMigrationsApplyAndAreIdempotent(t *testing.T) {
 	pool := testenv.Postgres(t, 2)
 	ctx := context.Background()

@@ -62,26 +62,33 @@ func addChecked(a, b int64) (int64, error) {
 // ParseUSDPerMTok converts a decimal string of USD per million tokens to pico-USD per
 // token. Prices stay as strings in configuration, because a float can't represent most
 // of them exactly. Anything but a plain non-negative decimal is rejected.
-func ParseUSDPerMTok(value string) (int64, error) {
+func ParseUSDPerMTok(value string) (int64, error) { return parseMillionths("price", value) }
+
+// ParseUSD converts a decimal string of USD to micro-USD, exactly.
+func ParseUSD(value string) (int64, error) { return parseMillionths("amount", value) }
+
+// parseMillionths reads a non-negative decimal with at most six places, as an integer
+// count of millionths.
+func parseMillionths(what, value string) (int64, error) {
 	whole, fraction, hasPoint := strings.Cut(value, ".")
 	if whole == "" || (hasPoint && fraction == "") {
-		return 0, fmt.Errorf("price %q must be a decimal number", value)
+		return 0, fmt.Errorf("%s %q must be a decimal number", what, value)
 	}
 	if len(fraction) > maxPriceDecimals {
-		return 0, fmt.Errorf("price %q has more than %d decimal places", value, maxPriceDecimals)
+		return 0, fmt.Errorf("%s %q has more than %d decimal places", what, value, maxPriceDecimals)
 	}
-	var pico int64
+	var n int64
 	for _, c := range whole + fraction + strings.Repeat("0", maxPriceDecimals-len(fraction)) {
 		if c < '0' || c > '9' {
-			return 0, fmt.Errorf("price %q must be a decimal number", value)
+			return 0, fmt.Errorf("%s %q must be a decimal number", what, value)
 		}
 		digit := int64(c - '0')
-		if pico > (math.MaxInt64-digit)/10 {
-			return 0, fmt.Errorf("price %q is too large", value)
+		if n > (math.MaxInt64-digit)/10 {
+			return 0, fmt.Errorf("%s %q is too large", what, value)
 		}
-		pico = pico*10 + digit
+		n = n*10 + digit
 	}
-	return pico, nil
+	return n, nil
 }
 
 // Prices are one model's rates, in pico-USD per token.
