@@ -57,6 +57,9 @@ func TestLoadParsesAndAppliesDefaults(t *testing.T) {
 	if got := cfg.Limits.CompletionTimeout; got != 45*time.Second/2 {
 		t.Errorf("default completion_timeout = %v: half the deadline leaves time to fall back", got)
 	}
+	if got := cfg.Limits.AdmissionTimeout; got != DefaultAdmissionTimeout {
+		t.Errorf("default admission_timeout = %v", got)
+	}
 	if got := cfg.Providers[0].MaxTokensParam; got != MaxCompletionTokens {
 		t.Errorf("default max_tokens_param = %q", got)
 	}
@@ -91,6 +94,7 @@ func TestLoadRejectsInvalidConfig(t *testing.T) {
 		{"empty alias", "alias: fast", "alias: ''", "alias"},
 		{"a first-event timeout past the deadline", "request_timeout: 45s", "request_timeout: 45s\n  first_event_timeout: 46s", "first_event_timeout"},
 		{"a completion timeout past the deadline", "request_timeout: 45s", "request_timeout: 45s\n  completion_timeout: 46s", "completion_timeout"},
+		{"an admission timeout past the deadline", "request_timeout: 45s", "request_timeout: 45s\n  admission_timeout: 46s", "admission_timeout"},
 		{
 			"the same route twice",
 			"        model: alpha",

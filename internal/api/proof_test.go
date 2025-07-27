@@ -183,7 +183,7 @@ func TestAnUnreachableDatabaseFailsClosed(t *testing.T) {
 	if resp.StatusCode != http.StatusServiceUnavailable || !strings.Contains(body, codeAccountingUnavailable) {
 		t.Fatalf("status = %d: %s", resp.StatusCode, body)
 	}
-	if elapsed := time.Since(start); elapsed > admissionTimeout {
+	if elapsed := time.Since(start); elapsed > defaultAdmissionTimeout {
 		t.Fatalf("took %v", elapsed)
 	}
 	if got := e.mock.Stats()["alpha"].Requests; got != 0 {
@@ -256,5 +256,47 @@ func TestManyStalledStreamsReleaseEverything(t *testing.T) {
 			t.Fatalf("%d goroutines, from %d before", runtime.NumGoroutine(), baseline)
 		}
 		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+// A database that stops answering, rather than refusing connections, mustn't hold a
+// request that needs its key looked up. This is a lock on the keys table, as a migration
+// stuck behind a long transaction would take.
+func TestAHungKeyLookupIsRefusedQuickly(t *testing.T) {
+	const model = "alpha;tokens=1"
+	e := newTenantEnv(t, model)
+	key := e.addTeam("a", 100_000)
+	const bound = 300 * time.Millisecond
+	url, client := e.instance(instanceOptions{adjust: func(l *Limits) { l.AdmissionTimeout = bound }}, model)
+
+	ctx := context.Background()
+	lock, err := e.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = lock.Rollback(ctx) }()
+	if _, err := lock.Exec(ctx, `LOCK TABLE api_keys IN ACCESS EXCLUSIVE MODE`); err != nil {
+		t.Fatal(err)
+	}
+
+	start := time.Now()
+	reqCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodPost, url+"/v1/chat/completions", strings.NewReader(chatBody(false, "")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Authorization", "Bearer "+key)
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("no answer after %v: %v", time.Since(start), err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusServiceUnavailable || !strings.Contains(string(body), codeAuthUnavailable) {
+		t.Fatalf("status = %d: %s", resp.StatusCode, body)
+	}
+	if elapsed := time.Since(start); elapsed > bound+2*time.Second {
+		t.Fatalf("took %v", elapsed)
 	}
 }
