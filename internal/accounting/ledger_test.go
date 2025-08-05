@@ -1152,3 +1152,27 @@ func TestSpendReporting(t *testing.T) {
 		t.Fatalf("available = %d", got.AvailableMicros)
 	}
 }
+
+// A timeout status says the provider gave up, not that it refused: the model may have
+// run, and been billed. So it's an unknown cost, not a free refusal.
+func TestAProviderTimeoutStatusIsAnUnknownCost(t *testing.T) {
+	for _, status := range []int{408, 504} {
+		t.Run(fmt.Sprint(status), func(t *testing.T) {
+			e := newEnv(t, 1000)
+			r := e.dispatched("r1")
+			settlement, err := e.ledger.Finish(context.Background(), accounting.FinishRequest{
+				AttemptID: r.AttemptID, Outcome: accounting.OutcomeFailed, ErrorKind: provider.KindTimeout,
+				Delivery: provider.DeliveryConfirmed, UpstreamStatus: status,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !settlement.Uncertain {
+				t.Fatalf("settlement = %+v", settlement)
+			}
+			if got := e.period(); got.reserved != r.ReservedMicros {
+				t.Fatalf("period = %+v", got)
+			}
+		})
+	}
+}
