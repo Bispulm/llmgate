@@ -82,7 +82,7 @@ The rule is that dispatch intent commits **before** the request is sent. A `rese
 
 - **Lease expiry** transfers who may reconcile an attempt. It never releases money.
 - **Absent usage** is `uncertain`, never zero. After a grace period, `accounting.uncertain_grace`, the charge is the full reservation, recorded as `conservative`. Late usage corrects it once, through a `late_adjustment` entry. No estimate policy is offered: an estimate could undercharge, and the full reservation can't.
-- **A refusal with no usage**, such as a provider's 4xx or 5xx before any output, is charged nothing by default and recorded as `rejected`. Providers don't normally bill for those, but that's a policy rather than something they guarantee, so `accounting.rejected_attempt_charge: conservative` treats them as unknown instead.
+- **A refusal with no usage**, meaning any non-200 status before any output other than a timeout, is charged nothing by default and recorded as `rejected`. A 408 or 504 means the provider gave up rather than refused, so it's an unknown cost like any other. Providers don't normally bill for those, but that's a policy rather than something they guarantee, so `accounting.rejected_attempt_charge: conservative` treats them as unknown instead.
 - **Settlement** is one transaction: a conditional state transition plus a ledger insert with a unique `(attempt_id, entry_kind)`. Repeat callbacks, retries, and reconcilers change nothing the second time.
 
 ### Periods and limit changes
@@ -105,7 +105,8 @@ A reservation stays with the period that admitted it. Rollover opens a new perio
 
 ## Consequences
 
-- Each admission costs a Postgres round trip and a row lock per team. Overhead is measured and published in M5.
+- Each admission costs Postgres round trips under a row lock per team. A team's admissions take turns, one at a time on each replica, so that waiting ones don't hold pooled connections that dispatch and settlement need. A team's admission rate is bounded by Postgres latency, and past `limits.admission_timeout` an admission fails closed. Overhead is measured and published in M5.
+- Leases use each replica's clock, so replicas need synchronized clocks. A badly slow clock fails closed rather than overspending.
 - Budget accounting stays conservative: a crash can hold or charge liability that no provider actually billed, until reconciled. That favors the budget limit over the team's available spend.
 - A team with many concurrent large requests can be rejected for reservations it wouldn't have fully used.
 
@@ -119,7 +120,7 @@ Per attempt, in `internal/api`:
 4. Send.
 5. `Finish`, on a context of its own with a bounded retry. If it never succeeds, the attempt stays open with its liability held, and the reconciler resolves it.
 
-Both admission steps share a five-second bound, so a database that has hung refuses requests quickly rather than holding them until their deadline. Every replica runs the reconciler on an interval.
+Both admission steps share `limits.admission_timeout`, five seconds by default, and so does looking up the client's key, so a database that has hung refuses requests quickly rather than holding them until their deadline. Every replica runs the reconciler on an interval.
 
 A non-streaming response is flushed to the client before settlement, so a slow database doesn't delay a finished answer. A client that checks its budget straight away can see the reservation still held for a moment.
 
