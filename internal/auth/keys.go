@@ -89,7 +89,7 @@ type KeyStoreOptions struct {
 	CacheTTL time.Duration
 	// Now replaces the clock, for tests.
 	Now func() time.Time
-	// MaxCacheEntries bounds the cache. Zero uses a default.
+	// MaxCacheEntries bounds real keys and unknown IDs, separately. Zero uses a default.
 	MaxCacheEntries int
 }
 
@@ -110,6 +110,9 @@ type KeyStore struct {
 
 	mu    sync.RWMutex
 	cache map[string]cacheEntry
+	// misses remembers IDs with no active key. It's kept apart, because anyone can make
+	// up IDs, and filling it must never push out a real key.
+	misses map[string]cacheEntry
 }
 
 var _ Authenticator = (*KeyStore)(nil)
@@ -124,7 +127,7 @@ func NewKeyStore(opts KeyStoreOptions) *KeyStore {
 	if maxEntries <= 0 {
 		maxEntries = defaultMaxCacheEntries
 	}
-	return &KeyStore{pool: opts.Pool, ttl: opts.CacheTTL, now: now, maxEntries: maxEntries, cache: make(map[string]cacheEntry)}
+	return &KeyStore{pool: opts.Pool, ttl: opts.CacheTTL, now: now, maxEntries: maxEntries, cache: make(map[string]cacheEntry), misses: make(map[string]cacheEntry)}
 }
 
 // Authenticate implements Authenticator. The team comes only from the key that was
@@ -138,6 +141,9 @@ func (s *KeyStore) Authenticate(ctx context.Context, token string) (Principal, e
 
 	s.mu.RLock()
 	entry, cached := s.cache[id]
+	if !cached {
+		entry, cached = s.misses[id]
+	}
 	s.mu.RUnlock()
 	if !cached || !now.Before(entry.expires) {
 		var err error
@@ -178,19 +184,26 @@ func (s *KeyStore) load(ctx context.Context, id string, now time.Time) (cacheEnt
 func (s *KeyStore) remember(id string, entry cacheEntry) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if _, exists := s.cache[id]; !exists && len(s.cache) >= s.maxEntries {
-		// Random keys can fill the cache, so it has to stay bounded. Dropping everything
-		// is crude but safe: entries are only an optimization, and reload on demand.
-		s.cache = make(map[string]cacheEntry)
+	target := &s.cache
+	if !entry.known {
+		target = &s.misses
+		delete(s.cache, id)
+	} else {
+		delete(s.misses, id)
 	}
-	s.cache[id] = entry
+	if _, exists := (*target)[id]; !exists && len(*target) >= s.maxEntries {
+		// Each map has to stay bounded. Dropping one whole map is crude but safe: entries
+		// are only an optimization, and reload on demand.
+		*target = make(map[string]cacheEntry)
+	}
+	(*target)[id] = entry
 }
 
 // CacheSize returns how many entries the cache holds.
 func (s *KeyStore) CacheSize() int {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	return len(s.cache)
+	return len(s.cache) + len(s.misses)
 }
 
 // Create stores a new key for a team. The raw key is only in the result, and can't be
@@ -224,6 +237,7 @@ func (s *KeyStore) Revoke(ctx context.Context, id string) error {
 	}
 	s.mu.Lock()
 	delete(s.cache, id)
+	delete(s.misses, id)
 	s.mu.Unlock()
 	return nil
 }

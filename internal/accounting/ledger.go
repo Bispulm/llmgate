@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
 	"sync"
 	"time"
 
@@ -106,6 +107,17 @@ type Ledger struct {
 
 	pinnedMu sync.RWMutex
 	pinned   map[pinnedKey]Prices // old price lists, which never change
+
+	gatesMu sync.Mutex
+	gates   map[string]*teamGate // admissions in progress, by team
+}
+
+// teamGate lets one admission per team run at a time in this process. They'd queue on
+// the team's period row anyway, and queueing here instead means a waiting admission
+// doesn't hold a pooled connection that dispatch and settlement need.
+type teamGate struct {
+	slot  chan struct{}
+	users int
 }
 
 type pinnedKey struct {
@@ -126,6 +138,38 @@ func NewLedger(opts LedgerOptions) *Ledger {
 		uncertainGrace: opts.UncertainGrace,
 		rejected:       opts.RejectedAttemptCharge,
 		pinned:         make(map[pinnedKey]Prices),
+		gates:          make(map[string]*teamGate),
+	}
+}
+
+// enterTeam waits for the team's turn to admit, or for ctx to end. The map only holds
+// teams with admissions in progress.
+func (l *Ledger) enterTeam(ctx context.Context, teamID string) (func(), error) {
+	l.gatesMu.Lock()
+	g, ok := l.gates[teamID]
+	if !ok {
+		g = &teamGate{slot: make(chan struct{}, 1)}
+		l.gates[teamID] = g
+	}
+	g.users++
+	l.gatesMu.Unlock()
+
+	leave := func() {
+		l.gatesMu.Lock()
+		if g.users--; g.users == 0 {
+			delete(l.gates, teamID)
+		}
+		l.gatesMu.Unlock()
+	}
+	select {
+	case g.slot <- struct{}{}:
+		return func() {
+			<-g.slot
+			leave()
+		}, nil
+	case <-ctx.Done():
+		leave()
+		return nil, unavailable(ctx.Err())
 	}
 }
 
@@ -178,6 +222,12 @@ func (l *Ledger) Reserve(ctx context.Context, r ReserveRequest) (*Reservation, e
 		return nil, err
 	}
 
+	exit, err := l.enterTeam(ctx, r.TeamID)
+	if err != nil {
+		return nil, err
+	}
+	defer exit()
+
 	now := l.now()
 	start, end := periodBounds(now)
 	out := &Reservation{AttemptID: "att_" + rand.Text(), ReservedMicros: amount}
@@ -188,18 +238,24 @@ func (l *Ledger) Reserve(ctx context.Context, r ReserveRequest) (*Reservation, e
 			ON CONFLICT (id) DO NOTHING`, r.RequestID, r.TeamID, r.KeyID, r.Alias, r.Stream, now); err != nil {
 			return err
 		}
-		// A period is created on first use, from the team's limit at that moment.
-		if _, err := tx.Exec(ctx, `
-			INSERT INTO budget_periods (team_id, starts_at, ends_at, limit_micros)
-			SELECT id, $2, $3, budget_limit_micros FROM teams WHERE id = $1
-			ON CONFLICT (team_id, starts_at) DO NOTHING`, r.TeamID, start, end); err != nil {
-			return err
-		}
-
 		var limit, settled, reserved int64
-		err := tx.QueryRow(ctx, `
-			SELECT id, limit_micros, settled_micros, reserved_micros FROM budget_periods
-			WHERE team_id = $1 AND starts_at = $2 FOR UPDATE`, r.TeamID, start).Scan(&out.PeriodID, &limit, &settled, &reserved)
+		lockPeriod := func() error {
+			return tx.QueryRow(ctx, `
+				SELECT id, limit_micros, settled_micros, reserved_micros FROM budget_periods
+				WHERE team_id = $1 AND starts_at = $2 FOR UPDATE`, r.TeamID, start).Scan(&out.PeriodID, &limit, &settled, &reserved)
+		}
+		err := lockPeriod()
+		if errors.Is(err, pgx.ErrNoRows) {
+			// A period is created on first use, from the team's limit. Locking the team's
+			// row waits for a limit change in flight, so the period starts from the new one.
+			if _, err := tx.Exec(ctx, `
+				INSERT INTO budget_periods (team_id, starts_at, ends_at, limit_micros)
+				SELECT id, $2, $3, budget_limit_micros FROM teams WHERE id = $1 FOR SHARE
+				ON CONFLICT (team_id, starts_at) DO NOTHING`, r.TeamID, start, end); err != nil {
+				return err
+			}
+			err = lockPeriod()
+		}
 		if errors.Is(err, pgx.ErrNoRows) {
 			return ErrUnknownTeam
 		}
@@ -315,11 +371,17 @@ func (l *Ledger) disposition(f FinishRequest) disposition {
 		return dispositionUncertain
 	case f.Delivery == provider.DeliveryNotSent:
 		return dispositionReleased
-	case f.UpstreamStatus != 0 && l.rejected == RejectedChargeNone:
+	case f.UpstreamStatus != 0 && !timedOut(f.UpstreamStatus) && l.rejected == RejectedChargeNone:
 		return dispositionRejected
 	default:
 		return dispositionUncertain
 	}
+}
+
+// timedOut reports a status that means the provider gave up rather than refused, so the
+// model may have run, and been billed.
+func timedOut(status int) bool {
+	return status == http.StatusRequestTimeout || status == http.StatusGatewayTimeout
 }
 
 type attemptRow struct {
@@ -728,8 +790,9 @@ func adjustCharge(ctx context.Context, tx pgx.Tx, id string, a attemptRow, usage
 	return err
 }
 
-// SetLimit changes a team's budget, including for the current period. Lowering it below
-// existing obligations is allowed: it blocks new work and doesn't touch work in flight.
+// SetLimit changes a team's budget, including for the current period and any later one
+// already opened. Lowering it below existing obligations is allowed: it blocks new work
+// and doesn't touch work in flight.
 func (l *Ledger) SetLimit(ctx context.Context, teamID string, limitMicros int64) error {
 	start, end := periodBounds(l.now())
 	err := pgx.BeginFunc(ctx, l.pool, func(tx pgx.Tx) error {
@@ -740,9 +803,13 @@ func (l *Ledger) SetLimit(ctx context.Context, teamID string, limitMicros int64)
 		if tag.RowsAffected() == 0 {
 			return ErrUnknownTeam
 		}
-		_, err = tx.Exec(ctx, `
+		if _, err := tx.Exec(ctx, `
 			INSERT INTO budget_periods (team_id, starts_at, ends_at, limit_micros) VALUES ($1, $2, $3, $4)
-			ON CONFLICT (team_id, starts_at) DO UPDATE SET limit_micros = EXCLUDED.limit_micros`, teamID, start, end, limitMicros)
+			ON CONFLICT (team_id, starts_at) DO UPDATE SET limit_micros = EXCLUDED.limit_micros`, teamID, start, end, limitMicros); err != nil {
+			return err
+		}
+		// A replica whose clock has already reached next month may have opened its period.
+		_, err = tx.Exec(ctx, `UPDATE budget_periods SET limit_micros = $2 WHERE team_id = $1 AND starts_at > $3`, teamID, limitMicros, start)
 		return err
 	})
 	if err != nil {

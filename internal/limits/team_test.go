@@ -405,3 +405,26 @@ func TestACanceledContextIsNotAnOutage(t *testing.T) {
 		t.Fatalf("error = %v", err)
 	}
 }
+
+// Token debt has to last until it's repaid. If its key expired first, a team that
+// overspent would start again with a full minute's allowance.
+func TestTokenDebtOutlastsItsKeyExpiry(t *testing.T) {
+	l, client, prefix := newTeamLimiter(t)
+	cfg := limits.TeamLimits{TokensPerMinute: 1000}
+	ctx := context.Background()
+	if err := l.DebitTokens(ctx, "t", cfg, 10_000); err != nil {
+		t.Fatal(err)
+	}
+	// 9,000 tokens of debt at 1,000 a minute takes nine minutes to repay.
+	ttl, err := client.PTTL(ctx, prefix+"tokens:{t}").Result()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ttl < 9*time.Minute {
+		t.Fatalf("the debt expires after %v", ttl)
+	}
+	d, _ := admit(t, l, "t", cfg, "after")
+	if d.Allowed || d.RetryAfter < 8*time.Minute {
+		t.Fatalf("decision = %+v", d)
+	}
+}
