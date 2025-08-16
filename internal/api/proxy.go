@@ -36,9 +36,10 @@ const (
 	// capacityRetryAfter is a short hint, because a slot could free at any moment.
 	capacityRetryAfter = time.Second
 
-	// admissionTimeout bounds reserving and marking an attempt, so that a database that
-	// has hung refuses requests soon, rather than holding them until their deadline.
-	admissionTimeout = 5 * time.Second
+	// defaultAdmissionTimeout bounds looking up a key, and reserving and marking an
+	// attempt, so that a database that has hung refuses requests soon, rather than
+	// holding them until their deadline.
+	defaultAdmissionTimeout = 5 * time.Second
 	// reserveLease is how long a reservation can go unsent before a reconciler may release
 	// it. It's only ever that long if this replica stopped between two statements.
 	reserveLease = time.Minute
@@ -101,7 +102,9 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 
 	// Authenticate before reading the body, so an unauthenticated caller can't make
 	// the gateway buffer or parse anything.
-	principal, err := s.auth.Authenticate(r.Context(), auth.BearerToken(r.Header))
+	authCtx, cancelAuth := context.WithTimeout(r.Context(), s.admissionTimeout())
+	principal, err := s.auth.Authenticate(authCtx, auth.BearerToken(r.Header))
+	cancelAuth()
 	if err != nil && !errors.Is(err, auth.ErrInvalidCredential) {
 		// Still a refusal, but the key may be perfectly good.
 		s.logger.LogAttrs(r.Context(), slog.LevelWarn, "a key could not be checked", attrRequestID(id), slog.Any("error", err))
@@ -308,7 +311,7 @@ func (s *Server) reserve(ctx context.Context, x *exchange, selected *routing.Sel
 	if s.ledger == nil {
 		return nil, nil
 	}
-	admitCtx, cancel := context.WithTimeout(ctx, admissionTimeout)
+	admitCtx, cancel := context.WithTimeout(ctx, s.admissionTimeout())
 	defer cancel()
 
 	reservation, err := s.ledger.Reserve(admitCtx, accounting.ReserveRequest{
@@ -335,6 +338,13 @@ func (s *Server) reserve(ctx context.Context, x *exchange, selected *routing.Sel
 		return nil, err
 	}
 	return reservation, nil
+}
+
+func (s *Server) admissionTimeout() time.Duration {
+	if s.limits.AdmissionTimeout > 0 {
+		return s.limits.AdmissionTimeout
+	}
+	return defaultAdmissionTimeout
 }
 
 // dispatchLease is longer than an attempt can run, so that a reconciler only takes over an
@@ -412,8 +422,8 @@ func (s *Server) attempt(ctx context.Context, x *exchange, selected *routing.Sel
 	}
 	defer func() {
 		record.Duration = time.Since(start)
-		s.settle(ctx, reservation, record)
-		s.debitTokens(ctx, x, record.Usage)
+		uncertain := s.settle(ctx, reservation, record)
+		s.debitTokens(ctx, x, record.Usage, uncertain)
 		s.record(ctx, record)
 	}()
 
@@ -426,9 +436,11 @@ func (s *Server) attempt(ctx context.Context, x *exchange, selected *routing.Sel
 // settle reports how an attempt ended to the ledger, on a context of its own: a client
 // leaving doesn't mean the attempt was free, and doesn't stop it being accounted for. If
 // this can't finish, the attempt stays open with its liability held.
-func (s *Server) settle(requestCtx context.Context, reservation *accounting.Reservation, record accounting.Attempt) {
+//
+// It reports whether the cost is still unknown, which includes not managing to settle.
+func (s *Server) settle(requestCtx context.Context, reservation *accounting.Reservation, record accounting.Attempt) (uncertain bool) {
 	if reservation == nil {
-		return
+		return false
 	}
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(requestCtx), recordTimeout)
 	defer cancel()
@@ -451,7 +463,7 @@ func (s *Server) settle(requestCtx context.Context, reservation *accounting.Rese
 				s.logger.LogAttrs(ctx, slog.LevelWarn, "an attempt cost more than was reserved",
 					slog.String("attempt_id", reservation.AttemptID), slog.Int64("charge_micros", settlement.ChargeMicros), slog.Int64("reserved_micros", reservation.ReservedMicros))
 			}
-			return
+			return settlement.Uncertain
 		}
 		if try < settleTries-1 && !sleep(ctx, backoff) {
 			break
@@ -459,17 +471,27 @@ func (s *Server) settle(requestCtx context.Context, reservation *accounting.Rese
 	}
 	s.logger.LogAttrs(ctx, slog.LevelError, "an attempt could not be settled, and a reconciler will resolve it",
 		slog.String("attempt_id", reservation.AttemptID), slog.Any("error", err))
+	return true
 }
 
-// debitTokens spends what a provider reported against the team's limit. This isn't money,
-// so failing is only worth a log line: the limit is a little looser during an outage.
-func (s *Server) debitTokens(requestCtx context.Context, x *exchange, usage *chat.Usage) {
-	if s.teamLimiter == nil || !usage.Reportable() {
+// debitTokens spends an attempt's tokens against the team's limit. A cost the ledger
+// couldn't determine counts as the most the attempt could have used, as it does for the
+// budget, so that a team can't get around the limit by leaving before a usage report.
+// This isn't money, so failing is only worth a log line.
+func (s *Server) debitTokens(requestCtx context.Context, x *exchange, usage *chat.Usage, uncertain bool) {
+	var tokens int64
+	switch {
+	case s.teamLimiter == nil:
+		return
+	case usage.Reportable():
+		tokens = usage.PromptTokens + usage.CompletionTokens
+	case uncertain:
+		tokens = accounting.InputBound(x.req) + x.req.MaxOutputTokens
+	default:
 		return
 	}
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(requestCtx), recordTimeout)
 	defer cancel()
-	tokens := usage.PromptTokens + usage.CompletionTokens
 	if err := s.teamLimiter.DebitTokens(ctx, x.principal.TeamID, limits.TeamLimits(x.principal.Limits), tokens); err != nil {
 		s.logger.LogAttrs(ctx, slog.LevelWarn, "tokens could not be counted against a team's limit", attrRequestID(x.id), slog.Any("error", err))
 	}
