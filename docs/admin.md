@@ -50,10 +50,17 @@ Amounts are exact decimal USD. Internally they're integer micro-USD, and no floa
 
 | Change | Takes effect |
 |---|---|
-| Revoking a key | At once on the replica that handled the request, and within `auth.key_cache_ttl` on the others. The default is 30 seconds, and the maximum is 5 minutes. |
+| Revoking a key | Within `auth.key_cache_ttl` on every replica. The default is 30 seconds, and the maximum is 5 minutes. The replica that served the revoke usually stops accepting the key at once, but a lookup already in progress there can put it back in the cache until the TTL runs out. |
 | A team's rate or in-flight limits | Within `auth.key_cache_ttl`, because they're cached with the key. |
 | A budget | At once, on every replica, because each admission reads it in the same transaction. Lowering it below what's already spent or reserved blocks new work, and never cancels work in flight. |
 | Prices | Only through a new `pricing.version`. A stored price list can't change, so every charge can be recomputed from the version its attempt recorded. |
+
+## Operational requirements
+
+- **Synchronized clocks.** Leases and grace periods are written and checked by each replica's own clock. If one replica's clock runs more than a minute behind the others, their reconcilers can release its reservations before it marks them dispatched. Nothing is overspent, because it then refuses to send, but its requests fail with 503 `accounting_unavailable`. Run NTP or an equivalent.
+- **A team's admissions take turns.** Each replica admits one attempt per team at a time, and replicas take turns on the team's budget row in Postgres. A team's admission rate is therefore bounded by Postgres latency. If the queue outlasts `limits.admission_timeout` (5 seconds by default), the request fails closed with 503 `accounting_unavailable`. Other teams aren't affected.
+- **Rate limit unauthenticated traffic in front of the gateway.** A well-formed key that doesn't exist costs one database query before it's remembered as unknown. Unknown keys are remembered separately from real ones, so they can't push real keys out of the cache, but a flood of distinct made-up keys still reaches Postgres.
+- **Give the cache its own Redis in production**, with `cache.redis_url_env`, and a `maxmemory` policy that suits a cache. Sharing one Redis means memory pressure from cached answers could evict rate-limit state.
 
 ## The admin API
 

@@ -43,6 +43,7 @@ const (
 	DefaultBodyReadTimeout          = 10 * time.Second
 	DefaultShutdownTimeout          = 30 * time.Second
 	DefaultQueueTimeout             = 5 * time.Second
+	DefaultAdmissionTimeout         = 5 * time.Second
 	DefaultKeyCacheTTL              = 30 * time.Second
 	DefaultReconcileInterval        = 15 * time.Second
 	DefaultUncertainGrace           = 10 * time.Minute
@@ -195,6 +196,9 @@ type Limits struct {
 	CompletionTimeout  time.Duration `yaml:"completion_timeout"`
 	ClientWriteTimeout time.Duration `yaml:"client_write_timeout"`
 	BodyReadTimeout    time.Duration `yaml:"body_read_timeout"`
+	// AdmissionTimeout bounds each Postgres check before anything is sent, so that a
+	// database that has hung refuses requests quickly.
+	AdmissionTimeout time.Duration `yaml:"admission_timeout"`
 }
 
 // Provider is one upstream API.
@@ -348,6 +352,7 @@ func (c *Config) applyDefaults() {
 	setDefault(&c.Limits.StreamIdleTimeout, DefaultStreamIdleTimeout)
 	setDefault(&c.Limits.ClientWriteTimeout, DefaultClientWriteTimeout)
 	setDefault(&c.Limits.BodyReadTimeout, DefaultBodyReadTimeout)
+	setDefault(&c.Limits.AdmissionTimeout, min(DefaultAdmissionTimeout, c.Limits.RequestTimeout))
 	for i := range c.Providers {
 		setDefault(&c.Providers[i].MaxTokensParam, MaxCompletionTokens)
 		setDefault(&c.Providers[i].QueueTimeout, DefaultQueueTimeout)
@@ -582,6 +587,7 @@ func (l Limits) validate() error {
 		{"stream_idle_timeout", l.StreamIdleTimeout},
 		{"client_write_timeout", l.ClientWriteTimeout},
 		{"body_read_timeout", l.BodyReadTimeout},
+		{"admission_timeout", l.AdmissionTimeout},
 	}
 	for _, t := range timeouts {
 		if t.value < 0 {
@@ -595,6 +601,9 @@ func (l Limits) validate() error {
 	}
 	if l.CompletionTimeout > l.RequestTimeout {
 		return errors.New("limits.completion_timeout must not exceed limits.request_timeout")
+	}
+	if l.AdmissionTimeout > l.RequestTimeout {
+		return errors.New("limits.admission_timeout must not exceed limits.request_timeout")
 	}
 	return nil
 }
