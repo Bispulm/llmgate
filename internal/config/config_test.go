@@ -277,3 +277,30 @@ func TestResolveSecrets(t *testing.T) {
 		})
 	}
 }
+
+func TestMetricsListener(t *testing.T) {
+	cfg, err := Load(writeConfig(t, validYAML+"metrics:\n  listen: 127.0.0.1:18303\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Metrics.Listen != "127.0.0.1:18303" {
+		t.Fatalf("metrics = %+v", cfg.Metrics)
+	}
+	if cfg, err := Load(writeConfig(t, validYAML)); err != nil || cfg.Metrics.Listen != "" {
+		t.Fatalf("metrics should be off unless asked for: %+v, %v", cfg, err)
+	}
+	for name, extra := range map[string]string{
+		"public without saying so":  "metrics:\n  listen: 0.0.0.0:18303\n",
+		"the gateway's own address": "metrics:\n  listen: 127.0.0.1:18300\n",
+		"not an address":            "metrics:\n  listen: nonsense\n",
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := Load(writeConfig(t, validYAML+extra)); err == nil || !strings.Contains(err.Error(), "metrics") {
+				t.Fatalf("err = %v", err)
+			}
+		})
+	}
+	if _, err := Load(writeConfig(t, validYAML+"metrics:\n  listen: 0.0.0.0:18303\n  allow_non_loopback: true\n")); err != nil {
+		t.Fatal(err)
+	}
+}
