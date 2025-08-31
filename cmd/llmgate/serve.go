@@ -17,6 +17,7 @@ import (
 	"github.com/Bispulm/llmgate/internal/auth"
 	"github.com/Bispulm/llmgate/internal/config"
 	"github.com/Bispulm/llmgate/internal/limits"
+	"github.com/Bispulm/llmgate/internal/metrics"
 	"github.com/Bispulm/llmgate/internal/provider"
 	"github.com/Bispulm/llmgate/internal/provider/anthropic"
 	"github.com/Bispulm/llmgate/internal/provider/openai"
@@ -54,9 +55,14 @@ func serve(ctx context.Context, configPath string, p process) error {
 	if err != nil {
 		return err
 	}
-	routes, err := buildRoutes(cfg, secrets)
+	routes, limiters, err := buildRoutes(cfg, secrets)
 	if err != nil {
 		return err
+	}
+	var gatewayMetrics *metrics.Metrics
+	if cfg.Metrics.Listen != "" {
+		gatewayMetrics = metrics.New(metrics.Options{})
+		gatewayMetrics.WatchRoutes(routes, limiters)
 	}
 
 	logger := slog.New(slog.NewJSONHandler(p.stderr, nil))
@@ -64,6 +70,7 @@ func serve(ctx context.Context, configPath string, p process) error {
 		Logger:   logger,
 		Routes:   routes,
 		Recorder: accounting.NewLogRecorder(logger),
+		Metrics:  gatewayMetrics,
 		Limits: api.Limits{
 			MaxRequestBytes:    cfg.Limits.MaxRequestBytes,
 			RequestTimeout:     cfg.Limits.RequestTimeout,
@@ -110,8 +117,36 @@ func serve(ctx context.Context, configPath string, p process) error {
 		// WriteTimeout stays unset: it would cut off long streams. Each write gets
 		// its own deadline instead.
 	}
-	serveErr := make(chan error, 2)
+	serveErr := make(chan error, 3)
 	go func() { serveErr <- server.Serve(listener) }()
+
+	var metricsServer *http.Server
+	if gatewayMetrics != nil {
+		metricsListener, err := lc.Listen(ctx, "tcp", cfg.Metrics.Listen)
+		if err != nil {
+			_ = server.Close()
+			return fmt.Errorf("listening for metrics: %w", err)
+		}
+		addrs.Metrics = metricsListener.Addr().String()
+		mux := http.NewServeMux()
+		mux.Handle("GET /metrics", gatewayMetrics.Handler())
+		metricsServer = &http.Server{Handler: mux, ReadHeaderTimeout: 10 * time.Second, WriteTimeout: 30 * time.Second}
+		go func() { serveErr <- metricsServer.Serve(metricsListener) }()
+		logger.Info("metrics listening", "addr", addrs.Metrics)
+	}
+	// closeSide stops the admin and metrics listeners.
+	closeSide := func(adminServer *http.Server) {
+		for _, side := range []*http.Server{adminServer, metricsServer} {
+			if side == nil {
+				continue
+			}
+			sideCtx, cancelSide := context.WithTimeout(context.WithoutCancel(ctx), adminShutdownTimeout)
+			if err := side.Shutdown(sideCtx); err != nil {
+				_ = side.Close()
+			}
+			cancelSide()
+		}
+	}
 
 	var adminServer *http.Server
 	var background sync.WaitGroup
@@ -120,6 +155,9 @@ func serve(ctx context.Context, configPath string, p process) error {
 		adminListener, err := lc.Listen(ctx, "tcp", cfg.Admin.Listen)
 		if err != nil {
 			_ = server.Close()
+			if metricsServer != nil {
+				_ = metricsServer.Close()
+			}
 			return fmt.Errorf("listening for the admin API: %w", err)
 		}
 		addrs.Admin = adminListener.Addr().String()
@@ -128,7 +166,7 @@ func serve(ctx context.Context, configPath string, p process) error {
 
 		var reconcileCtx context.Context
 		reconcileCtx, stopBackground = context.WithCancel(context.WithoutCancel(ctx))
-		background.Go(func() { tenant.runReconciler(reconcileCtx, logger) })
+		background.Go(func() { tenant.runReconciler(reconcileCtx, logger, gatewayMetrics) })
 		logger.Info("admin API listening", "addr", addrs.Admin)
 	}
 
@@ -140,8 +178,10 @@ func serve(ctx context.Context, configPath string, p process) error {
 	select {
 	case err := <-serveErr:
 		_ = server.Close()
-		if adminServer != nil {
-			_ = adminServer.Close()
+		for _, side := range []*http.Server{adminServer, metricsServer} {
+			if side != nil {
+				_ = side.Close()
+			}
 		}
 		stopBackground()
 		background.Wait()
@@ -166,13 +206,7 @@ func serve(ctx context.Context, configPath string, p process) error {
 			logger.Error("exiting with requests still running, so their attempts may be unrecorded", "error", err.Error())
 		}
 	}
-	if adminServer != nil {
-		adminCtx, cancelAdmin := context.WithTimeout(context.WithoutCancel(ctx), adminShutdownTimeout)
-		defer cancelAdmin()
-		if err := adminServer.Shutdown(adminCtx); err != nil {
-			_ = adminServer.Close()
-		}
-	}
+	closeSide(adminServer)
 	stopBackground()
 	background.Wait()
 
@@ -188,15 +222,16 @@ func serve(ctx context.Context, configPath string, p process) error {
 	return nil
 }
 
-// buildRoutes creates each configured provider and the alias table that uses them.
-func buildRoutes(cfg *config.Config, secrets *config.Secrets) (*routing.Table, error) {
+// buildRoutes creates each configured provider, its concurrency limiter if it has one,
+// and the alias table that uses them.
+func buildRoutes(cfg *config.Config, secrets *config.Secrets) (*routing.Table, map[string]*limits.FairLimiter, error) {
 	providers := make(map[string]provider.Provider, len(cfg.Providers))
 	scopes := make(map[string]string, len(cfg.Providers))
 	limiters := make(map[string]*limits.FairLimiter, len(cfg.Providers))
 	for _, p := range cfg.Providers {
 		adapter, err := newProvider(p, secrets.ProviderKeys[p.Name], cfg.Limits)
 		if err != nil {
-			return nil, fmt.Errorf("provider %q: %w", p.Name, err)
+			return nil, nil, fmt.Errorf("provider %q: %w", p.Name, err)
 		}
 		providers[p.Name] = adapter
 		scopes[p.Name] = p.Type + " " + p.BaseURL
@@ -240,7 +275,7 @@ func buildRoutes(cfg *config.Config, secrets *config.Secrets) (*routing.Table, e
 		ErrorRate:      cfg.CircuitBreaker.ErrorRate,
 		Cooldown:       cfg.CircuitBreaker.Cooldown,
 		HalfOpenProbes: cfg.CircuitBreaker.HalfOpenProbes,
-	}}), nil
+	}}), limiters, nil
 }
 
 func newProvider(p config.Provider, apiKey string, limits config.Limits) (provider.Provider, error) {

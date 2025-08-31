@@ -17,6 +17,7 @@ import (
 type listening struct {
 	Gateway string
 	Admin   string
+	Metrics string
 }
 
 // process is what a command gets from its environment, so tests can supply their own.

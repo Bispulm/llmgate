@@ -17,6 +17,7 @@ import (
 	"github.com/Bispulm/llmgate/internal/cache"
 	"github.com/Bispulm/llmgate/internal/config"
 	"github.com/Bispulm/llmgate/internal/limits"
+	"github.com/Bispulm/llmgate/internal/metrics"
 	"github.com/Bispulm/llmgate/internal/routing"
 	"github.com/Bispulm/llmgate/internal/store"
 )
@@ -104,14 +105,16 @@ func (t *tenantRuntime) start(ctx context.Context, secrets *config.Secrets, rout
 	return nil
 }
 
-func (t *tenantRuntime) runReconciler(ctx context.Context, logger *slog.Logger) {
+func (t *tenantRuntime) runReconciler(ctx context.Context, logger *slog.Logger, m *metrics.Metrics) {
 	t.ledger.RunReconciler(ctx, t.cfg.Accounting.ReconcileInterval, reconcileBatch, func(result accounting.ReconcileResult, err error) {
 		if err != nil {
 			if ctx.Err() == nil {
 				logger.Warn("a reconciliation pass failed", "error", err.Error())
+				m.DependencyError("postgres", "reconcile")
 			}
 			return
 		}
+		m.Reconciled(result)
 		logger.Info("reconciled attempts", "released", result.Released, "marked_uncertain", result.MarkedUncertain,
 			"charged_conservatively", result.ChargedConservatively)
 	})
