@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"runtime"
 	"strings"
 	"sync"
@@ -16,6 +17,8 @@ import (
 
 	"github.com/Bispulm/llmgate/internal/accounting"
 	"github.com/Bispulm/llmgate/internal/chat"
+	"github.com/Bispulm/llmgate/internal/mock"
+	"github.com/Bispulm/llmgate/internal/provider/openai"
 	"github.com/Bispulm/llmgate/internal/store"
 )
 
@@ -207,7 +210,18 @@ func TestManyStalledStreamsReleaseEverything(t *testing.T) {
 		streams = 100
 		tokens  = 200000
 	)
-	g := newGateway(t, fmt.Sprintf("stuck;tokens=%d;pad=4096", tokens), func(o *Options) {
+	m := mock.New()
+	upstream := httptest.NewServer(m)
+	t.Cleanup(upstream.Close)
+	adapter, err := openai.New(openai.Options{BaseURL: upstream.URL + "/v1", APIKey: testProviderKey, MaxResponseBytes: 1 << 20, MaxEventBytes: 1 << 16})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(adapter.CloseIdleConnections)
+	// A stall is only noticed once the gateway's socket buffer fills. Linux can grow that
+	// to megabytes per connection, which a slow machine takes a long time to fill a
+	// hundred times over, so this keeps it small.
+	g := startGatewayOn(t, func(l net.Listener) net.Listener { return smallSendBuffers{l} }, adapter, fmt.Sprintf("stuck;tokens=%d;pad=4096", tokens), m, func(o *Options) {
 		o.Limits.ClientWriteTimeout = 300 * time.Millisecond
 		o.Routes = routingWithLimit(o.Routes, tokens)
 		o.Recorder = accounting.NewLogRecorder(slog.New(slog.DiscardHandler))
@@ -305,4 +319,16 @@ func TestAHungKeyLookupIsRefusedQuickly(t *testing.T) {
 	if elapsed := time.Since(start); elapsed > bound+2*time.Second {
 		t.Fatalf("took %v", elapsed)
 	}
+}
+
+// smallSendBuffers gives each accepted connection a small send buffer, so a client that
+// stops reading blocks the gateway's writes after kilobytes rather than megabytes.
+type smallSendBuffers struct{ net.Listener }
+
+func (l smallSendBuffers) Accept() (net.Conn, error) {
+	conn, err := l.Listener.Accept()
+	if tcp, ok := conn.(*net.TCPConn); ok {
+		_ = tcp.SetWriteBuffer(16 << 10)
+	}
+	return conn, err
 }
