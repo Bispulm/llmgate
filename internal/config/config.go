@@ -93,6 +93,7 @@ type Config struct {
 	Accounting     Accounting     `yaml:"accounting"`
 	Cache          Cache          `yaml:"cache"`
 	Metrics        Metrics        `yaml:"metrics"`
+	Tracing        Tracing        `yaml:"tracing"`
 	Limits         Limits         `yaml:"limits"`
 	CircuitBreaker CircuitBreaker `yaml:"circuit_breaker"`
 	Providers      []Provider     `yaml:"providers"`
@@ -187,6 +188,13 @@ func (d *Decimal) UnmarshalYAML(node *yaml.Node) error {
 type Metrics struct {
 	Listen           string `yaml:"listen"`
 	AllowNonLoopback bool   `yaml:"allow_non_loopback"`
+}
+
+// Tracing exports OpenTelemetry traces over OTLP/HTTP, and is off unless an endpoint is
+// set. Spans carry routing and accounting decisions, never request or response content.
+type Tracing struct {
+	OTLPEndpoint string  `yaml:"otlp_endpoint"`
+	SampleRatio  float64 `yaml:"sample_ratio"`
 }
 
 // Cache configures the response cache. Aliases opt in with their own TTL.
@@ -378,6 +386,9 @@ func (c *Config) validateMode() error {
 
 func (c *Config) applyDefaults() {
 	setDefault(&c.Server.ShutdownTimeout, DefaultShutdownTimeout)
+	if c.Tracing.OTLPEndpoint != "" {
+		setDefault(&c.Tracing.SampleRatio, 1)
+	}
 	if c.Tenant() {
 		setDefault(&c.Auth.KeyCacheTTL, DefaultKeyCacheTTL)
 		setDefault(&c.Database.MaxConns, DefaultDatabaseMaxConns)
@@ -425,6 +436,9 @@ func (c *Config) validate() error {
 		return errors.New("auth.dev_key_env is required")
 	}
 	if err := c.validateMetrics(); err != nil {
+		return err
+	}
+	if err := c.Tracing.validate(); err != nil {
 		return err
 	}
 	if err := c.Limits.validate(); err != nil {
@@ -568,6 +582,30 @@ func (c *Config) validateMetrics() error {
 		if port == otherPort && (host == otherHost || isUnspecified(host) || isUnspecified(otherHost)) {
 			return fmt.Errorf("metrics.listen can't share an address with another listener")
 		}
+	}
+	return nil
+}
+
+// validate refuses plaintext to anything but loopback, since spans name teams and routes.
+func (t Tracing) validate() error {
+	if t.OTLPEndpoint == "" {
+		if t.SampleRatio != 0 {
+			return errors.New("tracing.sample_ratio needs tracing.otlp_endpoint")
+		}
+		return nil
+	}
+	if t.SampleRatio < 0 || t.SampleRatio > 1 {
+		return errors.New("tracing.sample_ratio must be between 0 and 1")
+	}
+	u, err := url.Parse(t.OTLPEndpoint)
+	if err != nil || u.Host == "" {
+		return errors.New("tracing.otlp_endpoint must be a URL")
+	}
+	switch {
+	case u.Scheme == "https":
+	case u.Scheme == "http" && isLoopback(u.Hostname()):
+	default:
+		return errors.New("tracing.otlp_endpoint must use https for a host other than loopback")
 	}
 	return nil
 }
