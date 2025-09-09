@@ -12,6 +12,11 @@ import (
 	"strings"
 	"time"
 
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/propagation"
+	"go.opentelemetry.io/otel/trace"
+
 	"github.com/Bispulm/llmgate/internal/accounting"
 	"github.com/Bispulm/llmgate/internal/auth"
 	"github.com/Bispulm/llmgate/internal/cache"
@@ -98,7 +103,25 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	w = recorder
 	var aliasLabel string
 	var stream bool
-	defer func() { s.metrics.RequestFinished(aliasLabel, stream, recorder.status, time.Since(start)) }()
+	var x *exchange
+
+	// A caller's trace continues here. Spans carry routing and accounting decisions, and
+	// never what the client sent or got back.
+	traced := propagation.TraceContext{}.Extract(r.Context(), propagation.HeaderCarrier(r.Header))
+	traced, span := s.tracer.Start(traced, "chat.completions", trace.WithSpanKind(trace.SpanKindServer),
+		trace.WithAttributes(attribute.String("llmgate.request_id", id)))
+	defer func() {
+		s.metrics.RequestFinished(aliasLabel, stream, recorder.status, time.Since(start))
+		span.SetAttributes(attribute.String("llmgate.alias", aliasLabel), attribute.Bool("llmgate.stream", stream),
+			attribute.Int("http.response.status_code", recorder.status))
+		if x != nil {
+			span.SetAttributes(attribute.String("llmgate.team", x.principal.TeamID), attribute.Int("llmgate.attempts", x.attempts))
+		}
+		if recorder.status >= http.StatusInternalServerError {
+			span.SetStatus(codes.Error, http.StatusText(recorder.status))
+		}
+		span.End()
+	}()
 	header := w.Header()
 	header.Set("X-Request-Id", id)
 	if s.ledger != nil {
@@ -120,12 +143,12 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 
 	// Authenticate before reading the body, so an unauthenticated caller can't make
 	// the gateway buffer or parse anything.
-	authCtx, cancelAuth := context.WithTimeout(r.Context(), s.admissionTimeout())
+	authCtx, cancelAuth := context.WithTimeout(traced, s.admissionTimeout())
 	principal, err := s.auth.Authenticate(authCtx, auth.BearerToken(r.Header))
 	cancelAuth()
 	if err != nil && !errors.Is(err, auth.ErrInvalidCredential) {
 		// Still a refusal, but the key may be perfectly good.
-		s.logger.LogAttrs(r.Context(), slog.LevelWarn, "a key could not be checked", attrRequestID(id), slog.Any("error", err))
+		s.logger.LogAttrs(traced, slog.LevelWarn, "a key could not be checked", attrRequestID(id), slog.Any("error", err))
 		s.metrics.DependencyError("postgres", "authenticate")
 		writeError(w, authUnavailable())
 		return
@@ -142,7 +165,7 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Limits come before the body too, so a team over its limit costs little to refuse.
-	releaseTeam, apiErr := s.admitTeam(r.Context(), principal, id)
+	releaseTeam, apiErr := s.admitTeam(traced, principal, id)
 	if apiErr != nil {
 		writeError(w, apiErr)
 		return
@@ -187,7 +210,7 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	x := &exchange{
+	x = &exchange{
 		w:         w,
 		r:         r,
 		rc:        rc,
@@ -198,7 +221,7 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		req:       limited,
 		principal: principal,
 	}
-	ctx, cancel := s.requestContext(r.Context())
+	ctx, cancel := s.requestContext(traced)
 	defer cancel()
 	if s.serveFromCache(ctx, x, alias) {
 		return
@@ -406,12 +429,33 @@ func sleep(ctx context.Context, d time.Duration) bool {
 func (s *Server) attemptWithSlot(ctx context.Context, x *exchange, selected *routing.Selected, reason accounting.Reason, release func()) (*provider.Error, error) {
 	defer release()
 	defer selected.Abandon()
+	ctx, span := s.tracer.Start(ctx, "attempt", trace.WithAttributes(
+		attribute.String("llmgate.provider", selected.Route.ProviderName), attribute.String("llmgate.model", selected.Route.Model),
+		attribute.Int("llmgate.attempt.number", x.attempts+1), attribute.String("llmgate.attempt.reason", string(reason))))
+	defer span.End()
 	reservation, err := s.reserve(ctx, x, selected)
 	if err != nil {
+		span.SetAttributes(attribute.Bool("llmgate.admitted", false))
+		span.SetStatus(codes.Error, admissionFailure(err))
 		return nil, err
 	}
 	x.attempts++
 	return s.attempt(ctx, x, selected, reason, reservation), nil
+}
+
+// admissionFailure names why the ledger didn't admit an attempt, without the error's text,
+// which can carry database details.
+func admissionFailure(err error) string {
+	switch {
+	case errors.Is(err, accounting.ErrBudgetExhausted):
+		return "budget_exhausted"
+	case errors.Is(err, accounting.ErrNoPrice):
+		return "no_price"
+	case errors.Is(err, accounting.ErrNotReserved):
+		return "not_reserved"
+	default:
+		return "unavailable"
+	}
 }
 
 // reserve holds the most this attempt could cost, then commits the intent to send it. Both
@@ -425,7 +469,8 @@ func (s *Server) reserve(ctx context.Context, x *exchange, selected *routing.Sel
 	admitCtx, cancel := context.WithTimeout(ctx, s.admissionTimeout())
 	defer cancel()
 
-	reservation, err := s.ledger.Reserve(admitCtx, accounting.ReserveRequest{
+	reserveCtx, reserveSpan := s.tracer.Start(admitCtx, "ledger.reserve")
+	reservation, err := s.ledger.Reserve(reserveCtx, accounting.ReserveRequest{
 		RequestID:   x.id,
 		TeamID:      x.principal.TeamID,
 		KeyID:       x.principal.KeyID,
@@ -439,9 +484,19 @@ func (s *Server) reserve(ctx context.Context, x *exchange, selected *routing.Sel
 		Lease:       reserveLease,
 	})
 	if err != nil {
+		reserveSpan.SetStatus(codes.Error, admissionFailure(err))
+		reserveSpan.End()
 		return nil, err
 	}
-	if err := s.ledger.MarkDispatched(admitCtx, reservation.AttemptID, s.dispatchLease(ctx)); err != nil {
+	reserveSpan.SetAttributes(attribute.Int64("llmgate.reserved_micros", reservation.ReservedMicros))
+	reserveSpan.End()
+	dispatchCtx, dispatchSpan := s.tracer.Start(admitCtx, "ledger.mark_dispatched")
+	err = s.ledger.MarkDispatched(dispatchCtx, reservation.AttemptID, s.dispatchLease(ctx))
+	if err != nil {
+		dispatchSpan.SetStatus(codes.Error, admissionFailure(err))
+	}
+	dispatchSpan.End()
+	if err != nil {
 		// This replica knows nothing was sent, whatever that call managed to do, so the
 		// money can come back now. If it can't, a reconciler gets to it later: a reserved
 		// attempt is released, and a dispatched one is charged conservatively.
@@ -541,6 +596,12 @@ func (s *Server) attempt(ctx context.Context, x *exchange, selected *routing.Sel
 		uncertain := s.settle(ctx, reservation, record)
 		s.debitTokens(ctx, x, record.Usage, uncertain)
 		s.record(ctx, record)
+		span := trace.SpanFromContext(ctx)
+		span.SetAttributes(attribute.String("llmgate.outcome", string(record.Outcome)), attribute.Bool("llmgate.committed", record.Committed),
+			attribute.String("llmgate.error_kind", string(record.ErrorKind)), attribute.Int("llmgate.upstream_status", record.UpstreamStatus))
+		if record.Outcome != accounting.OutcomeCompleted {
+			span.SetStatus(codes.Error, string(record.Outcome))
+		}
 	}()
 
 	if x.req.Stream {
@@ -560,6 +621,8 @@ func (s *Server) settle(requestCtx context.Context, reservation *accounting.Rese
 	}
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(requestCtx), recordTimeout)
 	defer cancel()
+	ctx, span := s.tracer.Start(ctx, "ledger.finish")
+	defer span.End()
 
 	finish := accounting.FinishRequest{
 		AttemptID:      reservation.AttemptID,
@@ -582,6 +645,9 @@ func (s *Server) settle(requestCtx context.Context, reservation *accounting.Rese
 			if !settlement.Uncertain && !settlement.AlreadySettled && settlement.Kind != "" {
 				s.metrics.Charged(record.Provider, record.Model, settlement.Kind, settlement.ChargeMicros)
 			}
+			span.SetAttributes(attribute.Int("llmgate.tries", try+1), attribute.Bool("llmgate.uncertain", settlement.Uncertain))
+			trace.SpanFromContext(requestCtx).SetAttributes(attribute.String("llmgate.charge_kind", settlement.Kind),
+				attribute.Int64("llmgate.charge_micros", settlement.ChargeMicros))
 			return settlement.Uncertain
 		}
 		if try < settleTries-1 && !sleep(ctx, backoff) {
@@ -592,6 +658,7 @@ func (s *Server) settle(requestCtx context.Context, reservation *accounting.Rese
 		slog.String("attempt_id", reservation.AttemptID), slog.Any("error", err))
 	s.metrics.SettlementFailed()
 	s.metrics.DependencyError("postgres", "settle")
+	span.SetStatus(codes.Error, "unavailable")
 	return true
 }
 
