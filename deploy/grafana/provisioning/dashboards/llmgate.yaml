@@ -1,0 +1,9 @@
+# Grafana provisioning: load the dashboards in /var/lib/grafana/dashboards/llmgate.
+apiVersion: 1
+providers:
+  - name: llmgate
+    folder: llmgate
+    type: file
+    disableDeletion: true
+    options:
+      path: /var/lib/grafana/dashboards/llmgate
