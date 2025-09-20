@@ -198,3 +198,50 @@ func TestTheTenantExampleLoads(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestCacheSettings(t *testing.T) {
+	withCache := strings.Replace(tenantYAML, "max_output_tokens: 1024", "max_output_tokens: 1024\n    cache:\n      ttl: 10m", 1)
+	withCache = strings.Replace(withCache, "auth:\n  mode: tenant", "cache:\n  max_entry_bytes: 65536\n  redis_url_env: CACHE_REDIS\nauth:\n  mode: tenant", 1)
+	cfg, err := Load(writeConfig(t, withCache))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Models[0].Cache.TTL != 10*time.Minute || cfg.Cache.MaxEntryBytes != 65536 {
+		t.Fatalf("cache = %+v %+v", cfg.Models[0].Cache, cfg.Cache)
+	}
+	env := map[string]string{"LLMGATE_DATABASE_URL": "db", "LLMGATE_REDIS_URL": "limits", "CACHE_REDIS": "cache", "LLMGATE_ADMIN_TOKEN": "a-long-enough-admin-token", "PRIMARY_KEY": "p"}
+	secrets, err := cfg.ResolveSecrets(func(k string) string { return env[k] })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if secrets.CacheRedisURL != "cache" {
+		t.Fatalf("cache redis = %q", secrets.CacheRedisURL)
+	}
+
+	// Without its own Redis, the cache shares the one for rate limits.
+	plain, err := Load(writeConfig(t, tenantYAML))
+	if err != nil {
+		t.Fatal(err)
+	}
+	secrets, err = plain.ResolveSecrets(func(k string) string { return env[k] })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if secrets.CacheRedisURL != "limits" || plain.Cache.MaxEntryBytes != DefaultMaxCacheEntryBytes {
+		t.Fatalf("cache redis = %q, max entry = %d", secrets.CacheRedisURL, plain.Cache.MaxEntryBytes)
+	}
+
+	for name, bad := range map[string]string{
+		"a negative TTL": strings.Replace(tenantYAML, "max_output_tokens: 1024", "max_output_tokens: 1024\n    cache:\n      ttl: -1s", 1),
+		"a TTL over 24h": strings.Replace(tenantYAML, "max_output_tokens: 1024", "max_output_tokens: 1024\n    cache:\n      ttl: 25h", 1),
+		"a huge entry":   strings.Replace(tenantYAML, "auth:\n  mode: tenant", "cache:\n  max_entry_bytes: 999999999\nauth:\n  mode: tenant", 1),
+		"caching in dev": strings.Replace(validYAML, "max_output_tokens: 1024", "max_output_tokens: 1024\n    cache:\n      ttl: 1m", 1),
+		"a cache in dev": validYAML + "cache:\n  max_entry_bytes: 1024\n",
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := Load(writeConfig(t, bad)); err == nil || !strings.Contains(err.Error(), "cache") {
+				t.Fatalf("err = %v", err)
+			}
+		})
+	}
+}

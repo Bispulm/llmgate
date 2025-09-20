@@ -9,10 +9,12 @@ import (
 	"net/http"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/Bispulm/llmgate/internal/accounting"
 	"github.com/Bispulm/llmgate/internal/auth"
+	"github.com/Bispulm/llmgate/internal/cache"
 	"github.com/Bispulm/llmgate/internal/chat"
 	"github.com/Bispulm/llmgate/internal/limits"
 	"github.com/Bispulm/llmgate/internal/provider"
@@ -27,6 +29,13 @@ const (
 	headerRoute             = "X-Llmgate-Route"
 	headerAttempts          = "X-Llmgate-Attempts"
 	headerBudgetEnforcement = "X-Llmgate-Budget-Enforcement"
+	// headerCache is how a client opts in to the cache, and how it learns the result.
+	headerCache = "X-Llmgate-Cache"
+
+	cacheAllow  = "allow"
+	cacheHit    = "hit"
+	cacheMiss   = "miss"
+	cacheBypass = "bypass"
 
 	// budgetEnforcementNone says plainly that no budget protects this request.
 	budgetEnforcementNone = "none"
@@ -76,6 +85,9 @@ type exchange struct {
 	req       *chat.Request
 	principal auth.Principal
 	attempts  int
+
+	// storeCached is set when this request leads the work for a cacheable answer.
+	storeCached func(cache.Entry)
 }
 
 func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
@@ -179,7 +191,92 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 	ctx, cancel := s.requestContext(r.Context())
 	defer cancel()
+	if s.serveFromCache(ctx, x, alias) {
+		return
+	}
 	s.runAttempts(ctx, x, alias, plan)
+}
+
+// serveFromCache answers from the cache if it can. Otherwise, for a request that's
+// eligible, it arranges for the answer to be stored, and for identical requests on this
+// replica to wait for it. It runs after authentication and team limits, and before any
+// reservation, so a hit spends nothing: a team out of budget can still read its cache.
+//
+// A request is eligible only when the client asks and the alias allows it, because a
+// cached answer changes what sampling means. Streams are never cached.
+func (s *Server) serveFromCache(ctx context.Context, x *exchange, alias *routing.Alias) bool {
+	if !strings.EqualFold(x.r.Header.Get(headerCache), cacheAllow) {
+		return false
+	}
+	header := x.w.Header()
+	if s.cache == nil || alias.CacheTTL <= 0 || x.req.Stream {
+		header.Set(headerCache, cacheBypass)
+		return false
+	}
+	team := x.principal.TeamID
+	key := cache.Key(team, alias.Name, alias.Revision(), x.req)
+	if entry, ok := s.cache.Get(ctx, team, key); ok {
+		s.writeCached(x, entry)
+		return true
+	}
+	entry, shared, finish := s.cache.Join(ctx, key)
+	if shared {
+		s.writeCached(x, entry)
+		return true
+	}
+	header.Set(headerCache, cacheMiss)
+	// The request ending without a usable answer has to release anyone waiting.
+	context.AfterFunc(ctx, func() { finish(cache.Entry{}, false) })
+	x.storeCached = func(e cache.Entry) {
+		s.cache.Set(context.WithoutCancel(ctx), team, key, e, alias.CacheTTL)
+		finish(e, true)
+	}
+	return false
+}
+
+// writeCached answers with a stored response. It made no attempt, and costs nothing, so
+// nothing is reserved or recorded. Its usage is what the original response reported.
+func (s *Server) writeCached(x *exchange, e cache.Entry) {
+	completion := &chat.Completion{
+		Content:      e.Content,
+		Refusal:      e.Refusal,
+		FinishReason: e.FinishReason,
+		Usage: &chat.Usage{
+			State:            chat.UsageReported,
+			PromptTokens:     e.PromptTokens,
+			CompletionTokens: e.CompletionTokens,
+			TotalTokens:      e.PromptTokens + e.CompletionTokens,
+		},
+	}
+	body, err := x.completionBody(completion)
+	if err != nil {
+		writeError(x.w, upstreamError(&provider.Error{Kind: provider.KindServer, Err: err}))
+		return
+	}
+	s.extendWriteDeadline(x.rc)
+	header := x.w.Header()
+	header.Set(headerCache, cacheHit)
+	header.Set(headerAttempts, "0")
+	header.Set(headerRoute, e.Route)
+	header.Set("Content-Type", "application/json")
+	header.Set("Content-Length", strconv.Itoa(len(body)))
+	x.w.WriteHeader(http.StatusOK)
+	_, _ = x.w.Write(body)
+}
+
+// cacheEntry returns what to store for an answer, if it's worth reusing: a complete,
+// ordinary answer whose usage was reported.
+func cacheEntry(c *chat.Completion, route string) (cache.Entry, bool) {
+	if c.Refusal != "" || (c.FinishReason != chat.FinishStop && c.FinishReason != chat.FinishLength) || !c.Usage.Reportable() {
+		return cache.Entry{}, false
+	}
+	return cache.Entry{
+		Content:          c.Content,
+		FinishReason:     c.FinishReason,
+		Route:            route,
+		PromptTokens:     c.Usage.PromptTokens,
+		CompletionTokens: c.Usage.CompletionTokens,
+	}, true
 }
 
 // noCapableRoute names the parameter that no route can honor. The client can fix
@@ -673,24 +770,7 @@ func (s *Server) completionAttempt(parent context.Context, x *exchange, selected
 	record.OutputBytes = int64(len(completion.Content) + len(completion.Refusal))
 	selected.Finish(nil)
 
-	message := wireMessage{Role: roleAssistant}
-	if completion.Content != "" || completion.Refusal == "" {
-		message.Content = &completion.Content
-	}
-	if completion.Refusal != "" {
-		message.Refusal = &completion.Refusal
-	}
-	body, err := encodeJSON(wireCompletion{
-		ID:      completionPrefix + x.id,
-		Object:  objectCompletion,
-		Created: x.created,
-		Model:   x.alias,
-		Choices: []wireChoice{{
-			Message:      message,
-			FinishReason: string(completion.FinishReason),
-		}},
-		Usage: newWireUsage(completion.Usage),
-	})
+	body, err := x.completionBody(completion)
 	if err != nil {
 		failure := &provider.Error{Kind: provider.KindServer, Delivery: provider.DeliveryConfirmed, Err: err}
 		record.ErrorKind = failure.Kind
@@ -711,6 +791,12 @@ func (s *Server) completionAttempt(parent context.Context, x *exchange, selected
 	if err == nil {
 		err = x.rc.Flush()
 	}
+	// The answer is good whether or not this client stayed to read it.
+	if x.storeCached != nil {
+		if entry, ok := cacheEntry(completion, routeName(selected.Route)); ok {
+			x.storeCached(entry)
+		}
+	}
 	if err != nil {
 		if errors.Is(err, os.ErrDeadlineExceeded) {
 			record.Outcome = accounting.OutcomeClientStalled
@@ -721,6 +807,28 @@ func (s *Server) completionAttempt(parent context.Context, x *exchange, selected
 	}
 	record.Outcome = accounting.OutcomeCompleted
 	return nil
+}
+
+// completionBody encodes a non-streaming response.
+func (x *exchange) completionBody(completion *chat.Completion) ([]byte, error) {
+	message := wireMessage{Role: roleAssistant}
+	if completion.Content != "" || completion.Refusal == "" {
+		message.Content = &completion.Content
+	}
+	if completion.Refusal != "" {
+		message.Refusal = &completion.Refusal
+	}
+	return encodeJSON(wireCompletion{
+		ID:      completionPrefix + x.id,
+		Object:  objectCompletion,
+		Created: x.created,
+		Model:   x.alias,
+		Choices: []wireChoice{{
+			Message:      message,
+			FinishReason: string(completion.FinishReason),
+		}},
+		Usage: newWireUsage(completion.Usage),
+	})
 }
 
 // streamAttempt runs one streaming attempt. Everything before the first write can

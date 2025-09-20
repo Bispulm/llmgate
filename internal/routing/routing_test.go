@@ -320,3 +320,47 @@ func TestOperationalStatus(t *testing.T) {
 		t.Fatalf("status = %+v", statuses)
 	}
 }
+
+// A cached answer is only reusable while the routes that produced it are the same, so the
+// revision changes with anything about them, and is the same on every replica.
+func TestARevisionFollowsTheRoutes(t *testing.T) {
+	base := func() Alias {
+		return Alias{Name: "fast", MaxOutputTokens: 100, Routes: []Route{
+			{ProviderName: "a", Scope: "openai-compatible https://a.example/v1", Model: "m1", Tier: 0, Weight: 2},
+			{ProviderName: "b", Scope: "anthropic https://b.example", Model: "m2", Tier: 1},
+		}}
+	}
+	revision := func(a Alias) string {
+		table := NewTable([]Alias{a}, Options{})
+		got, _ := table.Resolve(a.Name)
+		return got.Revision()
+	}
+	want := revision(base())
+	if want == "" || revision(base()) != want {
+		t.Fatal("the same configuration gave different revisions")
+	}
+	if a := base(); true {
+		a.Routes[1].Weight = 1 // The default, so nothing changes.
+		if revision(a) != want {
+			t.Fatal("an explicit default changed the revision")
+		}
+	}
+	changes := map[string]func(*Alias){
+		"provider":    func(a *Alias) { a.Routes[0].ProviderName = "c" },
+		"scope":       func(a *Alias) { a.Routes[0].Scope = "openai-compatible https://other.example/v1" },
+		"model":       func(a *Alias) { a.Routes[0].Model = "m3" },
+		"tier":        func(a *Alias) { a.Routes[1].Tier = 2 },
+		"weight":      func(a *Alias) { a.Routes[0].Weight = 3 },
+		"route order": func(a *Alias) { a.Routes[0], a.Routes[1] = a.Routes[1], a.Routes[0] },
+		"a route":     func(a *Alias) { a.Routes = a.Routes[:1] },
+		"output":      func(a *Alias) { a.MaxOutputTokens = 101 },
+		"attempts":    func(a *Alias) { a.MaxAttempts = 1 },
+	}
+	for name, change := range changes {
+		a := base()
+		change(&a)
+		if revision(a) == want {
+			t.Errorf("changing the %s kept the revision", name)
+		}
+	}
+}

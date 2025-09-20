@@ -54,6 +54,8 @@ providers:
 models:
   - alias: fast
     max_output_tokens: 64
+    cache:
+      ttl: 1m
     routes:
       - provider: mock
         model: alpha;tokens=3
@@ -212,6 +214,27 @@ func TestTenantModeFromTeamToUsage(t *testing.T) {
 	if parsed.Usage.Budget.SettledMicros == 0 {
 		t.Fatal("nothing was charged")
 	}
+
+	t.Run("an opted-in repeat comes from the cache", func(t *testing.T) {
+		for i, want := range []string{"miss", "hit"} {
+			req, err := http.NewRequest(http.MethodPost, "http://"+g.addrs.Gateway+"/v1/chat/completions",
+				strings.NewReader(`{"model":"fast","messages":[{"role":"user","content":"cache me"}]}`))
+			if err != nil {
+				t.Fatal(err)
+			}
+			req.Header.Set("Authorization", "Bearer "+key)
+			req.Header.Set("X-Llmgate-Cache", "allow")
+			resp, err := g.gateway.Do(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, _ = io.Copy(io.Discard, resp.Body)
+			_ = resp.Body.Close()
+			if got := resp.Header.Get("X-Llmgate-Cache"); resp.StatusCode != http.StatusOK || got != want {
+				t.Fatalf("request %d: status %d, cache %q", i+1, resp.StatusCode, got)
+			}
+		}
+	})
 
 	t.Run("an exhausted team is refused while another carries on", func(t *testing.T) {
 		g.mustCLI("teams", "create", "broke", "--budget-usd", "0.0001")
