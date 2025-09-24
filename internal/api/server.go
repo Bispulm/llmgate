@@ -16,6 +16,7 @@ import (
 	"github.com/Bispulm/llmgate/internal/auth"
 	"github.com/Bispulm/llmgate/internal/cache"
 	"github.com/Bispulm/llmgate/internal/limits"
+	"github.com/Bispulm/llmgate/internal/metrics"
 	"github.com/Bispulm/llmgate/internal/routing"
 )
 
@@ -66,8 +67,10 @@ type Options struct {
 	// TeamLimiter applies team limits. Without one, teams have none.
 	TeamLimiter TeamLimiter
 	// Cache serves repeated requests that opt in. Without one, nothing is cached.
-	Cache  *cache.Cache
-	Limits Limits
+	Cache *cache.Cache
+	// Metrics records what the gateway does. Without it, nothing is recorded.
+	Metrics *metrics.Metrics
+	Limits  Limits
 }
 
 // Server handles client requests. Use New to create one.
@@ -79,6 +82,7 @@ type Server struct {
 	ledger      Ledger
 	teamLimiter TeamLimiter
 	cache       *cache.Cache
+	metrics     *metrics.Metrics
 	limits      Limits
 	mux         *http.ServeMux
 	draining    atomic.Bool
@@ -96,6 +100,7 @@ func New(opts Options) *Server {
 		ledger:      opts.Ledger,
 		teamLimiter: opts.TeamLimiter,
 		cache:       opts.Cache,
+		metrics:     opts.Metrics,
 		limits:      opts.Limits,
 		mux:         http.NewServeMux(),
 	}
@@ -208,3 +213,26 @@ type denyAll struct{}
 func (denyAll) Authenticate(context.Context, string) (auth.Principal, error) {
 	return auth.Principal{}, auth.ErrInvalidCredential
 }
+
+// statusRecorder remembers the status a handler wrote, for metrics. Unwrap lets
+// http.ResponseController reach the connection beneath it.
+type statusRecorder struct {
+	http.ResponseWriter
+	status int
+}
+
+func (r *statusRecorder) WriteHeader(code int) {
+	if r.status == 0 {
+		r.status = code
+	}
+	r.ResponseWriter.WriteHeader(code)
+}
+
+func (r *statusRecorder) Write(b []byte) (int, error) {
+	if r.status == 0 {
+		r.status = http.StatusOK
+	}
+	return r.ResponseWriter.Write(b)
+}
+
+func (r *statusRecorder) Unwrap() http.ResponseWriter { return r.ResponseWriter }
