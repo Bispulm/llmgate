@@ -243,6 +243,9 @@ type Provider struct {
 	BaseURL        string `yaml:"base_url"`
 	APIKeyEnv      string `yaml:"api_key_env"`
 	MaxTokensParam string `yaml:"max_tokens_param"`
+	// AllowInsecureHTTP permits plaintext to a host other than loopback, such as a mock
+	// on a private container network. The provider credential travels in every request.
+	AllowInsecureHTTP bool `yaml:"allow_insecure_http"`
 
 	// MaxConcurrency limits attempts running at once on this provider, in each
 	// process. Zero means no limit. The others only apply when it's set.
@@ -739,7 +742,7 @@ func (p Provider) validate() error {
 	if err := p.validateConcurrency(); err != nil {
 		return err
 	}
-	return validateBaseURL(p.BaseURL)
+	return validateBaseURL(p.BaseURL, p.AllowInsecureHTTP)
 }
 
 func (p Provider) validateConcurrency() error {
@@ -755,7 +758,7 @@ func (p Provider) validateConcurrency() error {
 
 // validateBaseURL refuses plaintext to anything but loopback, because the
 // provider credential travels in every request.
-func validateBaseURL(raw string) error {
+func validateBaseURL(raw string, allowInsecure bool) error {
 	if raw == "" {
 		return errors.New("base_url is required")
 	}
@@ -766,8 +769,8 @@ func validateBaseURL(raw string) error {
 	switch u.Scheme {
 	case "https":
 	case "http":
-		if !isLoopback(u.Hostname()) {
-			return errors.New("base_url must use https for a host other than loopback")
+		if !isLoopback(u.Hostname()) && !allowInsecure {
+			return errors.New("base_url must use https for a host other than loopback, unless allow_insecure_http is set")
 		}
 	default:
 		return errors.New("base_url must use http or https")
