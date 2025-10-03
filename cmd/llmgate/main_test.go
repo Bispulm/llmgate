@@ -561,3 +561,24 @@ func TestTracesURL(t *testing.T) {
 		}
 	}
 }
+
+func TestValidateChecksAConfigurationWithoutStarting(t *testing.T) {
+	var out bytes.Buffer
+	if err := run(context.Background(), []string{"validate", "--config", writeTestConfig(t)}, process{getenv: testEnv, stdout: &out, stderr: io.Discard}); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out.String(), "valid") {
+		t.Fatalf("printed %q", out.String())
+	}
+	bad := filepath.Join(t.TempDir(), "bad.yaml")
+	if err := os.WriteFile(bad, []byte(strings.Replace(testConfig, "max_output_tokens: 64", "max_output_tokens: 0", 1)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := run(context.Background(), []string{"validate", "--config", bad}, process{getenv: testEnv, stdout: io.Discard, stderr: io.Discard}); err == nil || !strings.Contains(err.Error(), "max_output_tokens") {
+		t.Fatalf("err = %v", err)
+	}
+	// It doesn't need credentials, so it can run where they aren't available, such as CI.
+	if err := run(context.Background(), []string{"validate", "--config", writeTestConfig(t)}, process{getenv: func(string) string { return "" }, stdout: io.Discard, stderr: io.Discard}); err != nil {
+		t.Fatalf("needed credentials: %v", err)
+	}
+}
