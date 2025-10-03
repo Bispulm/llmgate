@@ -1,0 +1,7 @@
+# Scrapes the gateway in the Compose stack.
+global:
+  scrape_interval: 5s
+scrape_configs:
+  - job_name: llmgate
+    static_configs:
+      - targets: ["gateway:18303"]
