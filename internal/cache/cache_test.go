@@ -99,6 +99,11 @@ func TestTheKeyCoversEverythingThatChangesTheAnswer(t *testing.T) {
 			r.Stop = []string{"EN", "D"}
 			return "team-a", "fast", "rev1", r
 		},
+		"a stop sequence's text": func() (string, string, string, *chat.Request) {
+			r := baseRequest()
+			r.Stop = []string{"FIN"}
+			return "team-a", "fast", "rev1", r
+		},
 		"team boundary": func() (string, string, string, *chat.Request) { return "team-af", "ast", "rev1", baseRequest() },
 	}
 	seen := map[string]string{base: "base"}
@@ -312,5 +317,15 @@ func TestCacheFailuresAreReported(t *testing.T) {
 	}
 	if got := reports.Load(); got != 1 {
 		t.Fatalf("%d reports", got)
+	}
+}
+
+// Zero is a temperature a client can ask for, and it isn't the same as not asking.
+func TestNoTemperatureIsNotZero(t *testing.T) {
+	zero, unset := baseRequest(), baseRequest()
+	zero.Temperature, unset.Temperature = float(0), nil
+	zero.TopP, unset.TopP = nil, nil
+	if cache.Key("team-a", "fast", "rev1", zero) == cache.Key("team-a", "fast", "rev1", unset) {
+		t.Fatal("temperature 0 and no temperature share a key")
 	}
 }
