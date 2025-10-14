@@ -218,8 +218,13 @@ func serve(ctx context.Context, configPath string, p process) error {
 	case <-ctx.Done():
 	}
 
-	logger.Info("shutting down", "drain_timeout", cfg.Server.ShutdownTimeout.String())
+	logger.Info("shutting down", "drain_delay", cfg.Server.DrainDelay.String(), "drain_timeout", cfg.Server.ShutdownTimeout.String())
 	handler.SetDraining()
+	// Readiness now fails, but new connections are still served until load balancers
+	// have had time to notice. Closing the listener at once would refuse them.
+	if cfg.Server.DrainDelay > 0 {
+		time.Sleep(cfg.Server.DrainDelay)
+	}
 	drainCtx, cancelDrain := context.WithTimeout(context.WithoutCancel(ctx), cfg.Server.ShutdownTimeout)
 	defer cancelDrain()
 	if err := server.Shutdown(drainCtx); err != nil {

@@ -114,6 +114,9 @@ type CircuitBreaker struct {
 type Server struct {
 	Listen          string        `yaml:"listen"`
 	ShutdownTimeout time.Duration `yaml:"shutdown_timeout"`
+	// DrainDelay is how long a stopping replica keeps serving while reporting that it
+	// isn't ready, so that a load balancer stops sending it new connections first.
+	DrainDelay time.Duration `yaml:"drain_delay"`
 }
 
 // Auth configures client authentication. Development mode accepts one shared key and
@@ -452,6 +455,9 @@ func (c *Config) validate() error {
 	}
 	if c.Server.ShutdownTimeout < 0 {
 		return errors.New("server.shutdown_timeout must not be negative")
+	}
+	if c.Server.DrainDelay < 0 || c.Server.DrainDelay > time.Minute {
+		return errors.New("server.drain_delay must be between 0 and 1m")
 	}
 	if len(c.Providers) == 0 {
 		return errors.New("at least one provider is required")

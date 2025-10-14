@@ -94,6 +94,8 @@ func TestLoadRejectsInvalidConfig(t *testing.T) {
 		{"empty alias", "alias: fast", "alias: ''", "alias"},
 		{"a first-event timeout past the deadline", "request_timeout: 45s", "request_timeout: 45s\n  first_event_timeout: 46s", "first_event_timeout"},
 		{"a completion timeout past the deadline", "request_timeout: 45s", "request_timeout: 45s\n  completion_timeout: 46s", "completion_timeout"},
+		{"a negative drain delay", "listen: 127.0.0.1:18300", "listen: 127.0.0.1:18300\n  drain_delay: -1s", "drain_delay"},
+		{"a drain delay over a minute", "listen: 127.0.0.1:18300", "listen: 127.0.0.1:18300\n  drain_delay: 2m", "drain_delay"},
 		{"an admission timeout past the deadline", "request_timeout: 45s", "request_timeout: 45s\n  admission_timeout: 46s", "admission_timeout"},
 		{
 			"the same route twice",
