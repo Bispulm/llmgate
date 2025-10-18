@@ -10,6 +10,7 @@ RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/llmgate ./cmd/llmg
 
 FROM gcr.io/distroless/static-debian13:nonroot@sha256:25ac8f0c3b2334a9eb05452266bd4697864a8c8ef0ef71e5e6480d7f92868329
 COPY --from=build /out/llmgate /out/llmgate-mock /usr/local/bin/
-USER nonroot:nonroot
+# Numeric, so that Kubernetes can verify runAsNonRoot. 65532 is distroless's nonroot user.
+USER 65532:65532
 EXPOSE 18300 18302 18303
 ENTRYPOINT ["/usr/local/bin/llmgate"]

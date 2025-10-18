@@ -1,0 +1,55 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "llmgate.name" . }}
+  labels:
+    {{- include "llmgate.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: llmgate
+      app.kubernetes.io/instance: {{ .Release.Name }}
+  template:
+    metadata:
+      labels:
+        {{- include "llmgate.labels" . | nindent 8 }}
+      annotations:
+        checksum/config: {{ toYaml .Values.config | sha256sum }}
+    spec:
+      automountServiceAccountToken: false
+      # Longer than the drain delay plus the drain, so in-flight requests can finish and
+      # settle before the pod is killed.
+      terminationGracePeriodSeconds: 45
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+      containers:
+        - name: gateway
+          image: {{ include "llmgate.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args: ["serve", "--config", "/etc/llmgate/config.yaml"]
+          env:
+            {{- include "llmgate.secretEnv" . | nindent 12 }}
+          ports:
+            - {name: http, containerPort: 18300}
+            - {name: admin, containerPort: 18302}
+            - {name: metrics, containerPort: 18303}
+          readinessProbe:
+            httpGet: {path: /readyz, port: http}
+            periodSeconds: 2
+            failureThreshold: 1
+          livenessProbe:
+            httpGet: {path: /healthz, port: http}
+            periodSeconds: 10
+          securityContext:
+            {{- include "llmgate.securityContext" . | nindent 12 }}
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          volumeMounts:
+            - {name: config, mountPath: /etc/llmgate, readOnly: true}
+      volumes:
+        - name: config
+          configMap:
+            name: {{ include "llmgate.name" . }}-config
