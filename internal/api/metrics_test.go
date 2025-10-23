@@ -49,16 +49,7 @@ func TestTheGatewayReportsWhatItDid(t *testing.T) {
 		t.Fatalf("status = %d", resp.StatusCode)
 	}
 
-	var out string
-	deadline := time.Now().Add(5 * time.Second)
-	for {
-		out = scrapeMetrics(t, m)
-		if strings.Contains(out, `llmgate_charged_micros_total{kind="reported",model="backup;tokens=2",provider="openai"}`) || time.Now().After(deadline) {
-			break
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-	for _, want := range []string{
+	wants := []string{
 		`llmgate_requests_total{alias="fast",status="200",stream="true"} 1`,
 		`llmgate_requests_total{alias="fast",status="429",stream="false"} 1`,
 		`llmgate_requests_total{alias="",status="401",stream="false"} 1`,
@@ -70,10 +61,21 @@ func TestTheGatewayReportsWhatItDid(t *testing.T) {
 		`llmgate_charged_micros_total{kind="rejected",model="primary;fail=status;status=500",provider="openai"} 0`,
 		`llmgate_charged_micros_total{kind="reported",model="backup;tokens=2",provider="openai"}`,
 		`llmgate_time_to_first_event_seconds_count{model="backup;tokens=2",provider="openai"} 1`,
-	} {
-		if !strings.Contains(out, want) {
-			t.Errorf("missing %s", want)
+	}
+	// Responses reach clients before handlers record them and settle, so wait for all of it.
+	var out string
+	missing := wants
+	for deadline := time.Now().Add(5 * time.Second); len(missing) > 0 && time.Now().Before(deadline); time.Sleep(10 * time.Millisecond) {
+		out = scrapeMetrics(t, m)
+		missing = nil
+		for _, want := range wants {
+			if !strings.Contains(out, want) {
+				missing = append(missing, want)
+			}
 		}
+	}
+	for _, want := range missing {
+		t.Errorf("missing %s", want)
 	}
 	for _, secret := range []string{testPrompt, key, poor, "lgk_nope"} {
 		if strings.Contains(out, secret) {
