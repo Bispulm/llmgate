@@ -232,6 +232,15 @@ func (l *Ledger) Reserve(ctx context.Context, r ReserveRequest) (*Reservation, e
 	start, end := periodBounds(now)
 	out := &Reservation{AttemptID: "att_" + rand.Text(), ReservedMicros: amount}
 
+	out.PeriodID, err = l.reserveInOneStatement(ctx, r, out.AttemptID, amount, now, start)
+	if err == nil {
+		return out, nil
+	}
+	if !errors.Is(err, errNoPeriod) {
+		return nil, classifyReserveError(err)
+	}
+
+	// The first admission of a period opens it, in a transaction of its own.
 	err = pgx.BeginFunc(ctx, l.pool, func(tx pgx.Tx) error {
 		if _, err := tx.Exec(ctx, `
 			INSERT INTO requests (id, team_id, key_id, alias, stream, created_at) VALUES ($1, $2, $3, $4, $5, $6)
@@ -290,6 +299,55 @@ func (l *Ledger) Reserve(ctx context.Context, r ReserveRequest) (*Reservation, e
 		return nil, classifyReserveError(err)
 	}
 	return out, nil
+}
+
+// errNoPeriod means the team's current period hasn't been opened yet.
+var errNoPeriod = errors.New("accounting: no budget period yet")
+
+// reserveSQL checks the invariant and reserves in one statement, so the period's row lock
+// is held for one round trip rather than several. The UPDATE takes the lock, and under
+// read committed Postgres re-checks its WHERE clause against the latest version of the row
+// once the lock is granted, so the check and the reservation are atomic across replicas.
+// The request and the attempt are only inserted if the reservation was made.
+const reserveSQL = `
+WITH period AS (
+  UPDATE budget_periods SET reserved_micros = reserved_micros + $8
+  WHERE team_id = $2 AND starts_at = $9
+    AND settled_micros::numeric + reserved_micros + $8 <= limit_micros
+  RETURNING id
+), request AS (
+  INSERT INTO requests (id, team_id, key_id, alias, stream, created_at)
+  SELECT $1, $2, $3, $4, $5, $6 FROM period
+  ON CONFLICT (id) DO NOTHING
+), attempt AS (
+  INSERT INTO attempts (id, request_id, number, team_id, budget_period_id, price_version_id, provider, model,
+    input_bound_tokens, output_bound_tokens, reserved_micros, state, lease_expires_at, created_at)
+  SELECT $7, $1, $10, $2, period.id, $11, $12, $13, $14, $15, $8, $16, $17, $6 FROM period
+  RETURNING budget_period_id
+)
+SELECT (SELECT budget_period_id FROM attempt)`
+
+// reserveInOneStatement reserves for an attempt in an open period. With no reservation
+// made, it tells an exhausted budget from a period that isn't open yet.
+func (l *Ledger) reserveInOneStatement(ctx context.Context, r ReserveRequest, attemptID string, amount int64, now, start time.Time) (int64, error) {
+	var periodID *int64
+	err := l.pool.QueryRow(ctx, reserveSQL,
+		r.RequestID, r.TeamID, r.KeyID, r.Alias, r.Stream, now, attemptID, amount, start,
+		r.Number, l.prices.VersionID(), r.Provider, r.Model, r.InputBound, r.OutputBound, StateReserved, now.Add(r.Lease)).Scan(&periodID)
+	if err != nil {
+		return 0, err
+	}
+	if periodID != nil {
+		return *periodID, nil
+	}
+	var open bool
+	if err := l.pool.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM budget_periods WHERE team_id = $1 AND starts_at = $2)`, r.TeamID, start).Scan(&open); err != nil {
+		return 0, err
+	}
+	if open {
+		return 0, ErrBudgetExhausted
+	}
+	return 0, errNoPeriod
 }
 
 func classifyReserveError(err error) error {
