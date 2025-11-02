@@ -11,6 +11,7 @@ import (
 
 	"github.com/Bispulm/llmgate/internal/cache"
 	"github.com/Bispulm/llmgate/internal/chat"
+	"github.com/Bispulm/llmgate/internal/redisclient"
 	"github.com/Bispulm/llmgate/internal/testenv"
 )
 
@@ -96,6 +97,11 @@ func TestTheKeyCoversEverythingThatChangesTheAnswer(t *testing.T) {
 		"stop sequences": func() (string, string, string, *chat.Request) {
 			r := baseRequest()
 			r.Stop = []string{"EN", "D"}
+			return "team-a", "fast", "rev1", r
+		},
+		"a stop sequence's text": func() (string, string, string, *chat.Request) {
+			r := baseRequest()
+			r.Stop = []string{"FIN"}
 			return "team-a", "fast", "rev1", r
 		},
 		"team boundary": func() (string, string, string, *chat.Request) { return "team-af", "ast", "rev1", baseRequest() },
@@ -278,5 +284,48 @@ func TestFlightsAreBounded(t *testing.T) {
 	}
 	if got := c.Flights(); got != 0 {
 		t.Fatalf("flights = %d after finishing", got)
+	}
+}
+
+// A Redis that has hung, rather than refused, is the hard case: a read waits for the
+// client's socket timeout unless the context's deadline applies to it.
+func TestAHungRedisIsAQuickMiss(t *testing.T) {
+	client := redisclient.FromOptions(&redis.Options{Addr: testenv.SilentRedis(t)})
+	defer func() { _ = client.Close() }()
+	c := cache.New(cache.Options{Client: client, Prefix: "x:"})
+	ctx := context.Background()
+	for range 3 {
+		start := time.Now()
+		if _, ok := c.Get(ctx, "team-a", "k"); ok {
+			t.Fatal("a hit from a hung Redis")
+		}
+		c.Set(ctx, "team-a", "k", entry("x"), time.Minute)
+		if elapsed := time.Since(start); elapsed > 400*time.Millisecond {
+			t.Fatalf("a miss took %v", elapsed)
+		}
+	}
+}
+
+// Failures are reported, at most once per outage interval, so an outage is visible.
+func TestCacheFailuresAreReported(t *testing.T) {
+	dead := redis.NewClient(&redis.Options{Addr: "127.0.0.1:1", MaxRetries: -1})
+	defer func() { _ = dead.Close() }()
+	var reports atomic.Int64
+	c := cache.New(cache.Options{Client: dead, OnFailure: func(error) { reports.Add(1) }})
+	for range 5 {
+		c.Get(context.Background(), "team-a", "k")
+	}
+	if got := reports.Load(); got != 1 {
+		t.Fatalf("%d reports", got)
+	}
+}
+
+// Zero is a temperature a client can ask for, and it isn't the same as not asking.
+func TestNoTemperatureIsNotZero(t *testing.T) {
+	zero, unset := baseRequest(), baseRequest()
+	zero.Temperature, unset.Temperature = float(0), nil
+	zero.TopP, unset.TopP = nil, nil
+	if cache.Key("team-a", "fast", "rev1", zero) == cache.Key("team-a", "fast", "rev1", unset) {
+		t.Fatal("temperature 0 and no temperature share a key")
 	}
 }

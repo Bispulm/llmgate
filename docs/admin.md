@@ -55,12 +55,35 @@ Amounts are exact decimal USD. Internally they're integer micro-USD, and no floa
 | A budget | At once, on every replica, because each admission reads it in the same transaction. Lowering it below what's already spent or reserved blocks new work, and never cancels work in flight. |
 | Prices | Only through a new `pricing.version`. A stored price list can't change, so every charge can be recomputed from the version its attempt recorded. |
 
+## The response cache
+
+An alias can let clients reuse answers to identical requests:
+
+```yaml
+models:
+  - alias: demo-fast
+    cache:
+      ttl: 10m
+```
+
+A request uses the cache only when its client also sends `X-Llmgate-Cache: allow`, because a cached answer means sampling no longer varies. Streams are never cached. The response says `X-Llmgate-Cache: hit`, `miss`, or `bypass`.
+
+- **Teams never share.** The team is part of the key and of where an entry lives.
+- **A hit costs nothing.** The lookup happens before any reservation and leaves no attempt behind, so a team that's out of budget can still read answers it already paid for. A hit still counts as a request for rate limits, but uses no tokens. Its `usage` is what the original response reported.
+- **Only good answers are stored:** complete, with a stop or length finish, and with reported usage. Never failures, refusals, or partial streams.
+- **Identical requests arriving together** on one replica make one upstream call, and the others wait for it.
+- **Bounded.** Each entry is limited by `cache.max_entry_bytes` (256 KiB by default) and its TTL (at most 24 hours). Redis's `maxmemory` bounds the total, and how Redis behaves at that limit matters: see the operational requirements below.
+- **A Redis failure is a miss.** It adds at most about 100ms to a request, even if Redis hangs rather than refusing connections, and then the cache is skipped for a second. Each such failure is logged and counted in `llmgate_dependency_errors_total`.
+- **Waiting is bounded by the waiter's own deadline.** If the request leading the work fails, the ones waiting for it each make their own attempt with the time they have left.
+
+Any change to an alias's routes changes its revision, which is part of the key, so answers from an old configuration aren't served.
+
 ## Operational requirements
 
 - **Synchronized clocks.** Leases and grace periods are written and checked by each replica's own clock. If one replica's clock runs more than a minute behind the others, their reconcilers can release its reservations before it marks them dispatched. Nothing is overspent, because it then refuses to send, but its requests fail with 503 `accounting_unavailable`. Run NTP or an equivalent.
 - **A team's admissions take turns.** Each replica admits one attempt per team at a time, and replicas take turns on the team's budget row in Postgres. A team's admission rate is therefore bounded by Postgres latency. If the queue outlasts `limits.admission_timeout` (5 seconds by default), the request fails closed with 503 `accounting_unavailable`. Other teams aren't affected.
 - **Rate limit unauthenticated traffic in front of the gateway.** A well-formed key that doesn't exist costs one database query before it's remembered as unknown. Unknown keys are remembered separately from real ones, so they can't push real keys out of the cache, but a flood of distinct made-up keys still reaches Postgres.
-- **Give the cache its own Redis in production**, with `cache.redis_url_env`, and a `maxmemory` policy that suits a cache. Sharing one Redis means memory pressure from cached answers could evict rate-limit state.
+- **Give the cache its own Redis in production**, with `cache.redis_url_env`, and a `maxmemory` policy that suits a cache, such as `allkeys-lru`. On a shared Redis, cached answers compete with rate-limit state: under `noeviction` a full Redis makes team limits fail closed for every team, and under an evicting policy it can forget rate-limit counters.
 
 ## The admin API
 

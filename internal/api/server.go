@@ -12,6 +12,9 @@ import (
 	"sync/atomic"
 	"time"
 
+	"go.opentelemetry.io/otel/trace"
+	"go.opentelemetry.io/otel/trace/noop"
+
 	"github.com/Bispulm/llmgate/internal/accounting"
 	"github.com/Bispulm/llmgate/internal/auth"
 	"github.com/Bispulm/llmgate/internal/cache"
@@ -70,7 +73,9 @@ type Options struct {
 	Cache *cache.Cache
 	// Metrics records what the gateway does. Without it, nothing is recorded.
 	Metrics *metrics.Metrics
-	Limits  Limits
+	// Tracer traces requests, attempts, and ledger steps. Without it, nothing is traced.
+	Tracer trace.Tracer
+	Limits Limits
 }
 
 // Server handles client requests. Use New to create one.
@@ -83,6 +88,7 @@ type Server struct {
 	teamLimiter TeamLimiter
 	cache       *cache.Cache
 	metrics     *metrics.Metrics
+	tracer      trace.Tracer
 	limits      Limits
 	mux         *http.ServeMux
 	draining    atomic.Bool
@@ -101,6 +107,7 @@ func New(opts Options) *Server {
 		teamLimiter: opts.TeamLimiter,
 		cache:       opts.Cache,
 		metrics:     opts.Metrics,
+		tracer:      opts.Tracer,
 		limits:      opts.Limits,
 		mux:         http.NewServeMux(),
 	}
@@ -112,6 +119,9 @@ func New(opts Options) *Server {
 	}
 	if s.routes == nil {
 		s.routes = routing.NewTable(nil, routing.Options{})
+	}
+	if s.tracer == nil {
+		s.tracer = noop.NewTracerProvider().Tracer("")
 	}
 	if s.recorder == nil {
 		s.recorder = accounting.NewLogRecorder(s.logger)

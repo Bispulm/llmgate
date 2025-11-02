@@ -79,7 +79,8 @@ Four decisions shape the design:
 | Budgets, durable per-attempt ledger, reconciliation after crashes | Implemented in tenant mode. Tested under 1,200 concurrent requests across four replicas, a killed process, and a crash inside settlement. |
 | Admin API and operator CLI: teams, keys, budgets, usage | Implemented. See [docs/admin.md](docs/admin.md). |
 | Development mode: one shared key, no budgets, loopback only | Implemented, and every response says `X-Llmgate-Budget-Enforcement: none` |
-| Response cache, metrics, traces, dashboards | Not built (M4) |
+| Team-scoped, opt-in response cache | Implemented in tenant mode. See [docs/admin.md](docs/admin.md#the-response-cache). |
+| Prometheus metrics, OpenTelemetry traces, Grafana dashboard | Implemented. See [docs/observability.md](docs/observability.md). |
 | Helm chart, load tests, overhead measurements | Not built (M5) |
 
 No test in this repository has run against a live provider. No overhead numbers are published yet, because none have been measured under controlled conditions.
