@@ -28,8 +28,9 @@ const MaxHold = 60 * time.Second
 type Route struct {
 	ProviderName string
 	Provider     provider.Provider
-	// Scope says which upstream this is, such as its type and base URL, so that a change
-	// of account or endpoint changes the alias's revision.
+	// Scope says which upstream this is, its type and base URL, so that changing the
+	// endpoint changes the alias's revision. A different credential for the same endpoint
+	// doesn't: rotate the alias's routes, or wait out the cache TTL, if that matters.
 	Scope string
 	Model string
 	// Tier orders fallback. Lower tiers are tried first.

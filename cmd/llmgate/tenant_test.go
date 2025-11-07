@@ -128,6 +128,11 @@ func startTenantGateway(t *testing.T, databaseURL string) *tenantGateway {
 	if redisURL == "" {
 		testenv.Redis(t) // Skips, or fails when integration tests are required.
 	}
+	return startTenantGatewayOn(t, databaseURL, redisURL)
+}
+
+func startTenantGatewayOn(t *testing.T, databaseURL, redisURL string) *tenantGateway {
+	t.Helper()
 	m := mock.New()
 	upstream := httptest.NewServer(m)
 	t.Cleanup(upstream.Close)
@@ -337,6 +342,49 @@ func TestUSDFormatting(t *testing.T) {
 	for micros, want := range map[int64]string{0: "$0.00", 10_000: "$0.01", 5_000_000: "$5.00", 1_234_567: "$1.234567", 100: "$0.0001", -2_500_000: "-$2.50"} {
 		if got := usd(micros); got != want {
 			t.Errorf("usd(%d) = %q, want %q", micros, got, want)
+		}
+	}
+}
+
+// A Redis that hangs, rather than refusing connections, has to cost a request almost
+// nothing: team limits fail closed quickly, and the cache is a quick miss.
+func TestAHungRedisCostsLittle(t *testing.T) {
+	g := startTenantGatewayOn(t, testenv.PostgresURL(t), "redis://"+testenv.SilentRedis(t)+"/0")
+	g.mustCLI("teams", "create", "limited", "--budget-usd", "1", "--requests-per-minute", "100")
+	g.mustCLI("teams", "create", "open", "--budget-usd", "1")
+	limited := strings.SplitN(g.mustCLI("keys", "create", "limited"), "\n", 2)[0]
+	open := strings.SplitN(g.mustCLI("keys", "create", "open"), "\n", 2)[0]
+
+	for range 3 {
+		start := time.Now()
+		resp, body := g.chat(limited)
+		if resp.StatusCode != http.StatusServiceUnavailable || !strings.Contains(body, "rate_limit_unavailable") {
+			t.Fatalf("status = %d: %s", resp.StatusCode, body)
+		}
+		if elapsed := time.Since(start); elapsed > time.Second {
+			t.Fatalf("team limits took %v to fail closed", elapsed)
+		}
+	}
+	for range 3 {
+		req, err := http.NewRequest(http.MethodPost, "http://"+g.addrs.Gateway+"/v1/chat/completions",
+			strings.NewReader(`{"model":"fast","messages":[{"role":"user","content":"hello"}]}`))
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header.Set("Authorization", "Bearer "+open)
+		req.Header.Set("X-Llmgate-Cache", "allow")
+		start := time.Now()
+		resp, err := g.gateway.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, _ = io.Copy(io.Discard, resp.Body)
+		_ = resp.Body.Close()
+		if resp.StatusCode != http.StatusOK || resp.Header.Get("X-Llmgate-Cache") != "miss" {
+			t.Fatalf("status = %d, cache %q", resp.StatusCode, resp.Header.Get("X-Llmgate-Cache"))
+		}
+		if elapsed := time.Since(start); elapsed > time.Second {
+			t.Fatalf("a cache miss took %v", elapsed)
 		}
 	}
 }
