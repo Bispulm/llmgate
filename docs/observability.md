@@ -35,6 +35,8 @@ Every label takes its values from a fixed set, or from configuration: alias, pro
 
 Go runtime and process metrics are included as well.
 
+`metrics.pprof: true` also serves Go's profiling endpoints under `/debug/pprof` on the same listener. A profile holds no request content, but taking one costs CPU, so it's off unless set. `scripts/bench.sh` uses it to profile tenant mode under load.
+
 Breakers, holds, and provider queues are per replica, so each replica reports its own. Money isn't: charges here are a view of what settled, and the ledger in Postgres is the authority. Use `llmgate usage` or the admin API for exact figures.
 
 ## Traces
