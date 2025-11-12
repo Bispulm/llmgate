@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -691,5 +692,17 @@ func TestTheDrainDelayKeepsServingWhileNotReady(t *testing.T) {
 		}
 	case <-time.After(10 * time.Second):
 		t.Fatal("serve didn't stop after the drain delay")
+	}
+}
+
+func TestVersionSaysWhatWasBuilt(t *testing.T) {
+	var out bytes.Buffer
+	if err := run(context.Background(), []string{"version"}, process{getenv: testEnv, stdout: &out, stderr: io.Discard}); err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"llmgate", "commit", runtime.Version()} {
+		if !strings.Contains(out.String(), want) {
+			t.Fatalf("version printed %q, missing %q", out.String(), want)
+		}
 	}
 }
