@@ -1,0 +1,39 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "llmgate.name" . }}
+  labels:
+    {{- include "llmgate.labels" . | nindent 4 }}
+spec:
+  selector:
+    app.kubernetes.io/name: llmgate
+    app.kubernetes.io/instance: {{ .Release.Name }}
+  ports:
+    - {name: http, port: 18300, targetPort: http}
+---
+# The admin API has its own Service, so it can be kept off any ingress.
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "llmgate.name" . }}-admin
+  labels:
+    {{- include "llmgate.labels" . | nindent 4 }}
+spec:
+  selector:
+    app.kubernetes.io/name: llmgate
+    app.kubernetes.io/instance: {{ .Release.Name }}
+  ports:
+    - {name: admin, port: 18302, targetPort: admin}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "llmgate.name" . }}-metrics
+  labels:
+    {{- include "llmgate.labels" . | nindent 4 }}
+spec:
+  selector:
+    app.kubernetes.io/name: llmgate
+    app.kubernetes.io/instance: {{ .Release.Name }}
+  ports:
+    - {name: metrics, port: 18303, targetPort: metrics}

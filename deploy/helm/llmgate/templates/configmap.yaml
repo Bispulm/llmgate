@@ -1,0 +1,16 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "llmgate.name" . }}-config
+  labels:
+    {{- include "llmgate.labels" . | nindent 4 }}
+  {{- if .Values.migrate.enabled }}
+  annotations:
+    # The migration hook runs before the release's own resources exist.
+    helm.sh/hook: pre-install,pre-upgrade
+    helm.sh/hook-weight: "-10"
+    helm.sh/hook-delete-policy: before-hook-creation
+  {{- end }}
+data:
+  config.yaml: |
+    {{- toYaml .Values.config | nindent 4 }}

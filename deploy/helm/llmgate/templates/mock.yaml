@@ -1,0 +1,47 @@
+{{- if .Values.mock.enabled }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "llmgate.name" . }}-mock
+  labels:
+    {{- include "llmgate.labels" . | nindent 4 }}
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: llmgate-mock
+      app.kubernetes.io/instance: {{ .Release.Name }}
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: llmgate-mock
+        app.kubernetes.io/instance: {{ .Release.Name }}
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+      containers:
+        - name: mock
+          image: {{ include "llmgate.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["/usr/local/bin/llmgate-mock", "-listen", "0.0.0.0:18301"]
+          ports:
+            - {name: http, containerPort: 18301}
+          securityContext:
+            {{- include "llmgate.securityContext" . | nindent 12 }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "llmgate.name" . }}-mock
+  labels:
+    {{- include "llmgate.labels" . | nindent 4 }}
+spec:
+  selector:
+    app.kubernetes.io/name: llmgate-mock
+    app.kubernetes.io/instance: {{ .Release.Name }}
+  ports:
+    - {name: http, port: 18301, targetPort: http}
+{{- end }}

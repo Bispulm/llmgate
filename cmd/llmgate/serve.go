@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/http/pprof"
 	"sync"
 	"time"
 
@@ -39,6 +40,28 @@ func serveCommand(p process) *cobra.Command {
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			return serve(cmd.Context(), configPath, p)
+		},
+	}
+	cmd.Flags().StringVar(&configPath, "config", "", "path to the configuration file")
+	_ = cmd.MarkFlagRequired("config")
+	return cmd
+}
+
+// validateCommand checks a configuration file the way serve would, without credentials
+// or any connection, so it can run in CI against a rendered chart.
+func validateCommand(p process) *cobra.Command {
+	var configPath string
+	cmd := &cobra.Command{
+		Use:   "validate",
+		Short: "Check a configuration file without starting anything",
+		Args:  cobra.NoArgs,
+		RunE: func(*cobra.Command, []string) error {
+			cfg, err := config.Load(configPath)
+			if err != nil {
+				return err
+			}
+			_, err = fmt.Fprintf(p.stdout, "the configuration is valid: %s mode, %d providers, %d model aliases\n", cfg.Auth.Mode, len(cfg.Providers), len(cfg.Models))
+			return err
 		},
 	}
 	cmd.Flags().StringVar(&configPath, "config", "", "path to the configuration file")
@@ -137,7 +160,14 @@ func serve(ctx context.Context, configPath string, p process) error {
 		addrs.Metrics = metricsListener.Addr().String()
 		mux := http.NewServeMux()
 		mux.Handle("GET /metrics", gatewayMetrics.Handler())
-		metricsServer = &http.Server{Handler: mux, ReadHeaderTimeout: 10 * time.Second, WriteTimeout: 30 * time.Second}
+		if cfg.Metrics.PProf {
+			mux.HandleFunc("/debug/pprof/", pprof.Index)
+			mux.HandleFunc("/debug/pprof/cmdline", pprof.Cmdline)
+			mux.HandleFunc("/debug/pprof/profile", pprof.Profile)
+			mux.HandleFunc("/debug/pprof/symbol", pprof.Symbol)
+			mux.HandleFunc("/debug/pprof/trace", pprof.Trace)
+		}
+		metricsServer = &http.Server{Handler: mux, ReadHeaderTimeout: 10 * time.Second, WriteTimeout: 2 * time.Minute}
 		go func() { serveErr <- metricsServer.Serve(metricsListener) }()
 		logger.Info("metrics listening", "addr", addrs.Metrics)
 	}
@@ -196,8 +226,13 @@ func serve(ctx context.Context, configPath string, p process) error {
 	case <-ctx.Done():
 	}
 
-	logger.Info("shutting down", "drain_timeout", cfg.Server.ShutdownTimeout.String())
+	logger.Info("shutting down", "drain_delay", cfg.Server.DrainDelay.String(), "drain_timeout", cfg.Server.ShutdownTimeout.String())
 	handler.SetDraining()
+	// Readiness now fails, but new connections are still served until load balancers
+	// have had time to notice. Closing the listener at once would refuse them.
+	if cfg.Server.DrainDelay > 0 {
+		time.Sleep(cfg.Server.DrainDelay)
+	}
 	drainCtx, cancelDrain := context.WithTimeout(context.WithoutCancel(ctx), cfg.Server.ShutdownTimeout)
 	defer cancelDrain()
 	if err := server.Shutdown(drainCtx); err != nil {
