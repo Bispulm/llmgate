@@ -39,7 +39,7 @@ The script also measures:
 
 ## Conditions
 
-Each run records the commit, the Go version, the operating system, the CPU, its cores and memory, how Postgres and Redis were run, the workload, and the load average before and after. A run is labeled **contended** if the 1-minute load average was above a quarter of the cores before or after, and its report says so at the top. A contended run isn't presented as a measurement of the gateway.
+Each run records the commit, the Go version, the operating system, the CPU, its cores and memory, how Postgres and Redis were run, the workload, the load average before it started, and the CPU other processes used during it, sampled every 10 seconds. The benchmark loads the machine itself, so the load average during the run says nothing about other work. A run is labeled **contended** if the load average before it exceeded a quarter of the cores, or other processes averaged more than one core, and its report says so at the top. A contended run isn't presented as a measurement of the gateway.
 
 Postgres and Redis run in containers, which on macOS means inside a VM, so tenant mode's numbers include that network hop. They are a property of this setup, not of a production deployment.
 
