@@ -62,6 +62,8 @@ services:
   gateway:
     <<: *llmgate
     command: ["serve", "--config", "/etc/llmgate/config.yaml"]
+    # Longer than the default 30 second drain, so requests in flight can finish.
+    stop_grace_period: 45s
     ports:
       - "127.0.0.1:${LLMGATE_GATEWAY_PORT:-18300}:18300"
       - "127.0.0.1:${LLMGATE_ADMIN_PORT:-18302}:18302"

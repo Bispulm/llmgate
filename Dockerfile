@@ -5,7 +5,10 @@ WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
-RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/llmgate ./cmd/llmgate && \
+# The build context has no .git, so the version and commit come in as arguments.
+ARG VERSION=dev
+ARG COMMIT=unknown
+RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w -X main.version=${VERSION} -X main.commit=${COMMIT}" -o /out/llmgate ./cmd/llmgate && \
     CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/llmgate-mock ./cmd/llmgate-mock
 
 FROM gcr.io/distroless/static-debian13:nonroot@sha256:25ac8f0c3b2334a9eb05452266bd4697864a8c8ef0ef71e5e6480d7f92868329
