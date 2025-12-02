@@ -73,7 +73,7 @@ The tests run against the real gateway, real Postgres, and real Redis, over real
 - **Crashes resolve conservatively.** A gateway process killed with `SIGKILL` mid-stream leaves its liability held until a reconciler charges the most it could have cost. A settlement killed partway leaves nothing half done.
 - **Failover respects the commitment point.** A failure before commit falls back. After commit, no other provider is ever called, which the mock's request counts prove.
 - **Outages fail closed, quickly.** An unreachable or hung Postgres refuses admission within seconds. A hung Redis fails team limits closed in well under a second, and never affects budgets.
-- **Deployments don't drop requests.** On kind, 12,271 requests went through a rolling restart without a failure, and every attempt reconciled exactly.
+- **Deployments don't drop requests.** On kind, 12,271 requests went through a rolling restart without a failure, and every attempt reconciled exactly. A stopping replica asks clients to close their connections first, and a test sending on pooled connections through a shutdown loses none.
 
 Before each milestone, the code was deliberately broken in dozens of ways to check that a test fails for each break, and an independent review looked for bugs the tests missed. Both found real bugs, which are fixed.
 
