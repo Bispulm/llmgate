@@ -100,5 +100,18 @@ section "Usage"
 k port-forward svc/llmgate-admin "$ADMIN_PORT:18302" >"$WORK/pf-admin-2.log" 2>&1 & PIDS+=($!)
 for _ in $(seq 1 100); do ready "http://127.0.0.1:$ADMIN_PORT/" && break; sleep 0.2; done
 cli usage kind-team
+
+section "A rollback restores the configuration"
+config_of() { k get deploy/llmgate -o jsonpath='{.spec.template.spec.volumes[0].configMap.name}'; }
+before=$(config_of)
+helm --kube-context "$CONTEXT" -n "$NAMESPACE" upgrade llmgate deploy/helm/llmgate \
+  --set mock.enabled=true --set image.tag=kind-test --set config.auth.key_cache_ttl=20s --wait --timeout 4m >/dev/null
+changed=$(config_of)
+helm --kube-context "$CONTEXT" -n "$NAMESPACE" rollback llmgate 1 --wait --timeout 4m >/dev/null
+after=$(config_of)
+echo "configuration: $before, then $changed, then after the rollback $after"
+[ "$before" != "$changed" ] && [ "$after" = "$before" ] || { echo "the rollback didn't restore the configuration"; exit 1; }
+k get configmap "$after" >/dev/null || { echo "the restored configuration doesn't exist"; exit 1; }
+
 echo
 echo "kind test passed"
