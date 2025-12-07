@@ -81,7 +81,17 @@ Before each milestone, the code was deliberately broken in dozens of ways to che
 
 `scripts/bench.sh` runs the same workload against the mock directly, through development mode, and through tenant mode, and also measures failover, memory per stream, fairness between teams, and how closely reservations match charges. See [docs/performance.md](docs/performance.md) for the method.
 
-No numbers are published yet. The runs so far were on a machine shared with other work, and a contended run isn't a clean measurement.
+From two uncontended runs on one machine, against a mock that answers in 0.17 ms:
+
+| | |
+|---|---|
+| Added latency, development mode | about +0.3 ms p50, +1 to +2 ms p99 |
+| Added time to first byte, streaming | about +0.7 ms p50 |
+| Tenant mode, one team | 3.7 to 4.4 ms p50 one at a time, levelling off near 1,000 req/s, since a team's reservations take turns on its budget row |
+| Tenant mode, eight teams | about 2,000 req/s, limited by Postgres in a VM |
+| Memory per active stream | about 75 KiB and 4 goroutines |
+
+Tenant mode's numbers vary between runs, because they're mostly Postgres round trips. The full results, conditions, and caveats are in [docs/performance.md](docs/performance.md#published-results).
 
 ## Documentation
 

@@ -1,0 +1,10 @@
+{
+  "label": "8 teams, 8 in flight",
+  "requests": 11657,
+  "ok": 11657,
+  "throughput_rps": 1165.7,
+  "latency_ms": {
+    "p50": 6.754,
+    "p99": 9.972
+  }
+}

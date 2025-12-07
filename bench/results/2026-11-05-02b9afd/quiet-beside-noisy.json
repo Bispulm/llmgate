@@ -1,0 +1,30 @@
+{
+  "label": "quiet-beside-noisy",
+  "url": "http://127.0.0.1:18300/v1/chat/completions",
+  "model": "bench-fair",
+  "stream": false,
+  "concurrency": 2,
+  "duration": "20s",
+  "warmup": "5s",
+  "requests": 1419,
+  "ok": 1419,
+  "errors": {},
+  "throughput_rps": 70.95,
+  "latency_ms": {
+    "p50": 28.221,
+    "p95": 29.19,
+    "p99": 30.248,
+    "max": 52.766,
+    "mean": 28.159
+  },
+  "ttfb_ms": {
+    "p50": 28.217,
+    "p95": 29.185,
+    "p99": 30.241,
+    "max": 52.758,
+    "mean": 28.153
+  },
+  "started_at": "2026-11-05T21:50:31.101535Z",
+  "go_version": "go1.27.3",
+  "gomaxprocs": 14
+}

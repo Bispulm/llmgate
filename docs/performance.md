@@ -53,4 +53,26 @@ Postgres and Redis run in containers, which on macOS means inside a VM, so tenan
 
 ## Published results
 
-None yet. The runs so far were on a machine shared with other work, and every one was contended.
+Two uncontended runs on 2026-11-05, on an Apple M4 Pro with 14 cores and 24 GiB, macOS, Go 1.27.3, with Postgres and Redis in Compose containers inside the Docker VM. The full reports, conditions, and raw JSON are in [`bench/results/2026-11-05-90d1219`](../bench/results/2026-11-05-90d1219/README.md) and [`bench/results/2026-11-05-02b9afd`](../bench/results/2026-11-05-02b9afd/README.md). Earlier, contended runs aren't published.
+
+| What | Run 90d1219 | Run 02b9afd |
+|---|---|---|
+| Development mode, added latency, non-streaming, 16 in flight | +0.35 ms p50, +1.00 ms p99 | +0.32 ms p50, +2.01 ms p99 |
+| Development mode, added time to first byte, streaming | +0.66 ms p50 | +0.75 ms p50 |
+| Development mode, throughput at 256 in flight | 50,982 req/s | 53,146 req/s |
+| Tenant mode, one team, 1 in flight | 3.7 ms p50, 264 req/s | 4.4 ms p50, 226 req/s |
+| Tenant mode, one team, 16 in flight | 1,017 req/s, 15.0 ms p50 | 540 to 927 req/s, 16.6 to 24.1 ms p50 |
+| Tenant mode, eight teams, 32 in flight | 2,044 req/s | 2,021 req/s |
+| Failover before commit, added latency, when the failing route answers at once | +0.0 ms p50, +0.3 ms p99 | +0.0 ms p50, within noise at p99 |
+| Memory per active stream | not valid in this run | 75 KiB of heap, 4 goroutines |
+| A quiet team beside a saturating one, added p99 | +0.84 ms | +0.69 ms |
+| Attempts settled, charged conservatively, over their reservation, budgets disagreeing with the ledger | 171,176, 0, 0, 0 | 149,579, 0, 0, 0 |
+| Charges as a share of reservations | 19% | 19% |
+
+What the numbers say:
+
+- **Proxying adds about a third of a millisecond at the median**, and one to two milliseconds at p99, against a mock that answers in 0.17 ms. The mock is far faster than any real provider, so in practice this is a small fraction of a request.
+- **Tenant mode's cost is Postgres round trips.** Each request reserves, marks dispatched, and settles, and here each round trip crosses into a VM. One team's admissions take turns on its budget row, so a single team levels off around 1,000 requests a second on this setup, and adding concurrency past that only adds latency. More teams admit in parallel, up to about 2,000 a second here, where Postgres in the VM becomes the limit.
+- **Tenant mode varies between runs**, from 540 to 1,017 requests a second for one team at 16 in flight, even with the machine otherwise quiet. Development mode doesn't vary much, so the variance comes from Postgres and the VM it runs in.
+- **Reservations are conservative.** Charges came to about a fifth of what was reserved, because the bound assumes every byte of the prompt is a token and the whole output limit is used. No attempt cost more than its reservation.
+- **Fairness holds.** A team keeping 64 requests in flight waits in its own queue, about 300 ms here, while a team with 2 in flight sees under a millisecond of difference.
