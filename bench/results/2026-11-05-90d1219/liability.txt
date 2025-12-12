@@ -1,0 +1,15 @@
+   team_id    |   state    | attempts | reserved_micros | charged_micros | conservative | over_reservation 
+--------------+------------+----------+-----------------+----------------+--------------+------------------
+ bench        | reconciled |    99355 |       138600225 |       26825850 |            0 |                0
+ bench-noisy  | reconciled |     5434 |         7580430 |         489060 |            0 |                0
+ bench-quiet  | reconciled |     3583 |         4998285 |         322470 |            0 |                0
+ bench-team-1 | reconciled |     7846 |        10945170 |        2118420 |            0 |                0
+ bench-team-2 | reconciled |     7833 |        10927035 |        2114910 |            0 |                0
+ bench-team-3 | reconciled |     7844 |        10942380 |        2117880 |            0 |                0
+ bench-team-4 | reconciled |     7851 |        10952145 |        2119770 |            0 |                0
+ bench-team-5 | reconciled |     7849 |        10949355 |        2119230 |            0 |                0
+ bench-team-6 | reconciled |     7859 |        10963305 |        2121930 |            0 |                0
+ bench-team-7 | reconciled |     7855 |        10957725 |        2120850 |            0 |                0
+ bench-team-8 | reconciled |     7867 |        10974465 |        2124090 |            0 |                0
+(11 rows)
+

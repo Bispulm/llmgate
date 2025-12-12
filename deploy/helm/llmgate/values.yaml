@@ -23,14 +23,23 @@ migrate:
 mock:
   enabled: false
 
+# How long Kubernetes waits for a stopping pod. It has to cover the drain delay, the
+# drain itself, and settling, or a long completion is cut off and charged its full
+# reservation. Keep it above drain_delay + shutdown_timeout + 30s.
+terminationGracePeriodSeconds: 170
+
 # The gateway's configuration file, as documented in docs/admin.md. Credentials are
-# named by environment variable here, and come from the Secret.
+# named by environment variable here, and come from the Secret. Values are rendered as
+# templates, so they can refer to the release, as the mock's URL does.
 config:
   server:
     listen: 0.0.0.0:18300
-    # Keep serving while not ready, so Services stop sending new connections first.
+    # Keep serving while not ready, and ask clients to close their connections, so
+    # Services and connection pools move to other pods first.
     drain_delay: 5s
-    shutdown_timeout: 25s
+    # Longer than limits.request_timeout plus settling, so requests in flight at shutdown
+    # can finish rather than being cut off.
+    shutdown_timeout: 130s
   auth:
     mode: tenant
     key_cache_ttl: 30s
@@ -39,7 +48,8 @@ config:
   redis:
     url_env: LLMGATE_REDIS_URL
   admin:
-    # Reachable only through its own ClusterIP Service, behind the admin token.
+    # Behind the admin token, and on its own Service so it can be kept off any ingress.
+    # Any pod in the cluster can reach the port unless networkPolicy is enabled.
     listen: 0.0.0.0:18302
     token_env: LLMGATE_ADMIN_TOKEN
     allow_non_loopback: true
@@ -58,7 +68,7 @@ config:
   providers:
     - name: mock
       type: openai-compatible
-      base_url: http://llmgate-mock:18301/v1
+      base_url: "http://{{ .Release.Name }}-mock:18301/v1"
       api_key_env: LLMGATE_MOCK_PROVIDER_KEY
       allow_insecure_http: true
   models:
@@ -85,3 +95,13 @@ resources:
 
 podDisruptionBudget:
   minAvailable: 1
+
+# Restricts who can reach the admin API and metrics ports. The gateway port stays open to
+# all. Only takes effect where the cluster's network plugin enforces NetworkPolicy.
+networkPolicy:
+  enabled: false
+  # NetworkPolicy peers allowed to reach the admin API, such as a namespaceSelector for
+  # an operations namespace.
+  adminFrom: []
+  # Peers allowed to scrape metrics, such as the Prometheus namespace.
+  metricsFrom: []

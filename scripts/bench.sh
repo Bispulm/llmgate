@@ -17,6 +17,13 @@ PG_CONTAINER=${BENCH_PG_CONTAINER:-llmgate-postgres-1}
 DB_URL="postgres://llmgate:llmgate_dev@127.0.0.1:${LLMGATE_POSTGRES_PORT:-15433}/llmgate_bench?sslmode=disable"
 REDIS_URL="redis://127.0.0.1:${LLMGATE_REDIS_PORT:-16383}/2"
 
+for port in 18300 18301 18302 18303; do
+  if lsof -nP -iTCP:"$port" -sTCP:LISTEN >/dev/null 2>&1; then
+    echo "port $port is in use, and the benchmark needs 18300 to 18303 for its own processes" >&2
+    exit 1
+  fi
+done
+
 SHA=$(git rev-parse --short HEAD)$(git diff --quiet && git diff --cached --quiet || echo "-dirty")
 OUT=bench/results/$(date -u +%Y-%m-%d)-$SHA
 WORK=$(mktemp -d)
@@ -25,6 +32,7 @@ MOCK_PID=""
 mkdir -p "$OUT"
 
 cleanup() {
+  [ -n "${SAMPLER_PID:-}" ] && kill "$SAMPLER_PID" 2>/dev/null || true
   [ -n "$GATEWAY_PID" ] && kill "$GATEWAY_PID" 2>/dev/null || true
   [ -n "$MOCK_PID" ] && kill "$MOCK_PID" 2>/dev/null || true
   wait 2>/dev/null || true
@@ -43,6 +51,16 @@ go build -o "$WORK/llmgate-mock" ./cmd/llmgate-mock
 go build -o "$WORK/llmgate-bench" ./cmd/llmgate-bench
 
 LOAD_BEFORE=$(load1)
+
+# The benchmark loads the machine itself, so the load average during and after it says
+# nothing about other work. Instead, sample the CPU that other processes use: everything
+# but this run's binaries and the container VM, which hosts this run's Postgres and Redis.
+other_cpu() {
+  ps -Ao pcpu=,comm= | awk -v work="$WORK" '
+    index($0, work) || /Virtualization|limactl|qemu/ { next }
+    { total += $1 } END { printf "%.0f\n", total }'
+}
+( while true; do other_cpu >>"$WORK/other-cpu"; sleep 10; done ) & SAMPLER_PID=$!
 {
   echo "# Run conditions"
   echo
@@ -63,8 +81,9 @@ LOAD_BEFORE=$(load1)
 section "Mock and database"
 "$WORK/llmgate-mock" -listen 127.0.0.1:18301 2>"$WORK/mock.log" & MOCK_PID=$!
 wait_for http://127.0.0.1:18301/__mock/stats
-docker exec "$PG_CONTAINER" psql -U llmgate -d llmgate -tAc "SELECT 1 FROM pg_database WHERE datname = 'llmgate_bench'" | grep -q 1 ||
-  docker exec "$PG_CONTAINER" psql -U llmgate -d llmgate -qc "CREATE DATABASE llmgate_bench"
+kill -0 "$MOCK_PID" 2>/dev/null || { echo "the mock exited at startup" >&2; exit 1; }
+# A fresh database each run, so the liability report covers this run only.
+docker exec "$PG_CONTAINER" psql -U llmgate -d llmgate -qc "DROP DATABASE IF EXISTS llmgate_bench WITH (FORCE)" -c "CREATE DATABASE llmgate_bench" >/dev/null
 
 prices() {
   for model in "$@"; do
@@ -125,6 +144,8 @@ export BENCH_DEV_KEY=bench-dev-key BENCH_MOCK_KEY=mock BENCH_DATABASE_URL=$DB_UR
 start_gateway() { # config file
   "$WORK/llmgate" serve --config "$1" 2>"$WORK/gateway.log" & GATEWAY_PID=$!
   wait_for http://127.0.0.1:18300/healthz
+  # Something else answering on the port mustn't pass for this gateway.
+  kill -0 "$GATEWAY_PID" 2>/dev/null || { echo "the gateway exited at startup:" >&2; cat "$WORK/gateway.log" >&2; exit 1; }
 }
 stop_gateway() { kill "$GATEWAY_PID" 2>/dev/null || true; wait "$GATEWAY_PID" 2>/dev/null || true; GATEWAY_PID=""; }
 bench() { # label url key model [flags...]
@@ -134,7 +155,10 @@ bench() { # label url key model [flags...]
 }
 cli() { LLMGATE_ADMIN_TOKEN=$ADMIN_TOKEN "$WORK/llmgate" "$@" --admin-url http://127.0.0.1:18302; }
 team_key() { # team
-  cli teams create "$1" --budget-usd 100000 >/dev/null 2>&1 || true
+  # Limits far above the workload, so the shared Redis check runs on every request without
+  # refusing any.
+  cli teams create "$1" --budget-usd 100000 --requests-per-minute 100000000 --tokens-per-minute 100000000000 \
+    --max-in-flight 100000 >/dev/null 2>&1 || true
   cli keys create "$1" | head -1
 }
 metric() { curl -s http://127.0.0.1:18303/metrics | awk -v m="$1" '$1 == m {print $2}'; }
@@ -154,7 +178,18 @@ bench dev-stream "$GATEWAY" "$BENCH_DEV_KEY" bench -stream
 section "Failover before commit"
 bench dev-failover "$GATEWAY" "$BENCH_DEV_KEY" bench-failover
 
+section "Saturation: development mode"
+for c in 1 4 16 64 256; do
+  LLMGATE_BENCH_KEY=$BENCH_DEV_KEY "$WORK/llmgate-bench" -label "dev-c$c" -url "$GATEWAY" -model bench \
+    -concurrency "$c" -duration 10s -warmup 2s >"$OUT/saturation-dev-c$c.json"
+done
+
 section "Memory per active stream"
+# A fresh process, given a moment to settle, so the idle reading isn't left over from the
+# saturation runs before it.
+stop_gateway
+start_gateway "$WORK/dev.yaml"
+sleep 3
 IDLE_HEAP=$(metric go_memstats_heap_inuse_bytes); IDLE_GOROUTINES=$(metric go_goroutines)
 # Each stream lasts about ten seconds, so the heap is sampled while all of them are open.
 LLMGATE_BENCH_KEY=$BENCH_DEV_KEY "$WORK/llmgate-bench" -label streams -url "$GATEWAY" -model bench-slow -stream \
@@ -181,6 +216,27 @@ bench tenant "$GATEWAY" "$KEY" bench
 wait "$PROFILE_PID"
 go tool pprof -top -nodecount=25 "$WORK/llmgate" "$OUT/tenant-cpu.pprof" >"$OUT/tenant-cpu.txt" 2>/dev/null || true
 bench tenant-stream "$GATEWAY" "$KEY" bench -stream
+
+section "Saturation: tenant mode, one team"
+for c in 1 4 16 64 256; do
+  LLMGATE_BENCH_KEY=$KEY "$WORK/llmgate-bench" -label "tenant-c$c" -url "$GATEWAY" -model bench \
+    -concurrency "$c" -duration 10s -warmup 2s >"$OUT/saturation-tenant-c$c.json"
+done
+
+section "Saturation: tenant mode, eight teams"
+TEAM_KEYS=()
+for i in $(seq 1 8); do TEAM_KEYS+=("$(team_key "bench-team-$i")"); done
+for c in 8 32 128; do
+  per=$((c / 8)); PIDS_SAT=()
+  for i in $(seq 0 7); do
+    LLMGATE_BENCH_KEY=${TEAM_KEYS[$i]} "$WORK/llmgate-bench" -label "teams8-c$c-$i" -url "$GATEWAY" -model bench \
+      -concurrency "$per" -duration 10s -warmup 2s >"$WORK/teams8-c$c-$i.json" & PIDS_SAT+=($!)
+  done
+  wait "${PIDS_SAT[@]}"
+  jq -s --arg label "8 teams, $c in flight" '{label: $label, requests: (map(.requests) | add), ok: (map(.ok) | add),
+    throughput_rps: (map(.throughput_rps) | add), latency_ms: {p50: (map(.latency_ms.p50) | max), p99: (map(.latency_ms.p99) | max)}}' \
+    "$WORK"/teams8-c$c-*.json >"$OUT/saturation-teams8-c$c.json"
+done
 stop_gateway
 
 section "Fairness under a saturated team"
@@ -204,12 +260,14 @@ docker exec "$PG_CONTAINER" psql -U llmgate -d llmgate_bench -tAc "
   WHERE p.settled_micros <> COALESCE((SELECT sum(l.amount_micros) FROM ledger_entries l JOIN attempts a ON a.id = l.attempt_id WHERE a.budget_period_id = p.id), 0)
      OR p.reserved_micros <> COALESCE((SELECT sum(a.reserved_micros) FROM attempts a WHERE a.budget_period_id = p.id AND a.state IN ('reserved', 'dispatched', 'uncertain')), 0)" >"$WORK/mismatched"
 
-LOAD_AFTER=$(load1)
+kill "$SAMPLER_PID" 2>/dev/null || true; SAMPLER_PID=""
+OTHER_AVG=$(awk '{ t += $1; n++ } END { printf "%.0f", n ? t / n : 0 }' "$WORK/other-cpu")
+OTHER_MAX=$(sort -n "$WORK/other-cpu" | tail -1)
 CONTENDED=no
-awk -v a="$LOAD_BEFORE" -v b="$LOAD_AFTER" -v c="$(cores)" 'BEGIN { exit !((a > c/4) || (b > c/4)) }' && CONTENDED=yes
+awk -v l="$LOAD_BEFORE" -v o="$OTHER_AVG" -v c="$(cores)" 'BEGIN { exit !((l > c/4) || (o > 100)) }' && CONTENDED=yes
 {
-  echo "| Load average after | $LOAD_AFTER |"
-  echo "| Contended | $CONTENDED (a run is contended if the 1-minute load average exceeded a quarter of the cores before or after) |"
+  echo "| Other processes' CPU during the run | average ${OTHER_AVG}%, peak ${OTHER_MAX:-0}%, sampled every 10 seconds |"
+  echo "| Contended | $CONTENDED (contended if the load average before the run exceeded a quarter of the cores, or other processes averaged more than one core) |"
 } >>"$OUT/environment.md"
 
 section "Report"
@@ -228,6 +286,16 @@ section "Report"
   "$WORK/llmgate-bench" compare "$OUT/direct-stream.json" "$OUT/dev-stream.json" "$OUT/tenant-stream.json"
   echo
   echo "The difference between development and tenant mode is the cost of authentication, team limits, and accounting."
+  echo
+  echo "## Saturation"
+  echo
+  echo "Throughput and latency as concurrency rises, 10 seconds each after 2 seconds of warm-up. One team's admissions take turns on its budget row, so eight teams show how tenant mode scales across teams. For eight teams, latency is the worst team's."
+  echo
+  echo "| Run | Req/s | p50 ms | p99 ms | Errors |"
+  echo "|---|---|---|---|---|"
+  for f in "$OUT"/saturation-dev-c{1,4,16,64,256}.json "$OUT"/saturation-tenant-c{1,4,16,64,256}.json "$OUT"/saturation-teams8-c{8,32,128}.json; do
+    jq -r '"| \(.label) | \(.throughput_rps | floor) | \(.latency_ms.p50) | \(.latency_ms.p99) | \(.requests - .ok) |"' "$f"
+  done
   echo
   echo "## Failover before commit"
   echo

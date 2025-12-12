@@ -8,8 +8,10 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -691,5 +693,98 @@ func TestTheDrainDelayKeepsServingWhileNotReady(t *testing.T) {
 		}
 	case <-time.After(10 * time.Second):
 		t.Fatal("serve didn't stop after the drain delay")
+	}
+}
+
+func TestVersionSaysWhatWasBuilt(t *testing.T) {
+	var out bytes.Buffer
+	if err := run(context.Background(), []string{"version"}, process{getenv: testEnv, stdout: &out, stderr: io.Discard}); err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"llmgate", "commit", runtime.Version()} {
+		if !strings.Contains(out.String(), want) {
+			t.Fatalf("version printed %q, missing %q", out.String(), want)
+		}
+	}
+}
+
+// Clients that keep connections open, such as an ingress or an SDK's pool, only move to
+// another replica when told to. During the drain delay every response says to close, so
+// nothing is still in flight on an idle connection when shutdown closes it.
+func TestClientsReusingConnectionsLoseNothingAtShutdown(t *testing.T) {
+	upstream := httptest.NewServer(mock.New())
+	defer upstream.Close()
+	config := strings.Replace(testConfig, "http://127.0.0.1:18301/v1", upstream.URL+"/v1", 1)
+	config = strings.Replace(config, "shutdown_timeout: 2s", "shutdown_timeout: 2s\n  drain_delay: 1s", 1)
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(path, []byte(config), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	started := make(chan listening, 1)
+	done := make(chan error, 1)
+	go func() {
+		done <- run(ctx, []string{"serve", "--config", path}, process{getenv: testEnv, stdout: io.Discard, stderr: io.Discard, started: func(l listening) { started <- l }})
+	}()
+	var addrs listening
+	select {
+	case addrs = <-started:
+	case err := <-done:
+		t.Fatalf("serve returned early: %v", err)
+	}
+
+	// Workers send back to back on pooled connections, as a client that hasn't noticed the
+	// replica is going would. One told to close its connection moves on, as it would behind
+	// a load balancer, which by then has another replica to send it to.
+	client := &http.Client{Transport: &http.Transport{MaxIdleConnsPerHost: 32}}
+	defer client.CloseIdleConnections()
+	stopAt := time.Now().Add(1500 * time.Millisecond)
+	var failures, closes atomic.Int64
+	var mu sync.Mutex
+	var errs []string
+	var wg sync.WaitGroup
+	for range 16 {
+		wg.Go(func() {
+			for time.Now().Before(stopAt) {
+				req, err := http.NewRequest(http.MethodPost, "http://"+addrs.Gateway+"/v1/chat/completions", strings.NewReader(`{"model":"fast","messages":[{"role":"user","content":"hello"}]}`))
+				if err != nil {
+					failures.Add(1)
+					return
+				}
+				req.Header.Set("Authorization", "Bearer dev")
+				resp, err := client.Do(req)
+				if err != nil {
+					// Once the listener has closed, a new connection is refused, which a
+					// client handles by trying another replica. Only a request lost
+					// mid-flight on an open connection counts here.
+					if strings.Contains(err.Error(), "connection refused") {
+						return
+					}
+					failures.Add(1)
+					mu.Lock()
+					errs = append(errs, err.Error())
+					mu.Unlock()
+					continue
+				}
+				_, _ = io.Copy(io.Discard, resp.Body)
+				_ = resp.Body.Close()
+				if resp.Close {
+					closes.Add(1)
+					return
+				}
+			}
+		})
+	}
+	time.Sleep(300 * time.Millisecond)
+	cancel()
+	wg.Wait()
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	if failures.Load() != 0 {
+		t.Fatalf("%d requests on reused connections failed during shutdown: %v", failures.Load(), errs)
+	}
+	if closes.Load() == 0 {
+		t.Fatal("no response during the drain delay asked the client to close")
 	}
 }

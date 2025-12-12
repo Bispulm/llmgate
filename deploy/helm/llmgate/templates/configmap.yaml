@@ -1,16 +1,30 @@
+{{- /*
+The Deployment mounts a ConfigMap named after its content, which Helm tracks like any
+other resource, so a rollback brings the old configuration back with the old pods. The
+migration hook runs before the release's resources exist, so it gets a copy of its own.
+*/ -}}
 apiVersion: v1
 kind: ConfigMap
 metadata:
-  name: {{ include "llmgate.name" . }}-config
+  name: {{ include "llmgate.configName" . }}
   labels:
     {{- include "llmgate.labels" . | nindent 4 }}
-  {{- if .Values.migrate.enabled }}
+data:
+  config.yaml: |
+    {{- include "llmgate.config" . | nindent 4 }}
+{{- if .Values.migrate.enabled }}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "llmgate.name" . }}-migrate-config
+  labels:
+    {{- include "llmgate.labels" . | nindent 4 }}
   annotations:
-    # The migration hook runs before the release's own resources exist.
     helm.sh/hook: pre-install,pre-upgrade
     helm.sh/hook-weight: "-10"
     helm.sh/hook-delete-policy: before-hook-creation
-  {{- end }}
 data:
   config.yaml: |
-    {{- toYaml .Values.config | nindent 4 }}
+    {{- include "llmgate.config" . | nindent 4 }}
+{{- end }}

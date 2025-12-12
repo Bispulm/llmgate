@@ -7,6 +7,12 @@ app.kubernetes.io/version: {{ .Chart.AppVersion | quote }}
 app.kubernetes.io/managed-by: {{ .Release.Service }}
 {{- end -}}
 
+{{- define "llmgate.config" -}}{{ tpl (toYaml .Values.config) . }}{{- end -}}
+
+{{- define "llmgate.configName" -}}
+{{ .Release.Name }}-config-{{ include "llmgate.config" . | sha256sum | trunc 10 }}
+{{- end -}}
+
 {{- define "llmgate.image" -}}{{ .Values.image.repository }}:{{ .Values.image.tag }}{{- end -}}
 
 {{/* Restricted pod security: non-root, read-only root, no privileges. */}}

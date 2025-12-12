@@ -155,6 +155,12 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	s.inflight.Add(1)
 	defer s.inflight.Add(-1)
 
+	// While draining, ask every client to close its connection after this response. A
+	// load balancer only steers new connections away, and a client holding a pooled one
+	// would otherwise keep sending to this replica until shutdown closed it mid-request.
+	if s.draining.Load() {
+		w.Header().Set("Connection", "close")
+	}
 	rc := http.NewResponseController(w)
 	s.extendWriteDeadline(rc)
 	if s.limits.BodyReadTimeout > 0 && r.ContentLength != 0 {

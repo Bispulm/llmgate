@@ -7,7 +7,7 @@ export LLMGATE_REDIS_PORT
 TEST_POSTGRES_URL = postgres://llmgate:llmgate_dev@127.0.0.1:$(LLMGATE_POSTGRES_PORT)/llmgate?sslmode=disable
 TEST_REDIS_URL = redis://127.0.0.1:$(LLMGATE_REDIS_PORT)/0
 
-.PHONY: build test vet lint vuln secrets check demo dev-up dev-down test-integration stack-up stack-down image
+.PHONY: build test vet lint vuln secrets check demo demo-dev dev-up dev-down test-integration stack-up stack-down image
 
 build:
 	go build ./...
@@ -30,8 +30,13 @@ secrets:
 
 check: build vet test lint vuln secrets
 
+# Tenant mode: two teams, streaming, failover, an exhausted budget, and the accounting.
 demo:
 	./scripts/demo.sh
+
+# Development mode: one key, no budgets, and the commitment point under failures.
+demo-dev:
+	./scripts/demo-dev.sh
 
 dev-up:
 	docker compose up -d --wait
@@ -47,7 +52,7 @@ stack-down:
 	docker compose --profile stack down
 
 image:
-	docker build -t llmgate:dev .
+	docker build --build-arg COMMIT=$$(git rev-parse HEAD) -t llmgate:dev .
 
 # Runs every test, including those needing real Postgres and Redis. It fails rather
 # than skips if they can't be reached.

@@ -1,0 +1,64 @@
+# Release configuration. Build locally with `goreleaser release --snapshot --clean`,
+# which writes to dist/ and publishes nothing. Publishing is turned off here on purpose.
+version: 2
+
+project_name: llmgate
+
+before:
+  hooks:
+    - go mod verify
+
+builds:
+  - id: llmgate
+    main: ./cmd/llmgate
+    binary: llmgate
+    env: [CGO_ENABLED=0]
+    goos: [linux, darwin]
+    goarch: [amd64, arm64]
+    flags: [-trimpath]
+    ldflags:
+      - -s -w -X main.version={{.Version}} -X main.commit={{.FullCommit}} -X main.date={{.CommitDate}}
+    mod_timestamp: "{{ .CommitTimestamp }}"
+  - id: llmgate-mock
+    main: ./cmd/llmgate-mock
+    binary: llmgate-mock
+    env: [CGO_ENABLED=0]
+    goos: [linux, darwin]
+    goarch: [amd64, arm64]
+    flags: [-trimpath]
+    ldflags: [-s -w]
+    mod_timestamp: "{{ .CommitTimestamp }}"
+  - id: llmgate-bench
+    main: ./cmd/llmgate-bench
+    binary: llmgate-bench
+    env: [CGO_ENABLED=0]
+    goos: [linux, darwin]
+    goarch: [amd64, arm64]
+    flags: [-trimpath]
+    ldflags: [-s -w]
+    mod_timestamp: "{{ .CommitTimestamp }}"
+
+archives:
+  - formats: [tar.gz]
+    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    files:
+      - LICENSE
+      - README.md
+      - docs/**/*
+      - configs/*
+
+checksum:
+  name_template: checksums.txt
+
+# Milestone tags such as m4 aren't versions, so a snapshot names its own: the release
+# candidate it builds, and the commit.
+snapshot:
+  version_template: "0.1.0-rc.1-snapshot+{{ .ShortCommit }}"
+
+changelog:
+  use: git
+  sort: asc
+
+# Nothing is published from this configuration.
+release:
+  disable: true

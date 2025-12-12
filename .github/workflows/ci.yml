@@ -103,8 +103,10 @@ jobs:
         run: helm lint deploy/helm/llmgate
       - name: Check the configuration the chart renders
         run: |
-          helm template llmgate deploy/helm/llmgate --show-only templates/configmap.yaml \
-            | yq '.data["config.yaml"]' > rendered.yaml
+          # A release name other than llmgate, so a hardcoded name would show up here.
+          helm template prod deploy/helm/llmgate --set mock.enabled=true --show-only templates/configmap.yaml \
+            | yq 'select(document_index == 0) | .data["config.yaml"]' > rendered.yaml
+          grep -q 'http://prod-mock:18301/v1' rendered.yaml
           go run ./cmd/llmgate validate --config rendered.yaml
       - name: Check the Compose configurations
         run: |
