@@ -690,7 +690,9 @@ func waitForLimiter(t *testing.T, l *limits.FairLimiter, ok func(limits.Stats) b
 }
 
 func TestConcurrencyLimit(t *testing.T) {
-	// hold starts a request that stays in flight until the test ends.
+	// hold starts a request that stays in flight until the test ends. It returns once the
+	// request holds a slot and has reached the provider, so that later counts only change
+	// if another request gets through.
 	hold := func(t *testing.T, g *gateway, l *limits.FairLimiter, want int) {
 		t.Helper()
 		ctx, cancel := context.WithCancel(context.Background())
@@ -707,6 +709,7 @@ func TestConcurrencyLimit(t *testing.T) {
 			<-done
 		})
 		waitForLimiter(t, l, func(s limits.Stats) bool { return s.InFlight == want })
+		waitForMock(t, g, "busy", func(s mock.LabelStats) bool { return s.Requests == int64(want) })
 	}
 
 	t.Run("over capacity falls through to the next route", func(t *testing.T) {
