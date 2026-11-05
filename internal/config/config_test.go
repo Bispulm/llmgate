@@ -310,7 +310,7 @@ func TestTracingSettings(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.Tracing.OTLPEndpoint != "http://127.0.0.1:4318" || cfg.Tracing.SampleRatio != 1 {
+	if cfg.Tracing.OTLPEndpoint != "http://127.0.0.1:4318" || cfg.Tracing.Ratio() != 1 {
 		t.Fatalf("tracing = %+v", cfg.Tracing)
 	}
 	if cfg, err := Load(writeConfig(t, validYAML)); err != nil || cfg.Tracing.OTLPEndpoint != "" {
@@ -330,5 +330,16 @@ func TestTracingSettings(t *testing.T) {
 	}
 	if _, err := Load(writeConfig(t, validYAML+"tracing:\n  otlp_endpoint: https://collector.example\n  sample_ratio: 0.1\n")); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// Zero is a real choice: trace only what callers have already decided to sample.
+func TestASampleRatioOfZeroIsKept(t *testing.T) {
+	cfg, err := Load(writeConfig(t, validYAML+"tracing:\n  otlp_endpoint: http://127.0.0.1:4318\n  sample_ratio: 0\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := cfg.Tracing.Ratio(); got != 0 {
+		t.Fatalf("ratio = %v", got)
 	}
 }
