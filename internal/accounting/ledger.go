@@ -106,6 +106,17 @@ type Ledger struct {
 
 	pinnedMu sync.RWMutex
 	pinned   map[pinnedKey]Prices // old price lists, which never change
+
+	gatesMu sync.Mutex
+	gates   map[string]*teamGate // admissions in progress, by team
+}
+
+// teamGate lets one admission per team run at a time in this process. They'd queue on
+// the team's period row anyway, and queueing here instead means a waiting admission
+// doesn't hold a pooled connection that dispatch and settlement need.
+type teamGate struct {
+	slot  chan struct{}
+	users int
 }
 
 type pinnedKey struct {
@@ -126,6 +137,38 @@ func NewLedger(opts LedgerOptions) *Ledger {
 		uncertainGrace: opts.UncertainGrace,
 		rejected:       opts.RejectedAttemptCharge,
 		pinned:         make(map[pinnedKey]Prices),
+		gates:          make(map[string]*teamGate),
+	}
+}
+
+// enterTeam waits for the team's turn to admit, or for ctx to end. The map only holds
+// teams with admissions in progress.
+func (l *Ledger) enterTeam(ctx context.Context, teamID string) (func(), error) {
+	l.gatesMu.Lock()
+	g, ok := l.gates[teamID]
+	if !ok {
+		g = &teamGate{slot: make(chan struct{}, 1)}
+		l.gates[teamID] = g
+	}
+	g.users++
+	l.gatesMu.Unlock()
+
+	leave := func() {
+		l.gatesMu.Lock()
+		if g.users--; g.users == 0 {
+			delete(l.gates, teamID)
+		}
+		l.gatesMu.Unlock()
+	}
+	select {
+	case g.slot <- struct{}{}:
+		return func() {
+			<-g.slot
+			leave()
+		}, nil
+	case <-ctx.Done():
+		leave()
+		return nil, unavailable(ctx.Err())
 	}
 }
 
@@ -177,6 +220,12 @@ func (l *Ledger) Reserve(ctx context.Context, r ReserveRequest) (*Reservation, e
 	if err != nil {
 		return nil, err
 	}
+
+	exit, err := l.enterTeam(ctx, r.TeamID)
+	if err != nil {
+		return nil, err
+	}
+	defer exit()
 
 	now := l.now()
 	start, end := periodBounds(now)
