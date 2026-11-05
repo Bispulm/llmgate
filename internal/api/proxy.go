@@ -105,23 +105,7 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	var stream bool
 	var x *exchange
 
-	// A caller's trace continues here. Spans carry routing and accounting decisions, and
-	// never what the client sent or got back.
-	traced := propagation.TraceContext{}.Extract(r.Context(), propagation.HeaderCarrier(r.Header))
-	traced, span := s.tracer.Start(traced, "chat.completions", trace.WithSpanKind(trace.SpanKindServer),
-		trace.WithAttributes(attribute.String("llmgate.request_id", id)))
-	defer func() {
-		s.metrics.RequestFinished(aliasLabel, stream, recorder.status, time.Since(start))
-		span.SetAttributes(attribute.String("llmgate.alias", aliasLabel), attribute.Bool("llmgate.stream", stream),
-			attribute.Int("http.response.status_code", recorder.status))
-		if x != nil {
-			span.SetAttributes(attribute.String("llmgate.team", x.principal.TeamID), attribute.Int("llmgate.attempts", x.attempts))
-		}
-		if recorder.status >= http.StatusInternalServerError {
-			span.SetStatus(codes.Error, http.StatusText(recorder.status))
-		}
-		span.End()
-	}()
+	defer func() { s.metrics.RequestFinished(aliasLabel, stream, recorder.status, time.Since(start)) }()
 	header := w.Header()
 	header.Set("X-Request-Id", id)
 	if s.ledger != nil {
@@ -143,12 +127,12 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 
 	// Authenticate before reading the body, so an unauthenticated caller can't make
 	// the gateway buffer or parse anything.
-	authCtx, cancelAuth := context.WithTimeout(traced, s.admissionTimeout())
+	authCtx, cancelAuth := context.WithTimeout(r.Context(), s.admissionTimeout())
 	principal, err := s.auth.Authenticate(authCtx, auth.BearerToken(r.Header))
 	cancelAuth()
 	if err != nil && !errors.Is(err, auth.ErrInvalidCredential) {
 		// Still a refusal, but the key may be perfectly good.
-		s.logger.LogAttrs(traced, slog.LevelWarn, "a key could not be checked", attrRequestID(id), slog.Any("error", err))
+		s.logger.LogAttrs(r.Context(), slog.LevelWarn, "a key could not be checked", attrRequestID(id), slog.Any("error", err))
 		s.metrics.DependencyError("postgres", "authenticate")
 		writeError(w, authUnavailable())
 		return
@@ -164,6 +148,24 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// A caller's trace continues here, once it has authenticated: anyone can send a trace
+	// header, and that mustn't be enough to have spans exported. Spans carry routing and
+	// accounting decisions, and never what the client sent or got back.
+	traced := propagation.TraceContext{}.Extract(r.Context(), propagation.HeaderCarrier(r.Header))
+	traced, span := s.tracer.Start(traced, "chat.completions", trace.WithSpanKind(trace.SpanKindServer), trace.WithTimestamp(start),
+		trace.WithAttributes(attribute.String("llmgate.request_id", id), attribute.String("llmgate.team", principal.TeamID)))
+	defer func() {
+		span.SetAttributes(attribute.String("llmgate.alias", aliasLabel), attribute.Bool("llmgate.stream", stream),
+			attribute.Int("http.response.status_code", recorder.status))
+		if x != nil {
+			span.SetAttributes(attribute.Int("llmgate.attempts", x.attempts))
+		}
+		if recorder.status >= http.StatusInternalServerError {
+			span.SetStatus(codes.Error, http.StatusText(recorder.status))
+		}
+		span.End()
+	}()
+
 	// Limits come before the body too, so a team over its limit costs little to refuse.
 	releaseTeam, apiErr := s.admitTeam(traced, principal, id)
 	if apiErr != nil {
@@ -173,7 +175,9 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	defer releaseTeam()
 
 	rc := http.NewResponseController(w)
-	body, apiErr := s.readBody(w, r)
+	// The unwrapped writer, because http.MaxBytesReader looks for net/http's own type to
+	// close the connection after a body that's too large.
+	body, apiErr := s.readBody(recorder.ResponseWriter, r)
 	// Reading the body can use up the deadline set when the request arrived.
 	s.extendWriteDeadline(rc)
 	if apiErr != nil {
@@ -278,10 +282,13 @@ func (s *Server) writeCached(x *exchange, e cache.Entry) {
 		Refusal:      e.Refusal,
 		FinishReason: e.FinishReason,
 		Usage: &chat.Usage{
-			State:            chat.UsageReported,
-			PromptTokens:     e.PromptTokens,
-			CompletionTokens: e.CompletionTokens,
-			TotalTokens:      e.PromptTokens + e.CompletionTokens,
+			State:                  chat.UsageReported,
+			PromptTokens:           e.PromptTokens,
+			CompletionTokens:       e.CompletionTokens,
+			TotalTokens:            e.TotalTokens,
+			CachedPromptTokens:     e.CachedPromptTokens,
+			CacheWritePromptTokens: e.CacheWritePromptTokens,
+			ReasoningTokens:        e.ReasoningTokens,
 		},
 	}
 	body, err := x.completionBody(completion)
@@ -301,17 +308,22 @@ func (s *Server) writeCached(x *exchange, e cache.Entry) {
 }
 
 // cacheEntry returns what to store for an answer, if it's worth reusing: a complete,
-// ordinary answer whose usage was reported.
+// ordinary answer whose usage was reported and consistent, kept exactly as reported.
 func cacheEntry(c *chat.Completion, route string) (cache.Entry, bool) {
-	if c.Refusal != "" || (c.FinishReason != chat.FinishStop && c.FinishReason != chat.FinishLength) || !c.Usage.Reportable() {
+	if c.Refusal != "" || (c.FinishReason != chat.FinishStop && c.FinishReason != chat.FinishLength) ||
+		c.Usage == nil || c.Usage.State != chat.UsageReported {
 		return cache.Entry{}, false
 	}
 	return cache.Entry{
-		Content:          c.Content,
-		FinishReason:     c.FinishReason,
-		Route:            route,
-		PromptTokens:     c.Usage.PromptTokens,
-		CompletionTokens: c.Usage.CompletionTokens,
+		Content:                c.Content,
+		FinishReason:           c.FinishReason,
+		Route:                  route,
+		PromptTokens:           c.Usage.PromptTokens,
+		CompletionTokens:       c.Usage.CompletionTokens,
+		TotalTokens:            c.Usage.TotalTokens,
+		CachedPromptTokens:     c.Usage.CachedPromptTokens,
+		CacheWritePromptTokens: c.Usage.CacheWritePromptTokens,
+		ReasoningTokens:        c.Usage.ReasoningTokens,
 	}, true
 }
 

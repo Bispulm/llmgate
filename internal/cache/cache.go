@@ -79,15 +79,19 @@ func writeFloat(h hash.Hash, f *float64) {
 	writeUint(h, math.Float64bits(*f))
 }
 
-// Entry is a stored response. Usage is what the original response reported. A hit
-// costs nothing, but the counts still describe the text.
+// Entry is a stored response. Its usage is exactly what the original response reported.
+// A hit costs nothing, but the counts still describe the text.
 type Entry struct {
-	Content          string            `json:"content"`
-	Refusal          string            `json:"refusal,omitempty"`
-	FinishReason     chat.FinishReason `json:"finish_reason"`
-	Route            string            `json:"route"`
-	PromptTokens     int64             `json:"prompt_tokens"`
-	CompletionTokens int64             `json:"completion_tokens"`
+	Content                string            `json:"content"`
+	Refusal                string            `json:"refusal,omitempty"`
+	FinishReason           chat.FinishReason `json:"finish_reason"`
+	Route                  string            `json:"route"`
+	PromptTokens           int64             `json:"prompt_tokens"`
+	CompletionTokens       int64             `json:"completion_tokens"`
+	TotalTokens            int64             `json:"total_tokens"`
+	CachedPromptTokens     *int64            `json:"cached_prompt_tokens,omitempty"`
+	CacheWritePromptTokens *int64            `json:"cache_write_prompt_tokens,omitempty"`
+	ReasoningTokens        *int64            `json:"reasoning_tokens,omitempty"`
 }
 
 // Options configures a Cache.
