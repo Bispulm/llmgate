@@ -80,6 +80,9 @@ func TestLoadRejectsInvalidConfig(t *testing.T) {
 		{"no api key env", "api_key_env: PRIMARY_KEY", "api_key_env: ''", "api_key_env"},
 		{"bad max_tokens_param", "api_key_env: PRIMARY_KEY", "api_key_env: PRIMARY_KEY\n    max_tokens_param: nope", "max_tokens_param"},
 		{"route to unknown provider", "provider: primary", "provider: missing", "missing"},
+		{"queue with no concurrency limit", "api_key_env: PRIMARY_KEY", "api_key_env: PRIMARY_KEY\n    max_queue: 5", "max_concurrency"},
+		{"per-team limit with no concurrency limit", "api_key_env: PRIMARY_KEY", "api_key_env: PRIMARY_KEY\n    max_in_flight_per_team: 5", "max_concurrency"},
+		{"negative concurrency", "api_key_env: PRIMARY_KEY", "api_key_env: PRIMARY_KEY\n    max_concurrency: -1", "negative"},
 		{"zero output limit", "max_output_tokens: 1024", "max_output_tokens: 0", "max_output_tokens"},
 		{"negative timeout", "request_timeout: 45s", "request_timeout: -1s", "request_timeout"},
 		{"empty alias", "alias: fast", "alias: ''", "alias"},
@@ -172,6 +175,25 @@ limits:`, 1)
 	}
 	if b := cfg.CircuitBreaker; b.MinRequests != 5 || b.ErrorRate != 0.25 || b.Cooldown != 10*time.Second || b.HalfOpenProbes != 1 || b.Window != 30*time.Second {
 		t.Fatalf("breaker = %+v", b)
+	}
+}
+
+func TestLoadAcceptsConcurrencyLimits(t *testing.T) {
+	content := strings.Replace(validYAML, "api_key_env: PRIMARY_KEY", `api_key_env: PRIMARY_KEY
+    max_concurrency: 10
+    max_queue: 20
+    max_queue_per_team: 5
+    max_in_flight_per_team: 4`, 1)
+	cfg, err := Load(writeConfig(t, content))
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := cfg.Providers[0]
+	if p.MaxConcurrency != 10 || p.MaxQueue != 20 || p.MaxQueuePerTeam != 5 || p.MaxInFlightPerTeam != 4 {
+		t.Fatalf("provider = %+v", p)
+	}
+	if p.QueueTimeout != DefaultQueueTimeout {
+		t.Fatalf("queue timeout = %v", p.QueueTimeout)
 	}
 }
 

@@ -19,6 +19,7 @@ import (
 	"github.com/Bispulm/llmgate/internal/api"
 	"github.com/Bispulm/llmgate/internal/auth"
 	"github.com/Bispulm/llmgate/internal/config"
+	"github.com/Bispulm/llmgate/internal/limits"
 	"github.com/Bispulm/llmgate/internal/provider"
 	"github.com/Bispulm/llmgate/internal/provider/anthropic"
 	"github.com/Bispulm/llmgate/internal/provider/openai"
@@ -158,12 +159,23 @@ func serve(ctx context.Context, args []string, getenv func(string) string, stder
 // buildRoutes creates each configured provider and the alias table that uses them.
 func buildRoutes(cfg *config.Config, secrets *config.Secrets) (*routing.Table, error) {
 	providers := make(map[string]provider.Provider, len(cfg.Providers))
+	limiters := make(map[string]*limits.FairLimiter, len(cfg.Providers))
 	for _, p := range cfg.Providers {
 		adapter, err := newProvider(p, secrets.ProviderKeys[p.Name], cfg.Limits)
 		if err != nil {
 			return nil, fmt.Errorf("provider %q: %w", p.Name, err)
 		}
 		providers[p.Name] = adapter
+		if p.MaxConcurrency > 0 {
+			// Upstream capacity belongs to the account, so routes share one limiter.
+			limiters[p.Name] = limits.NewFairLimiter(limits.Config{
+				MaxConcurrency:    p.MaxConcurrency,
+				MaxQueue:          p.MaxQueue,
+				MaxQueuePerKey:    p.MaxQueuePerTeam,
+				MaxInFlightPerKey: p.MaxInFlightPerTeam,
+				QueueTimeout:      p.QueueTimeout,
+			})
+		}
 	}
 
 	aliases := make([]routing.Alias, len(cfg.Models))
@@ -176,6 +188,7 @@ func buildRoutes(cfg *config.Config, secrets *config.Secrets) (*routing.Table, e
 				Model:        r.Model,
 				Tier:         r.Tier,
 				Weight:       r.Weight,
+				Limiter:      limiters[r.Provider],
 			}
 		}
 		aliases[i] = routing.Alias{

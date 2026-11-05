@@ -14,6 +14,7 @@ import (
 	"github.com/Bispulm/llmgate/internal/accounting"
 	"github.com/Bispulm/llmgate/internal/auth"
 	"github.com/Bispulm/llmgate/internal/chat"
+	"github.com/Bispulm/llmgate/internal/limits"
 	"github.com/Bispulm/llmgate/internal/mock"
 	"github.com/Bispulm/llmgate/internal/provider"
 	"github.com/Bispulm/llmgate/internal/provider/anthropic"
@@ -606,5 +607,278 @@ func TestUsageFromAFailedAttemptIsKeptOnThatAttempt(t *testing.T) {
 	last := s.chunks[len(s.chunks)-1]
 	if !strings.Contains(string(last.Usage), `"completion_tokens":2`) {
 		t.Fatalf("the client's usage should be the serving attempt's: %s", last.Usage)
+	}
+}
+
+// teamAuth gives each key its own team.
+type teamAuth struct{}
+
+func (teamAuth) Authenticate(_ context.Context, token string) (auth.Principal, error) {
+	if token == "" {
+		return auth.Principal{}, auth.ErrInvalidCredential
+	}
+	return auth.Principal{TeamID: token, KeyID: token}, nil
+}
+
+// limitedGateway runs routes on one mock, where the route's limiter is shared.
+func limitedGateway(t *testing.T, cfg limits.Config, models ...string) (*gateway, *limits.FairLimiter) {
+	t.Helper()
+	m := mock.New()
+	upstream := httptest.NewServer(m)
+	t.Cleanup(upstream.Close)
+	adapter, err := openai.New(openai.Options{BaseURL: upstream.URL + "/v1", APIKey: testProviderKey, MaxResponseBytes: 1 << 20, MaxEventBytes: 1 << 16})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(adapter.CloseIdleConnections)
+
+	limiter := limits.NewFairLimiter(cfg)
+	routes := make([]routing.Route, len(models))
+	for i, model := range models {
+		routes[i] = routing.Route{ProviderName: "openai", Provider: adapter, Model: model, Tier: i}
+		if i == 0 {
+			routes[i].Limiter = limiter // Only the first route is limited.
+		}
+	}
+	rec := &attemptRecorder{attempts: make(chan recordedAttempt, 256)}
+	ts := httptest.NewServer(New(Options{
+		Auth:     teamAuth{},
+		Recorder: rec,
+		Limits:   testLimits(),
+		Routes: routing.NewTable([]routing.Alias{{Name: "fast", MaxOutputTokens: 100, Routes: routes}},
+			routing.Options{Breaker: routing.BreakerConfig{MinRequests: 1000}}),
+	}))
+	t.Cleanup(ts.Close)
+	client := &http.Client{Transport: &http.Transport{MaxIdleConnsPerHost: 100}}
+	t.Cleanup(client.CloseIdleConnections)
+	return &gateway{url: ts.URL, mock: m, recorder: rec, client: client}, limiter
+}
+
+func (g *gateway) sendAs(ctx context.Context, team, body string) (*http.Response, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, g.url+"/v1/chat/completions", strings.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Authorization", "Bearer "+team)
+	return g.client.Do(req)
+}
+
+func waitForLimiter(t *testing.T, l *limits.FairLimiter, ok func(limits.Stats) bool) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for !ok(l.Stats()) {
+		if time.Now().After(deadline) {
+			t.Fatalf("limiter never reached the expected state: %+v", l.Stats())
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+}
+
+func TestConcurrencyLimit(t *testing.T) {
+	// hold starts a request that stays in flight until the test ends.
+	hold := func(t *testing.T, g *gateway, l *limits.FairLimiter, want int) {
+		t.Helper()
+		ctx, cancel := context.WithCancel(context.Background())
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			resp, err := g.sendAs(ctx, "holder", chatBody(false, ""))
+			if err == nil {
+				_ = resp.Body.Close()
+			}
+		}()
+		t.Cleanup(func() {
+			cancel()
+			<-done
+		})
+		waitForLimiter(t, l, func(s limits.Stats) bool { return s.InFlight == want })
+	}
+
+	t.Run("over capacity falls through to the next route", func(t *testing.T) {
+		g, l := limitedGateway(t, limits.Config{MaxConcurrency: 1}, "busy;latency=30s", "backup;tokens=1")
+		hold(t, g, l, 1)
+
+		resp, err := g.sendAs(context.Background(), "someone", chatBody(false, ""))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = resp.Body.Close() }()
+		if got := completionText(t, resp); !strings.HasPrefix(got, "[backup]") {
+			t.Fatalf("text = %q", got)
+		}
+		// A route that was never called isn't an attempt.
+		if got := resp.Header.Get("X-Llmgate-Attempts"); got != "1" {
+			t.Fatalf("attempts header = %q", got)
+		}
+		if got := g.mock.Stats()["busy"].Requests; got != 1 {
+			t.Fatalf("the saturated route saw %d requests", got)
+		}
+		if got := l.Stats().Shed; got != 1 {
+			t.Fatalf("shed = %d", got)
+		}
+	})
+	t.Run("with nowhere else to go it sheds with a retry hint", func(t *testing.T) {
+		g, l := limitedGateway(t, limits.Config{MaxConcurrency: 1}, "busy;latency=30s")
+		hold(t, g, l, 1)
+
+		start := time.Now()
+		resp, err := g.sendAs(context.Background(), "someone", chatBody(false, ""))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = resp.Body.Close() }()
+		expectError(t, resp, 503, "upstream_error", "capacity_exceeded")
+		if got := time.Since(start); got > time.Second {
+			t.Fatalf("shedding took %v", got)
+		}
+		if resp.Header.Get("Retry-After") == "" {
+			t.Fatal("no Retry-After")
+		}
+		if got := g.mock.Stats()["busy"].Requests; got != 1 {
+			t.Fatalf("the saturated route saw %d requests", got)
+		}
+	})
+	t.Run("a queue wait that outlasts its limit tries the next route", func(t *testing.T) {
+		g, l := limitedGateway(t, limits.Config{MaxConcurrency: 1, MaxQueue: 5, QueueTimeout: 50 * time.Millisecond}, "busy;latency=30s", "backup;tokens=1")
+		hold(t, g, l, 1)
+
+		resp, err := g.sendAs(context.Background(), "someone", chatBody(false, ""))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = resp.Body.Close() }()
+		if got := completionText(t, resp); !strings.HasPrefix(got, "[backup]") {
+			t.Fatalf("text = %q", got)
+		}
+	})
+	t.Run("a client that leaves the queue costs nothing", func(t *testing.T) {
+		g, l := limitedGateway(t, limits.Config{MaxConcurrency: 1, MaxQueue: 5}, "busy;latency=30s")
+		hold(t, g, l, 1)
+
+		ctx, cancel := context.WithCancel(context.Background())
+		errs := make(chan error, 1)
+		go func() {
+			resp, err := g.sendAs(ctx, "someone", chatBody(false, ""))
+			if err == nil {
+				_ = resp.Body.Close()
+			}
+			errs <- err
+		}()
+		waitForLimiter(t, l, func(s limits.Stats) bool { return s.Queued == 1 })
+		cancel()
+		if err := <-errs; err == nil {
+			t.Error("the canceled request reported success")
+		}
+		waitForLimiter(t, l, func(s limits.Stats) bool { return s.Queued == 0 })
+		if got := g.mock.Stats()["busy"].Requests; got != 1 {
+			t.Fatalf("the upstream saw %d requests", got)
+		}
+	})
+}
+
+// A slot must come back however an attempt ends, or capacity leaks away until the
+// gateway stops serving.
+func TestSlotsAreReturnedHoweverAnAttemptEnds(t *testing.T) {
+	for name, model := range map[string]string{
+		"success":             "a;tokens=1",
+		"status failure":      "a;fail=status;status=500",
+		"dropped connection":  "a;fail=drop_before_headers",
+		"failure before text": "a;fail=disconnect;after=0",
+		"failure after text":  "a;fail=disconnect;after=1;tokens=3",
+		"missing terminator":  "a;terminator=none;tokens=1",
+		"bad request":         "a;fail=status;status=400",
+	} {
+		t.Run(name, func(t *testing.T) {
+			g, l := limitedGateway(t, limits.Config{MaxConcurrency: 1}, model)
+			for range 3 {
+				for _, stream := range []bool{false, true} {
+					if !stream && strings.Contains(name, "text") {
+						continue
+					}
+					resp, err := g.sendAs(context.Background(), "someone", chatBody(stream, ""))
+					if err != nil {
+						if !stream {
+							continue
+						}
+						t.Fatal(err)
+					}
+					_, _ = io.Copy(io.Discard, resp.Body)
+					_ = resp.Body.Close()
+					if resp.StatusCode == 503 && strings.Contains(resp.Header.Get("Retry-After"), "1") {
+						t.Fatal("a slot leaked: the gateway is shedding with nothing in flight")
+					}
+					waitForLimiter(t, l, func(s limits.Stats) bool { return s.InFlight == 0 })
+				}
+			}
+		})
+	}
+	t.Run("a client canceling a stream", func(t *testing.T) {
+		g, l := limitedGateway(t, limits.Config{MaxConcurrency: 1}, "a;tokens=1000;interval=10ms")
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		resp, err := g.sendAs(ctx, "someone", chatBody(true, ""))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = resp.Body.Close() }()
+		cancel()
+		waitForLimiter(t, l, func(s limits.Stats) bool { return s.InFlight == 0 })
+	})
+}
+
+// This is the fairness proof: a low-volume team keeps making progress while another
+// team saturates the provider.
+func TestSaturatedTeamDoesNotStarveAQuietTeam(t *testing.T) {
+	const (
+		capacity     = 2
+		greedyCount  = 40
+		quietCount   = 6
+		upstreamTime = 60 * time.Millisecond
+	)
+	g, l := limitedGateway(t, limits.Config{MaxConcurrency: capacity, MaxQueue: 100, MaxQueuePerKey: 50}, "shared;tokens=1;latency=60ms")
+
+	greedyDone := make(chan time.Time, greedyCount)
+	for range greedyCount {
+		go func() {
+			resp, err := g.sendAs(context.Background(), "greedy", chatBody(false, ""))
+			if err == nil {
+				_, _ = io.Copy(io.Discard, resp.Body)
+				_ = resp.Body.Close()
+			}
+			greedyDone <- time.Now()
+		}()
+	}
+	waitForLimiter(t, l, func(s limits.Stats) bool { return s.Queued >= greedyCount-capacity-2 })
+
+	// Served alone behind the whole backlog, each of these would wait over a second.
+	backlog := time.Duration(greedyCount/capacity) * upstreamTime
+	limit := backlog / 3
+	for i := range quietCount {
+		start := time.Now()
+		resp, err := g.sendAs(context.Background(), "quiet", chatBody(false, ""))
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, _ = io.Copy(io.Discard, resp.Body)
+		_ = resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("quiet request %d: status %d", i, resp.StatusCode)
+		}
+		if got := time.Since(start); got > limit {
+			t.Fatalf("quiet request %d waited %v behind a backlog of about %v", i, got, backlog)
+		}
+	}
+	if got := l.Stats().Queued; got == 0 {
+		t.Fatalf("the backlog had already drained, so this proved nothing")
+	}
+
+	finished := 0
+	for finished < greedyCount {
+		select {
+		case <-greedyDone:
+			finished++
+		case <-time.After(30 * time.Second):
+			t.Fatalf("only %d of %d greedy requests finished", finished, greedyCount)
+		}
 	}
 }
