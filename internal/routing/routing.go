@@ -4,6 +4,9 @@
 package routing
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
+	"fmt"
 	"math/rand/v2"
 	"slices"
 	"sort"
@@ -25,7 +28,10 @@ const MaxHold = 60 * time.Second
 type Route struct {
 	ProviderName string
 	Provider     provider.Provider
-	Model        string
+	// Scope says which upstream this is, such as its type and base URL, so that a change
+	// of account or endpoint changes the alias's revision.
+	Scope string
+	Model string
 	// Tier orders fallback. Lower tiers are tried first.
 	Tier int
 	// Weight shares traffic within a tier. Zero means 1.
@@ -42,9 +48,25 @@ type Alias struct {
 	Routes          []Route
 	// MaxAttempts bounds attempts for one request. Zero means one per route.
 	MaxAttempts int
+	// CacheTTL lets clients opt in to cached responses for this alias. Zero disables it.
+	CacheTTL time.Duration
 
 	table       *Table
 	routeStates []*routeState
+	revision    string
+}
+
+// Revision identifies the alias's configuration. It's the same on every replica with the
+// same configuration, and changes with anything about its routes.
+func (a *Alias) Revision() string { return a.revision }
+
+func (a *Alias) computeRevision() string {
+	h := sha256.New()
+	_, _ = fmt.Fprintf(h, "%q %d %d %d\n", a.Name, a.MaxOutputTokens, a.MaxAttempts, len(a.Routes))
+	for _, r := range a.Routes {
+		_, _ = fmt.Fprintf(h, "%q %q %q %d %d\n", r.ProviderName, r.Scope, r.Model, r.Tier, r.Weight)
+	}
+	return hex.EncodeToString(h.Sum(nil))[:16]
 }
 
 // Attempts returns how many upstream attempts one request may make.
@@ -107,6 +129,7 @@ func NewTable(aliases []Alias, opts Options) *Table {
 			// The state is shared, but tier and weight belong to this alias.
 			alias.routeStates[j] = state
 		}
+		alias.revision = alias.computeRevision()
 		t.aliases[alias.Name] = alias
 	}
 	return t
