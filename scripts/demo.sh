@@ -1,119 +1,105 @@
 #!/usr/bin/env bash
-# Runs the local demonstration against the mock provider. It makes no external
-# network calls and needs no credentials.
+# The tenant mode demonstration: two teams with their own keys and budgets, streaming,
+# failover before commit, one team running out of budget while the other carries on, and
+# the accounting for all of it. Every provider is the local mock, so nothing costs money
+# and no credentials are needed.
 #
-# Ports default to 18300 (gateway) and 18301 (mock). Override them with
-# LLMGATE_DEMO_GATEWAY_PORT and LLMGATE_DEMO_MOCK_PORT if those are in use.
+# Needs Go, Docker, curl, and lsof. Postgres and Redis come from compose.yaml. Each run
+# uses a fresh database called llmgate_demo, so it can be repeated.
 set -euo pipefail
-
 cd "$(dirname "$0")/.."
 
-GATEWAY_PORT="${LLMGATE_DEMO_GATEWAY_PORT:-18300}"
-MOCK_PORT="${LLMGATE_DEMO_MOCK_PORT:-18301}"
-GATEWAY="http://127.0.0.1:${GATEWAY_PORT}"
-MOCK="http://127.0.0.1:${MOCK_PORT}"
-
-for port in "$GATEWAY_PORT" "$MOCK_PORT"; do
+for port in 18300 18301 18302 18303; do
   if lsof -nP -iTCP:"$port" -sTCP:LISTEN >/dev/null 2>&1; then
-    echo "port $port is in use. Set LLMGATE_DEMO_GATEWAY_PORT or LLMGATE_DEMO_MOCK_PORT." >&2
+    echo "port $port is in use, and the demo needs 18300 to 18303" >&2
     exit 1
   fi
 done
 
-WORK="$(mktemp -d)"
+WORK=$(mktemp -d)
 PIDS=()
 cleanup() {
-  for pid in "${PIDS[@]:-}"; do
-    [ -n "$pid" ] && kill "$pid" 2>/dev/null || true
-  done
+  for pid in "${PIDS[@]:-}"; do kill "$pid" 2>/dev/null || true; done
   wait 2>/dev/null || true
   rm -rf "$WORK"
 }
 trap cleanup EXIT
 
-section() { printf '\n== %s\n' "$1"; }
+section() { printf '\n\033[1m== %s\033[0m\n' "$1"; }
+wait_for() { for _ in $(seq 1 150); do curl -s -o /dev/null "$1" && return; sleep 0.1; done; echo "timed out waiting for $1" >&2; exit 1; }
 
-wait_for() {
-  for _ in $(seq 1 100); do
-    if curl -fsS -o /dev/null "$1" 2>/dev/null; then
-      return 0
-    fi
-    sleep 0.1
-  done
-  echo "timed out waiting for $1" >&2
-  exit 1
-}
+export LLMGATE_DATABASE_URL="postgres://llmgate:llmgate_dev@127.0.0.1:${LLMGATE_POSTGRES_PORT:-15433}/llmgate_demo?sslmode=disable"
+export LLMGATE_REDIS_URL="redis://127.0.0.1:${LLMGATE_REDIS_PORT:-16383}/3"
+export LLMGATE_ADMIN_TOKEN=demo-local-admin-token
+export LLMGATE_MOCK_PROVIDER_KEY=mock
+export LLMGATE_ADMIN_URL=http://127.0.0.1:18302
 
-section "Building"
+section "Starting Postgres and Redis"
+docker compose up -d --wait postgres redis >/dev/null
+docker compose exec -T postgres psql -U llmgate -d llmgate -qc "DROP DATABASE IF EXISTS llmgate_demo WITH (FORCE)" -c "CREATE DATABASE llmgate_demo" >/dev/null
+
+section "Building and starting the mock and the gateway"
 go build -o "$WORK/llmgate" ./cmd/llmgate
 go build -o "$WORK/llmgate-mock" ./cmd/llmgate-mock
+{ cat configs/tenant.yaml; printf 'metrics:\n  listen: 127.0.0.1:18303\n'; } >"$WORK/config.yaml"
+"$WORK/llmgate-mock" -listen 127.0.0.1:18301 2>"$WORK/mock.log" & PIDS+=($!)
+"$WORK/llmgate" migrate --config "$WORK/config.yaml"
+"$WORK/llmgate" serve --config "$WORK/config.yaml" 2>"$WORK/gateway.log" & PIDS+=($!)
+wait_for http://127.0.0.1:18300/healthz
+llmgate() { "$WORK/llmgate" "$@"; }
 
-sed -e "s/127.0.0.1:18300/127.0.0.1:${GATEWAY_PORT}/" \
-    -e "s/127.0.0.1:18301/127.0.0.1:${MOCK_PORT}/" configs/demo.yaml > "$WORK/config.yaml"
+section "Two teams, each with a monthly budget and its own key"
+llmgate teams create acme --budget-usd 1.00
+llmgate teams create startup --budget-usd 0.005
+ACME=$(llmgate keys create acme --name demo | head -1)
+STARTUP=$(llmgate keys create startup --name demo | head -1)
+echo "acme's key:    ${ACME:0:24}..."
+echo "startup's key: ${STARTUP:0:24}..."
 
-"$WORK/llmgate-mock" -listen "127.0.0.1:${MOCK_PORT}" 2>"$WORK/mock.log" &
-PIDS+=($!)
-LLMGATE_DEV_KEY=demo-dev-key LLMGATE_MOCK_PROVIDER_KEY=demo-provider-key \
-  "$WORK/llmgate" serve --config "$WORK/config.yaml" 2>"$WORK/gateway.log" &
-PIDS+=($!)
-
-wait_for "$MOCK/__mock/stats"
-wait_for "$GATEWAY/healthz"
-
-KEY=demo-dev-key
-ask() { # alias, extra JSON fields
-  curl -sS -N -D "$WORK/headers" "$GATEWAY/v1/chat/completions" -H "Authorization: Bearer $KEY" \
-    -d "{\"model\":\"$1\",\"messages\":[{\"role\":\"user\",\"content\":\"hello\"}]$2}"
-  echo
+ask() { # key, model, stream
+  curl -sS -N -D "$WORK/headers" http://127.0.0.1:18300/v1/chat/completions -H "Authorization: Bearer $1" \
+    -d "{\"model\":\"$2\",\"stream\":$3,\"messages\":[{\"role\":\"user\",\"content\":\"hello\"}]}"
 }
-status() { sed -n 1p "$WORK/headers" | tr -d '\r'; }
+header() { grep -i "^$1:" "$WORK/headers" | cut -d' ' -f2- | tr -d '\r'; }
+status() { sed -n 1p "$WORK/headers" | awk '{print $2}'; }
 
-section "Non-streaming request through the gateway"
-ask demo-fast ''
-status
-grep -iE '^x-llmgate-' "$WORK/headers" | tr -d '\r'
+section "acme streams a response"
+ask "$ACME" demo-fast true | grep -o '"content":"[^"]*"' | tr '\n' ' '
+echo
+echo "status $(status), budget enforcement: $(header X-Llmgate-Budget-Enforcement)"
 
-section "Streaming request, with usage"
-ask demo-fast ',"stream":true,"stream_options":{"include_usage":true}'
+section "acme asks for a route that fails before any content, and the gateway fails over"
+ask "$ACME" demo-failover false >/dev/null
+echo "status $(status), served by $(header X-Llmgate-Route) after $(header X-Llmgate-Attempts) attempts"
 
-section "An unsupported field is rejected by name, and never reaches the provider"
-ask demo-fast ',"tools":[]'
-status
+section "startup keeps asking until its budget can't cover another request"
+for i in $(seq 1 20); do
+  body=$(ask "$STARTUP" demo-fast false)
+  code=$(status)
+  if [ "$code" != 200 ]; then
+    echo "request $i: $code $(echo "$body" | grep -o '"code":"[^"]*"')"
+    break
+  fi
+  echo "request $i: $code"
+done
 
-section "The first route fails before any content: the request falls back"
-ask demo-failover ',"stream":true'
-status
-grep -iE '^x-llmgate-(route|attempts)' "$WORK/headers" | tr -d '\r'
+section "acme carries on, unaffected"
+ask "$ACME" demo-fast false >/dev/null
+echo "status $(status)"
 
-section "Every route fails before any content: an ordinary HTTP error"
-ask demo-fails-before-content ',"stream":true'
-status
+sleep 1 # Settlement finishes as each handler returns, a moment after the client has its answer.
 
-section "The provider fails after content: one error event, and no [DONE]"
-ask demo-fails-midstream ',"stream":true'
-status
+section "What acme spent, attempt by attempt"
+llmgate usage acme --attempts 5
 
-section "The provider is rate limiting: the status and retry hint are passed on"
-ask demo-rate-limited ''
-status
-grep -i '^retry-after' "$WORK/headers" | tr -d '\r'
+section "What startup spent"
+llmgate usage startup
+echo
+echo "startup still has some budget left, but less than the most one more request could"
+echo "cost, which is what each attempt has to reserve before anything is sent."
 
-section "A client that disconnects cancels the upstream request"
-curl -sS -N --max-time 0.5 -o /dev/null "$GATEWAY/v1/chat/completions" -H "Authorization: Bearer $KEY" \
-  -d '{"model":"demo-slow","stream":true,"messages":[{"role":"user","content":"hello"}]}' 2>/dev/null || true
-sleep 0.3
-printf 'mock counters for the canceled stream: '
-curl -sS "$MOCK/__mock/stats" | python3 -I -c 'import json,sys; print(json.load(sys.stdin)["slow"])'
-
-section "What the gateway recorded for each attempt"
-python3 -I - "$WORK/gateway.log" <<'PY'
-import json, sys
-for line in open(sys.argv[1]):
-    r = json.loads(line)
-    if r.get("msg") != "upstream attempt":
-        continue
-    print("{alias:28} {outcome:16} committed={committed!s:5} usage={usage_state:8} completion_tokens={tokens} text_events={text_events}".format(
-        tokens=r.get("completion_tokens", "-"), **r))
-PY
+section "The same, as the gateway's metrics see it"
+curl -s http://127.0.0.1:18303/metrics | grep -E '^llmgate_(requests_total|budget_refusals_total|fallbacks_total)' | sed 's/^/  /'
 
 section "Done"
+echo "Every request went to the local mock. Nothing was sent to a real provider."
