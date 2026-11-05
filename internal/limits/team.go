@@ -115,8 +115,12 @@ local state = redis.call('HMGET', KEYS[1], 'level', 'at')
 local value, at = tonumber(state[1]), tonumber(state[2])
 local current = limit
 if value ~= nil then current = math.min(limit, value + (now - at) * limit / 60000) end
-redis.call('HSET', KEYS[1], 'level', tostring(current - spent), 'at', now)
-redis.call('PEXPIRE', KEYS[1], ARGV[3])
+local level = current - spent
+redis.call('HSET', KEYS[1], 'level', tostring(level), 'at', now)
+-- Debt has to outlast its repayment, or expiring would forgive it.
+local ttl = tonumber(ARGV[3])
+if level < 0 then ttl = math.max(ttl, math.ceil(-level * 60000 / limit) + ttl) end
+redis.call('PEXPIRE', KEYS[1], ttl)
 return 1
 `)
 
