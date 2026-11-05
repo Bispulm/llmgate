@@ -96,29 +96,24 @@ func New(opts Options) *Server {
 // The timeout limits how long one write can block, not how long a provider can
 // take, so anything writing after a wait must call extendWriteDeadline first.
 //
-// The read deadline bounds the request body, including when no handler reads it,
-// because net/http reads an unread body itself when a handler finishes. The chat
-// endpoint clears it once it has the whole body.
+// The read deadline bounds the request body, including when no handler reads it:
+// net/http drains an unread body before writing a response, and would otherwise
+// wait on a stalled client indefinitely. If that drain fails, net/http closes the
+// connection, so the unread bytes can't be parsed as another request.
+//
+// net/http clears the deadline itself once the body is consumed, when it starts
+// watching for the client disconnecting. For a request with no body that watch has
+// already started, and a deadline would cancel the request when it expired.
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	s.inflight.Add(1)
 	defer s.inflight.Add(-1)
 
 	rc := http.NewResponseController(w)
 	s.extendWriteDeadline(rc)
-	if s.limits.BodyReadTimeout > 0 {
+	if s.limits.BodyReadTimeout > 0 && r.ContentLength != 0 {
 		_ = rc.SetReadDeadline(time.Now().Add(s.limits.BodyReadTimeout))
 	}
 	s.mux.ServeHTTP(w, r)
-}
-
-// abandonBody prepares to reply without reading the request body. Without this,
-// net/http would wait for the body before sending the response, so a client that
-// never sends it would never get an answer. The connection can't carry another
-// request, because the unread bytes would be parsed as one.
-func abandonBody(w http.ResponseWriter, r *http.Request) {
-	if r.ContentLength != 0 {
-		w.Header().Set("Connection", "close")
-	}
 }
 
 func (s *Server) extendWriteDeadline(rc *http.ResponseController) {
@@ -148,13 +143,11 @@ func (s *Server) WaitForRequests(ctx context.Context) error {
 // requests while in-flight ones finish.
 func (s *Server) SetDraining() { s.draining.Store(true) }
 
-func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
-	abandonBody(w, r)
+func (s *Server) handleHealth(w http.ResponseWriter, _ *http.Request) {
 	writeStatus(w, http.StatusOK, "ok")
 }
 
-func (s *Server) handleReady(w http.ResponseWriter, r *http.Request) {
-	abandonBody(w, r)
+func (s *Server) handleReady(w http.ResponseWriter, _ *http.Request) {
 	if s.draining.Load() {
 		writeStatus(w, http.StatusServiceUnavailable, "draining")
 		return
@@ -162,8 +155,7 @@ func (s *Server) handleReady(w http.ResponseWriter, r *http.Request) {
 	writeStatus(w, http.StatusOK, "ready")
 }
 
-func (s *Server) handleNotFound(w http.ResponseWriter, r *http.Request) {
-	abandonBody(w, r)
+func (s *Server) handleNotFound(w http.ResponseWriter, _ *http.Request) {
 	w.Header().Set("X-Request-Id", rand.Text())
 	writeError(w, &apiError{
 		Status:  http.StatusNotFound,
