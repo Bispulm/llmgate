@@ -384,3 +384,35 @@ func TestConcurrentAuthenticationIsSafe(t *testing.T) {
 	}
 	wg.Wait()
 }
+
+// Anyone can send well-formed keys that don't exist. Remembering those mustn't push out
+// real keys, or a flood of made-up ones would send every request to the database.
+func TestMadeUpKeysDontEvictRealOnes(t *testing.T) {
+	pool := testenv.Postgres(t, 4)
+	ctx := context.Background()
+	if _, err := pool.Exec(ctx, `INSERT INTO teams (id, name, budget_limit_micros) VALUES ('team-a', 'a', 1000)`); err != nil {
+		t.Fatal(err)
+	}
+	store := auth.NewKeyStore(auth.KeyStoreOptions{Pool: pool, CacheTTL: time.Hour, MaxCacheEntries: 4})
+	key, err := store.Create(ctx, "team-a", "k")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Authenticate(ctx, key.Raw); err != nil {
+		t.Fatal(err)
+	}
+	for range 50 {
+		fake, err := auth.GenerateKey()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := store.Authenticate(ctx, fake.Raw); !errors.Is(err, auth.ErrInvalidCredential) {
+			t.Fatalf("err = %v", err)
+		}
+	}
+	// With the database gone, only a cached key still works.
+	pool.Close()
+	if _, err := store.Authenticate(ctx, key.Raw); err != nil {
+		t.Fatalf("a real key was pushed out of the cache: %v", err)
+	}
+}
