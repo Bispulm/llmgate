@@ -47,6 +47,7 @@ const (
 	DefaultReconcileInterval        = 15 * time.Second
 	DefaultUncertainGrace           = 10 * time.Minute
 	DefaultDatabaseMaxConns         = 20
+	DefaultRedisKeyPrefix           = "llmgate:"
 
 	// MaxKeyCacheTTL bounds how long a revoked key can keep working on another replica.
 	MaxKeyCacheTTL = 5 * time.Minute
@@ -124,6 +125,8 @@ type Database struct {
 // Redis holds team rate limits.
 type Redis struct {
 	URLEnv string `yaml:"url_env"`
+	// KeyPrefix namespaces the gateway's keys, so that environments can share a Redis.
+	KeyPrefix string `yaml:"key_prefix"`
 }
 
 // RateLimits configures team limits.
@@ -328,6 +331,7 @@ func (c *Config) applyDefaults() {
 	if c.Tenant() {
 		setDefault(&c.Auth.KeyCacheTTL, DefaultKeyCacheTTL)
 		setDefault(&c.Database.MaxConns, DefaultDatabaseMaxConns)
+		setDefault(&c.Redis.KeyPrefix, DefaultRedisKeyPrefix)
 		setDefault(&c.RateLimits.OnRedisFailure, RedisFailureClosed)
 		setDefault(&c.Accounting.ReconcileInterval, DefaultReconcileInterval)
 		setDefault(&c.Accounting.UncertainGrace, DefaultUncertainGrace)
@@ -478,12 +482,10 @@ func (c *Config) validateAdminListen() error {
 	if !isLoopback(host) && !c.Admin.AllowNonLoopback {
 		return fmt.Errorf("admin.listen %q is not loopback, which needs admin.allow_non_loopback: true", c.Admin.Listen)
 	}
-	if c.Admin.Listen == c.Server.Listen {
-		return errors.New("admin.listen and server.listen can't be the same address")
-	}
+	// Port 0 asks for any free port, so two of them never collide.
 	_, adminPort, _ := net.SplitHostPort(c.Admin.Listen)
 	serverHost, serverPort, _ := net.SplitHostPort(c.Server.Listen)
-	if adminPort == serverPort && (isUnspecified(host) || isUnspecified(serverHost)) {
+	if adminPort != "0" && adminPort == serverPort && (host == serverHost || isUnspecified(host) || isUnspecified(serverHost)) {
 		return errors.New("admin.listen and server.listen can't be the same address")
 	}
 	return nil
