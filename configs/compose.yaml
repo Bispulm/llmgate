@@ -1,0 +1,79 @@
+# Tenant mode inside the Compose stack, against the mock provider, so nothing in this
+# file can spend money. Listeners bind to every interface inside the container, and
+# compose.yaml only publishes them on the host's loopback. Credentials come from the
+# environment that compose.yaml sets.
+server:
+  listen: 0.0.0.0:18300
+
+auth:
+  mode: tenant
+  key_cache_ttl: 30s
+
+database:
+  url_env: LLMGATE_DATABASE_URL
+
+redis:
+  url_env: LLMGATE_REDIS_URL
+
+admin:
+  listen: 0.0.0.0:18302
+  token_env: LLMGATE_ADMIN_TOKEN
+  allow_non_loopback: true
+
+metrics:
+  listen: 0.0.0.0:18303
+  allow_non_loopback: true
+
+pricing:
+  version: demo-2026-11-05
+  prices:
+    - provider: mock
+      model: alpha;tokens=5;interval=100ms
+      input_usd_per_mtok: "3.00"
+      cached_input_usd_per_mtok: "0.30"
+      cache_write_usd_per_mtok: "3.75"
+      output_usd_per_mtok: "15.00"
+    - provider: mock
+      model: primary;fail=status;status=500
+      input_usd_per_mtok: "3.00"
+      cached_input_usd_per_mtok: "0.30"
+      cache_write_usd_per_mtok: "3.75"
+      output_usd_per_mtok: "15.00"
+    - provider: mock
+      model: backup;tokens=4
+      input_usd_per_mtok: "1.00"
+      cached_input_usd_per_mtok: "0.10"
+      cache_write_usd_per_mtok: "1.25"
+      output_usd_per_mtok: "5.00"
+
+limits:
+  request_timeout: 30s
+  first_event_timeout: 5s
+  stream_idle_timeout: 5s
+
+providers:
+  - name: mock
+    type: openai-compatible
+    base_url: http://mock:18301/v1
+    api_key_env: LLMGATE_MOCK_PROVIDER_KEY
+    # The mock is on the stack's private network, and has no real credential.
+    allow_insecure_http: true
+
+models:
+  - alias: demo-fast
+    max_output_tokens: 256
+    cache:
+      ttl: 10m
+    routes:
+      - provider: mock
+        model: alpha;tokens=5;interval=100ms
+
+  - alias: demo-failover
+    max_output_tokens: 256
+    routes:
+      - provider: mock
+        model: primary;fail=status;status=500
+        tier: 0
+      - provider: mock
+        model: backup;tokens=4
+        tier: 1

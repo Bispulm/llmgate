@@ -245,3 +245,9 @@ func TestCacheSettings(t *testing.T) {
 		})
 	}
 }
+
+func TestTheComposeConfigLoads(t *testing.T) {
+	if _, err := Load("../../configs/compose.yaml"); err != nil {
+		t.Fatal(err)
+	}
+}
