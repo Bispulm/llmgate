@@ -432,3 +432,66 @@ func TestServeRefusesToStartWithoutCredentials(t *testing.T) {
 		t.Fatalf("error = %v", err)
 	}
 }
+
+func TestServeExportsMetricsOnTheirOwnListener(t *testing.T) {
+	upstream := httptest.NewServer(mock.New())
+	defer upstream.Close()
+	config := strings.Replace(testConfig, "http://127.0.0.1:18301/v1", upstream.URL+"/v1", 1) + "metrics:\n  listen: 127.0.0.1:0\n"
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(path, []byte(config), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	started := make(chan listening, 1)
+	done := make(chan error, 1)
+	go func() {
+		done <- run(ctx, []string{"serve", "--config", path}, process{getenv: testEnv, stdout: io.Discard, stderr: io.Discard, started: func(l listening) { started <- l }})
+	}()
+	var addrs listening
+	select {
+	case addrs = <-started:
+	case err := <-done:
+		t.Fatalf("serve returned early: %v", err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("serve didn't start")
+	}
+	defer func() {
+		cancel()
+		if err := <-done; err != nil {
+			t.Error(err)
+		}
+	}()
+	if addrs.Metrics == "" || addrs.Metrics == addrs.Gateway {
+		t.Fatalf("addresses = %+v", addrs)
+	}
+
+	req, err := http.NewRequest(http.MethodPost, "http://"+addrs.Gateway+"/v1/chat/completions", strings.NewReader(`{"model":"fast","messages":[{"role":"user","content":"hello"}]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Authorization", "Bearer dev")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+
+	get := func(url string) (int, string) {
+		resp, err := http.Get(url)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = resp.Body.Close() }()
+		body, _ := io.ReadAll(resp.Body)
+		return resp.StatusCode, string(body)
+	}
+	status, body := get("http://" + addrs.Metrics + "/metrics")
+	for _, want := range []string{`llmgate_requests_total{alias="fast",status="200",stream="false"} 1`, `llmgate_breaker_state{model="alpha",provider="primary",state="closed"} 1`, "go_goroutines"} {
+		if status != http.StatusOK || !strings.Contains(body, want) {
+			t.Fatalf("status %d, missing %s", status, want)
+		}
+	}
+	if status, _ := get("http://" + addrs.Gateway + "/metrics"); status != http.StatusNotFound {
+		t.Fatalf("the gateway's listener serves metrics: %d", status)
+	}
+}

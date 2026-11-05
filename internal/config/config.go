@@ -92,6 +92,7 @@ type Config struct {
 	Pricing        Pricing        `yaml:"pricing"`
 	Accounting     Accounting     `yaml:"accounting"`
 	Cache          Cache          `yaml:"cache"`
+	Metrics        Metrics        `yaml:"metrics"`
 	Limits         Limits         `yaml:"limits"`
 	CircuitBreaker CircuitBreaker `yaml:"circuit_breaker"`
 	Providers      []Provider     `yaml:"providers"`
@@ -179,6 +180,13 @@ func (d *Decimal) UnmarshalYAML(node *yaml.Node) error {
 	d.Value = node.Value
 	d.quoted = node.Kind == yaml.ScalarNode && node.Tag == "!!str"
 	return nil
+}
+
+// Metrics configures the Prometheus listener, which is off unless listen is set. It has
+// no authentication, so it stays on loopback unless allow_non_loopback is set.
+type Metrics struct {
+	Listen           string `yaml:"listen"`
+	AllowNonLoopback bool   `yaml:"allow_non_loopback"`
 }
 
 // Cache configures the response cache. Aliases opt in with their own TTL.
@@ -416,6 +424,9 @@ func (c *Config) validate() error {
 	} else if c.Auth.DevKeyEnv == "" {
 		return errors.New("auth.dev_key_env is required")
 	}
+	if err := c.validateMetrics(); err != nil {
+		return err
+	}
 	if err := c.Limits.validate(); err != nil {
 		return err
 	}
@@ -534,6 +545,29 @@ func (c *Config) validateAdminListen() error {
 	serverHost, serverPort, _ := net.SplitHostPort(c.Server.Listen)
 	if adminPort != "0" && adminPort == serverPort && (host == serverHost || isUnspecified(host) || isUnspecified(serverHost)) {
 		return errors.New("admin.listen and server.listen can't be the same address")
+	}
+	return nil
+}
+
+func (c *Config) validateMetrics() error {
+	if c.Metrics.Listen == "" {
+		return nil
+	}
+	host, port, err := net.SplitHostPort(c.Metrics.Listen)
+	if err != nil {
+		return fmt.Errorf("metrics.listen: %w", err)
+	}
+	if !isLoopback(host) && !c.Metrics.AllowNonLoopback {
+		return fmt.Errorf("metrics.listen %q is not loopback, which needs metrics.allow_non_loopback: true", c.Metrics.Listen)
+	}
+	for _, other := range []string{c.Server.Listen, c.Admin.Listen} {
+		otherHost, otherPort, err := net.SplitHostPort(other)
+		if err != nil || port == "0" {
+			continue
+		}
+		if port == otherPort && (host == otherHost || isUnspecified(host) || isUnspecified(otherHost)) {
+			return fmt.Errorf("metrics.listen can't share an address with another listener")
+		}
 	}
 	return nil
 }

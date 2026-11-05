@@ -93,6 +93,12 @@ type exchange struct {
 func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
 	id := rand.Text()
+	// Only a configured alias's name becomes a label, never what the client asked for.
+	recorder := &statusRecorder{ResponseWriter: w}
+	w = recorder
+	var aliasLabel string
+	var stream bool
+	defer func() { s.metrics.RequestFinished(aliasLabel, stream, recorder.status, time.Since(start)) }()
 	header := w.Header()
 	header.Set("X-Request-Id", id)
 	if s.ledger != nil {
@@ -120,6 +126,7 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	if err != nil && !errors.Is(err, auth.ErrInvalidCredential) {
 		// Still a refusal, but the key may be perfectly good.
 		s.logger.LogAttrs(r.Context(), slog.LevelWarn, "a key could not be checked", attrRequestID(id), slog.Any("error", err))
+		s.metrics.DependencyError("postgres", "authenticate")
 		writeError(w, authUnavailable())
 		return
 	}
@@ -155,6 +162,7 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		writeError(w, validationError(err))
 		return
 	}
+	stream = req.Stream
 
 	alias, ok := s.routes.Resolve(req.Model)
 	if !ok {
@@ -167,6 +175,7 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		})
 		return
 	}
+	aliasLabel = alias.Name
 	limited, apiErr := applyOutputLimit(req, alias)
 	if apiErr != nil {
 		writeError(w, apiErr)
@@ -211,19 +220,23 @@ func (s *Server) serveFromCache(ctx context.Context, x *exchange, alias *routing
 	header := x.w.Header()
 	if s.cache == nil || alias.CacheTTL <= 0 || x.req.Stream {
 		header.Set(headerCache, cacheBypass)
+		s.metrics.CacheResult(alias.Name, cacheBypass)
 		return false
 	}
 	team := x.principal.TeamID
 	key := cache.Key(team, alias.Name, alias.Revision(), x.req)
 	if entry, ok := s.cache.Get(ctx, team, key); ok {
+		s.metrics.CacheResult(alias.Name, cacheHit)
 		s.writeCached(x, entry)
 		return true
 	}
 	entry, shared, finish := s.cache.Join(ctx, key)
 	if shared {
+		s.metrics.CacheResult(alias.Name, cacheHit)
 		s.writeCached(x, entry)
 		return true
 	}
+	s.metrics.CacheResult(alias.Name, cacheMiss)
 	header.Set(headerCache, cacheMiss)
 	// The request ending without a usable answer has to release anyone waiting.
 	context.AfterFunc(ctx, func() { finish(cache.Entry{}, false) })
@@ -309,6 +322,7 @@ func (s *Server) runAttempts(ctx context.Context, x *exchange, alias *routing.Al
 	var last *provider.Error
 	lastRoute := ""
 	reason := accounting.ReasonPrimary
+	defer func() { s.metrics.RouteSkipped(alias.Name, plan.Skipped()) }()
 
 	for x.attempts < alias.Attempts() {
 		selected, ok := plan.Next()
@@ -468,12 +482,14 @@ func (s *Server) refuseAttempt(ctx context.Context, x *exchange, err error, last
 	}
 	switch {
 	case errors.Is(err, accounting.ErrBudgetExhausted):
+		s.metrics.BudgetRefused()
 		writeError(x.w, budgetExhausted())
 	case ctx.Err() != nil:
 		// The request ran out of time, which isn't the ledger's fault.
 		writeError(x.w, upstreamError(&provider.Error{Kind: provider.KindTimeout, Delivery: provider.DeliveryNotSent, Err: err}))
 	default:
 		s.logger.LogAttrs(ctx, slog.LevelError, "the ledger could not admit an attempt", attrRequestID(x.id), slog.Any("error", err))
+		s.metrics.DependencyError("postgres", "admit")
 		writeError(x.w, accountingUnavailable())
 	}
 }
@@ -487,9 +503,11 @@ func (s *Server) admitTeam(ctx context.Context, principal auth.Principal, reques
 	decision, release, err := s.teamLimiter.Admit(ctx, principal.TeamID, limits.TeamLimits(principal.Limits), requestID, s.inFlightHold())
 	if err != nil {
 		s.logger.LogAttrs(ctx, slog.LevelWarn, "team limits could not be checked", attrRequestID(requestID), slog.Any("error", err))
+		s.metrics.DependencyError("redis", "admit")
 		return nil, rateLimitUnavailable()
 	}
 	if !decision.Allowed {
+		s.metrics.TeamLimited(decision.Reason)
 		return nil, teamLimited(decision)
 	}
 	return release, nil
@@ -519,6 +537,7 @@ func (s *Server) attempt(ctx context.Context, x *exchange, selected *routing.Sel
 	}
 	defer func() {
 		record.Duration = time.Since(start)
+		s.metrics.Attempt(record)
 		uncertain := s.settle(ctx, reservation, record)
 		s.debitTokens(ctx, x, record.Usage, uncertain)
 		s.record(ctx, record)
@@ -560,6 +579,9 @@ func (s *Server) settle(requestCtx context.Context, reservation *accounting.Rese
 				s.logger.LogAttrs(ctx, slog.LevelWarn, "an attempt cost more than was reserved",
 					slog.String("attempt_id", reservation.AttemptID), slog.Int64("charge_micros", settlement.ChargeMicros), slog.Int64("reserved_micros", reservation.ReservedMicros))
 			}
+			if !settlement.Uncertain && !settlement.AlreadySettled && settlement.Kind != "" {
+				s.metrics.Charged(record.Provider, record.Model, settlement.Kind, settlement.ChargeMicros)
+			}
 			return settlement.Uncertain
 		}
 		if try < settleTries-1 && !sleep(ctx, backoff) {
@@ -568,6 +590,8 @@ func (s *Server) settle(requestCtx context.Context, reservation *accounting.Rese
 	}
 	s.logger.LogAttrs(ctx, slog.LevelError, "an attempt could not be settled, and a reconciler will resolve it",
 		slog.String("attempt_id", reservation.AttemptID), slog.Any("error", err))
+	s.metrics.SettlementFailed()
+	s.metrics.DependencyError("postgres", "settle")
 	return true
 }
 
