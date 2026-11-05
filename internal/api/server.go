@@ -29,6 +29,8 @@ type Limits struct {
 	FirstEventTimeout time.Duration
 	// StreamIdleTimeout bounds the wait between content events after commit.
 	StreamIdleTimeout time.Duration
+	// CompletionTimeout bounds one non-streaming attempt, leaving time for a fallback.
+	CompletionTimeout time.Duration
 	// ClientWriteTimeout bounds each write to the client.
 	ClientWriteTimeout time.Duration
 	// BodyReadTimeout bounds reading the request body.
