@@ -66,11 +66,18 @@ func serve(ctx context.Context, configPath string, p process) error {
 	}
 
 	logger := slog.New(slog.NewJSONHandler(p.stderr, nil))
+	tracer, stopTracing, err := startTracing(ctx, cfg.Tracing)
+	if err != nil {
+		return err
+	}
+	// Deferred first, so it runs last, after every request has ended its spans.
+	defer stopTracing()
 	opts := api.Options{
 		Logger:   logger,
 		Routes:   routes,
 		Recorder: accounting.NewLogRecorder(logger),
 		Metrics:  gatewayMetrics,
+		Tracer:   tracer,
 		Limits: api.Limits{
 			MaxRequestBytes:    cfg.Limits.MaxRequestBytes,
 			RequestTimeout:     cfg.Limits.RequestTimeout,
@@ -85,7 +92,7 @@ func serve(ctx context.Context, configPath string, p process) error {
 
 	var tenant *tenantRuntime
 	if cfg.Tenant() {
-		tenant, err = startTenant(ctx, cfg, secrets, routes, logger)
+		tenant, err = startTenant(ctx, cfg, secrets, routes, logger, gatewayMetrics)
 		if err != nil {
 			return err
 		}

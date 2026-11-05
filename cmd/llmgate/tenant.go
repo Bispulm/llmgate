@@ -18,6 +18,7 @@ import (
 	"github.com/Bispulm/llmgate/internal/config"
 	"github.com/Bispulm/llmgate/internal/limits"
 	"github.com/Bispulm/llmgate/internal/metrics"
+	"github.com/Bispulm/llmgate/internal/redisclient"
 	"github.com/Bispulm/llmgate/internal/routing"
 	"github.com/Bispulm/llmgate/internal/store"
 )
@@ -39,20 +40,20 @@ type tenantRuntime struct {
 	admin      http.Handler
 }
 
-func startTenant(ctx context.Context, cfg *config.Config, secrets *config.Secrets, routes *routing.Table, logger *slog.Logger) (*tenantRuntime, error) {
+func startTenant(ctx context.Context, cfg *config.Config, secrets *config.Secrets, routes *routing.Table, logger *slog.Logger, m *metrics.Metrics) (*tenantRuntime, error) {
 	pool, err := store.Open(ctx, store.PoolConfig{URL: secrets.DatabaseURL, MaxConns: cfg.Database.MaxConns})
 	if err != nil {
 		return nil, err
 	}
 	t := &tenantRuntime{cfg: cfg, pool: pool}
-	if err := t.start(ctx, secrets, routes, logger); err != nil {
+	if err := t.start(ctx, secrets, routes, logger, m); err != nil {
 		t.close()
 		return nil, err
 	}
 	return t, nil
 }
 
-func (t *tenantRuntime) start(ctx context.Context, secrets *config.Secrets, routes *routing.Table, logger *slog.Logger) error {
+func (t *tenantRuntime) start(ctx context.Context, secrets *config.Secrets, routes *routing.Table, logger *slog.Logger, m *metrics.Metrics) error {
 	if err := store.CheckCurrent(ctx, t.pool); err != nil {
 		return err
 	}
@@ -74,7 +75,15 @@ func (t *tenantRuntime) start(ctx context.Context, secrets *config.Secrets, rout
 		}
 		cacheClient = t.cacheRedis
 	}
-	t.cache = cache.New(cache.Options{Client: cacheClient, Prefix: t.cfg.Redis.KeyPrefix, MaxEntryBytes: t.cfg.Cache.MaxEntryBytes})
+	t.cache = cache.New(cache.Options{
+		Client:        cacheClient,
+		Prefix:        t.cfg.Redis.KeyPrefix,
+		MaxEntryBytes: t.cfg.Cache.MaxEntryBytes,
+		OnFailure: func(err error) {
+			logger.Warn("the cache's Redis failed, so the cache is skipped for a moment", "error", err.Error())
+			m.DependencyError("redis", "cache")
+		},
+	})
 
 	rejected := accounting.RejectedChargeNone
 	if t.cfg.Accounting.RejectedAttemptCharge == config.RejectedChargeConservative {
@@ -120,14 +129,9 @@ func (t *tenantRuntime) runReconciler(ctx context.Context, logger *slog.Logger, 
 	})
 }
 
-func newRedis(url string) (*redis.Client, error) {
-	opts, err := redis.ParseURL(url)
-	if err != nil {
-		// The parse error can contain the URL, and so its password.
-		return nil, errors.New("parsing a Redis URL: the URL is malformed")
-	}
-	return redis.NewClient(opts), nil
-}
+// newRedis builds a client whose calls end at their context's deadline, even if Redis
+// accepts connections and never answers.
+func newRedis(url string) (*redis.Client, error) { return redisclient.New(url) }
 
 func (t *tenantRuntime) close() {
 	for _, c := range []*redis.Client{t.redis, t.cacheRedis} {

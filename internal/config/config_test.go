@@ -304,3 +304,42 @@ func TestMetricsListener(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestTracingSettings(t *testing.T) {
+	cfg, err := Load(writeConfig(t, validYAML+"tracing:\n  otlp_endpoint: http://127.0.0.1:4318\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Tracing.OTLPEndpoint != "http://127.0.0.1:4318" || cfg.Tracing.Ratio() != 1 {
+		t.Fatalf("tracing = %+v", cfg.Tracing)
+	}
+	if cfg, err := Load(writeConfig(t, validYAML)); err != nil || cfg.Tracing.OTLPEndpoint != "" {
+		t.Fatalf("tracing should be off unless asked for: %v", err)
+	}
+	for name, extra := range map[string]string{
+		"plaintext to a remote collector": "tracing:\n  otlp_endpoint: http://collector.example:4318\n",
+		"not a URL":                       "tracing:\n  otlp_endpoint: ':nope'\n",
+		"a ratio over 1":                  "tracing:\n  otlp_endpoint: https://collector.example\n  sample_ratio: 1.5\n",
+		"a ratio without an endpoint":     "tracing:\n  sample_ratio: 0.5\n",
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := Load(writeConfig(t, validYAML+extra)); err == nil || !strings.Contains(err.Error(), "tracing") {
+				t.Fatalf("err = %v", err)
+			}
+		})
+	}
+	if _, err := Load(writeConfig(t, validYAML+"tracing:\n  otlp_endpoint: https://collector.example\n  sample_ratio: 0.1\n")); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// Zero is a real choice: trace only what callers have already decided to sample.
+func TestASampleRatioOfZeroIsKept(t *testing.T) {
+	cfg, err := Load(writeConfig(t, validYAML+"tracing:\n  otlp_endpoint: http://127.0.0.1:4318\n  sample_ratio: 0\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := cfg.Tracing.Ratio(); got != 0 {
+		t.Fatalf("ratio = %v", got)
+	}
+}

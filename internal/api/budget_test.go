@@ -14,6 +14,7 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/redis/go-redis/v9"
+	"go.opentelemetry.io/otel/trace"
 
 	"github.com/Bispulm/llmgate/internal/accounting"
 	"github.com/Bispulm/llmgate/internal/auth"
@@ -92,6 +93,7 @@ type instanceOptions struct {
 	cache       *cache.Cache
 	cacheTTL    time.Duration
 	metrics     *metrics.Metrics
+	tracer      trace.Tracer
 }
 
 // instance runs one gateway replica, with its own connection pool and adapters. Alias
@@ -128,6 +130,7 @@ func (e *tenantEnv) instance(opts instanceOptions, models ...string) (string, *h
 		TeamLimiter: opts.limiter,
 		Cache:       opts.cache,
 		Metrics:     opts.metrics,
+		Tracer:      opts.tracer,
 		Limits:      serverLimits,
 		Routes: routing.NewTable([]routing.Alias{{Name: "fast", MaxOutputTokens: 10, Routes: routes, CacheTTL: opts.cacheTTL}},
 			routing.Options{Breaker: routing.BreakerConfig{MinRequests: 100000}}),
