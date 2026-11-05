@@ -5,6 +5,8 @@ package api
 
 import (
 	"context"
+	"crypto/rand"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"sync/atomic"
@@ -14,6 +16,8 @@ import (
 	"github.com/Bispulm/llmgate/internal/auth"
 	"github.com/Bispulm/llmgate/internal/routing"
 )
+
+const waitForRequestsInterval = 10 * time.Millisecond
 
 // Limits bounds what one request can consume. A zero duration disables that
 // timer. Configuration always sets them, so this only affects tests.
@@ -49,6 +53,7 @@ type Server struct {
 	limits   Limits
 	mux      *http.ServeMux
 	draining atomic.Bool
+	inflight atomic.Int64
 }
 
 // New returns a Server. Without an Authenticator every request is rejected, so a
@@ -90,9 +95,30 @@ func New(opts Options) *Server {
 //
 // The timeout limits how long one write can block, not how long a provider can
 // take, so anything writing after a wait must call extendWriteDeadline first.
+//
+// The read deadline bounds the request body, including when no handler reads it,
+// because net/http reads an unread body itself when a handler finishes. The chat
+// endpoint clears it once it has the whole body.
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	s.extendWriteDeadline(http.NewResponseController(w))
+	s.inflight.Add(1)
+	defer s.inflight.Add(-1)
+
+	rc := http.NewResponseController(w)
+	s.extendWriteDeadline(rc)
+	if s.limits.BodyReadTimeout > 0 {
+		_ = rc.SetReadDeadline(time.Now().Add(s.limits.BodyReadTimeout))
+	}
 	s.mux.ServeHTTP(w, r)
+}
+
+// abandonBody prepares to reply without reading the request body. Without this,
+// net/http would wait for the body before sending the response, so a client that
+// never sends it would never get an answer. The connection can't carry another
+// request, because the unread bytes would be parsed as one.
+func abandonBody(w http.ResponseWriter, r *http.Request) {
+	if r.ContentLength != 0 {
+		w.Header().Set("Connection", "close")
+	}
 }
 
 func (s *Server) extendWriteDeadline(rc *http.ResponseController) {
@@ -102,15 +128,33 @@ func (s *Server) extendWriteDeadline(rc *http.ResponseController) {
 	}
 }
 
+// WaitForRequests blocks until no request is being handled, or ctx ends. A handler
+// records its attempt before it finishes, so a process that waits for this before
+// exiting doesn't lose those records.
+func (s *Server) WaitForRequests(ctx context.Context) error {
+	ticker := time.NewTicker(waitForRequestsInterval)
+	defer ticker.Stop()
+	for s.inflight.Load() > 0 {
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("waiting for requests to finish: %w", ctx.Err())
+		case <-ticker.C:
+		}
+	}
+	return nil
+}
+
 // SetDraining makes readiness fail, so that load balancers stop sending new
 // requests while in-flight ones finish.
 func (s *Server) SetDraining() { s.draining.Store(true) }
 
-func (s *Server) handleHealth(w http.ResponseWriter, _ *http.Request) {
+func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
+	abandonBody(w, r)
 	writeStatus(w, http.StatusOK, "ok")
 }
 
-func (s *Server) handleReady(w http.ResponseWriter, _ *http.Request) {
+func (s *Server) handleReady(w http.ResponseWriter, r *http.Request) {
+	abandonBody(w, r)
 	if s.draining.Load() {
 		writeStatus(w, http.StatusServiceUnavailable, "draining")
 		return
@@ -118,7 +162,9 @@ func (s *Server) handleReady(w http.ResponseWriter, _ *http.Request) {
 	writeStatus(w, http.StatusOK, "ready")
 }
 
-func (s *Server) handleNotFound(w http.ResponseWriter, _ *http.Request) {
+func (s *Server) handleNotFound(w http.ResponseWriter, r *http.Request) {
+	abandonBody(w, r)
+	w.Header().Set("X-Request-Id", rand.Text())
 	writeError(w, &apiError{
 		Status:  http.StatusNotFound,
 		Type:    errTypeInvalidRequest,

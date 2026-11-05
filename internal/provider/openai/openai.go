@@ -201,16 +201,20 @@ func statusError(resp *http.Response) *provider.Error {
 	var envelope struct {
 		Error json.RawMessage `json:"error"`
 	}
-	code := ""
+	var details errorDetails
 	if json.Unmarshal(body, &envelope) == nil {
-		code = upstreamCode(envelope.Error)
+		details = parseErrorDetails(envelope.Error)
+	}
+	kind := kindForStatus(resp.StatusCode)
+	if kind == provider.KindRateLimited && details.isBilling() {
+		kind = provider.KindBilling
 	}
 	return &provider.Error{
-		Kind:         kindForStatus(resp.StatusCode),
+		Kind:         kind,
 		Delivery:     provider.DeliveryConfirmed,
 		Status:       resp.StatusCode,
 		RetryAfter:   parseRetryAfter(resp.Header.Get("Retry-After"), time.Now()),
-		UpstreamCode: code,
+		UpstreamCode: details.identifier(),
 	}
 }
 
@@ -220,6 +224,8 @@ func kindForStatus(status int) provider.Kind {
 		return provider.KindAuth
 	case status == http.StatusNotFound:
 		return provider.KindNotFound
+	case status == http.StatusPaymentRequired:
+		return provider.KindBilling
 	case status == http.StatusRequestTimeout:
 		return provider.KindTimeout
 	case status == http.StatusTooManyRequests:
@@ -236,23 +242,52 @@ func kindForStatus(status int) provider.Kind {
 	}
 }
 
-// upstreamCode extracts a short identifier from an error object. Provider
+// errorDetails holds the identifiers from an upstream error object. Provider
 // messages are deliberately ignored, because they can contain account details.
-func upstreamCode(errorJSON []byte) string {
+type errorDetails struct {
+	code, errType string
+}
+
+func parseErrorDetails(errorJSON []byte) errorDetails {
 	var e struct {
 		Code any `json:"code"`
 		Type any `json:"type"`
 	}
+	var out errorDetails
 	if len(errorJSON) == 0 || json.Unmarshal(errorJSON, &e) != nil {
-		return ""
+		return out
 	}
 	if s, ok := e.Code.(string); ok && isIdentifier(s) {
-		return s
+		out.code = s
 	}
 	if s, ok := e.Type.(string); ok && isIdentifier(s) {
-		return s
+		out.errType = s
 	}
-	return ""
+	return out
+}
+
+// identifier returns the most specific identifier available.
+func (d errorDetails) identifier() string {
+	if d.code != "" {
+		return d.code
+	}
+	return d.errType
+}
+
+// isBilling reports an account that can't serve requests until its credits or
+// limits change. OpenAI sends these as HTTP 429 and says to branch on the code,
+// noting that the broader type can still be insufficient_quota. See
+// https://developers.openai.com/api/docs/guides/error-codes (checked 2026-11-05).
+func (d errorDetails) isBilling() bool {
+	switch d.code {
+	case "credit_balance_exhausted",
+		"organization_spend_limit_exceeded",
+		"project_spend_limit_exceeded",
+		"organization_usage_limit_exceeded",
+		"insufficient_quota":
+		return true
+	}
+	return d.errType == "insufficient_quota"
 }
 
 func isIdentifier(s string) bool {
@@ -576,9 +611,12 @@ func (s *stream) parseChunk(data []byte) (chat.StreamEvent, error) {
 
 // streamError classifies an error sent inside a stream, after a 200 response.
 func streamError(errorJSON []byte) *provider.Error {
-	code := upstreamCode(errorJSON)
+	details := parseErrorDetails(errorJSON)
+	code := details.identifier()
 	kind := provider.KindServer
 	switch {
+	case details.isBilling():
+		kind = provider.KindBilling
 	case strings.Contains(code, "rate_limit"):
 		kind = provider.KindRateLimited
 	case strings.Contains(code, "overloaded"):

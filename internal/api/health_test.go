@@ -41,6 +41,9 @@ func TestUnknownPathsUseTheErrorEnvelope(t *testing.T) {
 	if ct := rec.Header().Get("Content-Type"); ct != "application/json" {
 		t.Errorf("content type = %q", ct)
 	}
+	if rec.Header().Get("X-Request-Id") == "" {
+		t.Error("the error has no X-Request-Id")
+	}
 	var got struct {
 		Error struct {
 			Message string  `json:"message"`

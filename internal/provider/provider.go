@@ -51,6 +51,7 @@ const (
 	KindOverloaded     Kind = "overloaded"      // The upstream reported it is overloaded.
 	KindServer         Kind = "server"          // The upstream failed.
 	KindAuth           Kind = "auth"            // The upstream rejected the gateway's credentials.
+	KindBilling        Kind = "billing"         // The upstream account is out of credit or over a limit, so retrying won't help.
 	KindNotFound       Kind = "not_found"       // The upstream doesn't know the model or path.
 	KindInvalidRequest Kind = "invalid_request" // The upstream rejected the request itself.
 	KindProtocol       Kind = "protocol"        // The upstream's response broke the wire format.

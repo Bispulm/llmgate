@@ -35,6 +35,7 @@ const (
 	codeUpstreamProtocolError = "upstream_protocol_error"
 	codeUpstreamRejected      = "upstream_rejected"
 	codeUpstreamMisconfigured = "upstream_misconfigured"
+	codeUpstreamAccountLimit  = "upstream_account_limit"
 	codeStreamInterrupted     = "stream_interrupted"
 )
 
@@ -155,6 +156,9 @@ func upstreamError(e *provider.Error) *apiError {
 	case provider.KindAuth, provider.KindNotFound:
 		out.Code = codeUpstreamMisconfigured
 		out.Message = "the gateway's provider configuration was rejected"
+	case provider.KindBilling:
+		out.Code = codeUpstreamAccountLimit
+		out.Message = "the gateway's provider account is out of credit or over a limit"
 	case provider.KindProtocol:
 		out.Code = codeUpstreamProtocolError
 		out.Message = "the provider sent a malformed response"

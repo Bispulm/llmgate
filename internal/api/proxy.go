@@ -59,6 +59,7 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	header.Set(headerBudgetEnforcement, budgetEnforcementNone)
 
 	if r.Method != http.MethodPost {
+		abandonBody(w, r)
 		header.Set("Allow", http.MethodPost)
 		writeError(w, &apiError{
 			Status:  http.StatusMethodNotAllowed,
@@ -73,6 +74,7 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	// the gateway buffer or parse anything.
 	principal, err := s.auth.Authenticate(r.Context(), auth.BearerToken(r.Header))
 	if err != nil {
+		abandonBody(w, r)
 		header.Set("WWW-Authenticate", "Bearer")
 		writeError(w, &apiError{
 			Status:  http.StatusUnauthorized,
@@ -167,9 +169,6 @@ func (s *Server) record(requestCtx context.Context, x *exchange) {
 }
 
 func (s *Server) readBody(w http.ResponseWriter, r *http.Request, rc *http.ResponseController) ([]byte, *apiError) {
-	if s.limits.BodyReadTimeout > 0 {
-		_ = rc.SetReadDeadline(time.Now().Add(s.limits.BodyReadTimeout))
-	}
 	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, s.limits.MaxRequestBytes))
 	if err == nil {
 		if s.limits.BodyReadTimeout > 0 {
@@ -180,11 +179,9 @@ func (s *Server) readBody(w http.ResponseWriter, r *http.Request, rc *http.Respo
 		return body, nil
 	}
 
-	// The rest of the body will never be read, so the connection can't carry
-	// another request: leftover bytes would be parsed as one. The read deadline
-	// stays in place because net/http tries to drain an unread body before writing
-	// the response, which would otherwise wait on this client indefinitely.
-	w.Header().Set("Connection", "close")
+	// The rest of the body will never be read. The read deadline stays in place to
+	// bound what net/http does with it.
+	abandonBody(w, r)
 
 	out := &apiError{Type: errTypeInvalidRequest}
 	var tooLarge *http.MaxBytesError
@@ -329,7 +326,7 @@ func (s *Server) proxyStream(parent context.Context, x *exchange) {
 	}
 	defer func() { _ = stream.Close() }()
 
-	first, err := stream.Next()
+	first, err := x.awaitFirstOutput(stream)
 	if errors.Is(err, io.EOF) {
 		// Adapters report a finish reason as an event, so this breaks their contract.
 		err = &provider.Error{
@@ -352,16 +349,13 @@ func (s *Server) proxyStream(parent context.Context, x *exchange) {
 		x.clientWriteFailed(err)
 		return
 	}
-	x.observe(first)
 
-	idle := newWatchdog(0, func() { cancel(errStreamIdleTimeout) })
+	idle := newWatchdog(s.limits.StreamIdleTimeout, func() { cancel(errStreamIdleTimeout) })
 	defer idle.stop()
 	for {
-		idle.reset(s.limits.StreamIdleTimeout)
 		event, err := stream.Next()
-		idle.stop()
-
 		if errors.Is(err, io.EOF) {
+			idle.stop()
 			if err := out.finish(x.attempt.Usage); err != nil {
 				x.clientWriteFailed(err)
 				return
@@ -370,13 +364,37 @@ func (s *Server) proxyStream(parent context.Context, x *exchange) {
 			return
 		}
 		if err != nil {
+			idle.stop()
 			s.interruptStream(ctx, x, out, err)
 			return
 		}
 		x.observe(event)
+		if !event.HasOutput() {
+			continue // Not progress, so the idle timer keeps running.
+		}
+
+		// A slow client isn't the upstream stalling, so writing doesn't count as idle.
+		idle.stop()
 		if err := out.write(event); err != nil {
 			x.clientWriteFailed(err)
 			return
+		}
+		idle.reset(s.limits.StreamIdleTimeout)
+	}
+}
+
+// awaitFirstOutput reads until an event with output arrives, which is what may
+// commit the response. The first-event timeout bounds how long this can take,
+// however many usage reports arrive in the meantime.
+func (x *exchange) awaitFirstOutput(stream provider.Stream) (chat.StreamEvent, error) {
+	for {
+		event, err := stream.Next()
+		if err != nil {
+			return chat.StreamEvent{}, err
+		}
+		x.observe(event)
+		if event.HasOutput() {
+			return event, nil
 		}
 	}
 }
