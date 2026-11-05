@@ -1,0 +1,6 @@
+apiVersion: v2
+name: llmgate
+description: An OpenAI-compatible LLM gateway with budgets, routing, and failover.
+type: application
+version: 0.1.0
+appVersion: "dev"

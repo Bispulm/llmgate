@@ -91,3 +91,27 @@ jobs:
       - uses: gitleaks/gitleaks-action@e0c47f4f8be36e29cdc102c57e68cb5cbf0e8d1e # v3.0.0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  deployment:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+      - name: Lint the chart
+        run: helm lint deploy/helm/llmgate
+      - name: Check the configuration the chart renders
+        run: |
+          helm template llmgate deploy/helm/llmgate --show-only templates/configmap.yaml \
+            | yq '.data["config.yaml"]' > rendered.yaml
+          go run ./cmd/llmgate validate --config rendered.yaml
+      - name: Check the Compose configurations
+        run: |
+          docker compose config --quiet
+          docker compose --profile stack config --quiet
+          go run ./cmd/llmgate validate --config configs/compose.yaml
+      # Builds the image, installs the chart on kind with the mock, and restarts it under
+      # traffic. Nothing calls a real provider.
+      - name: Test the chart on kind
+        run: ./scripts/kind-test.sh

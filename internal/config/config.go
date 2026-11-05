@@ -114,6 +114,9 @@ type CircuitBreaker struct {
 type Server struct {
 	Listen          string        `yaml:"listen"`
 	ShutdownTimeout time.Duration `yaml:"shutdown_timeout"`
+	// DrainDelay is how long a stopping replica keeps serving while reporting that it
+	// isn't ready, so that a load balancer stops sending it new connections first.
+	DrainDelay time.Duration `yaml:"drain_delay"`
 }
 
 // Auth configures client authentication. Development mode accepts one shared key and
@@ -188,6 +191,9 @@ func (d *Decimal) UnmarshalYAML(node *yaml.Node) error {
 type Metrics struct {
 	Listen           string `yaml:"listen"`
 	AllowNonLoopback bool   `yaml:"allow_non_loopback"`
+	// PProf serves Go's profiling endpoints under /debug/pprof on the same listener. A
+	// profile reveals nothing about requests, but it does cost CPU, so it's off unless set.
+	PProf bool `yaml:"pprof"`
 }
 
 // Tracing exports OpenTelemetry traces over OTLP/HTTP, and is off unless an endpoint is
@@ -253,6 +259,9 @@ type Provider struct {
 	BaseURL        string `yaml:"base_url"`
 	APIKeyEnv      string `yaml:"api_key_env"`
 	MaxTokensParam string `yaml:"max_tokens_param"`
+	// AllowInsecureHTTP permits plaintext to a host other than loopback, such as a mock
+	// on a private container network. The provider credential travels in every request.
+	AllowInsecureHTTP bool `yaml:"allow_insecure_http"`
 
 	// MaxConcurrency limits attempts running at once on this provider, in each
 	// process. Zero means no limit. The others only apply when it's set.
@@ -456,6 +465,9 @@ func (c *Config) validate() error {
 	}
 	if c.Server.ShutdownTimeout < 0 {
 		return errors.New("server.shutdown_timeout must not be negative")
+	}
+	if c.Server.DrainDelay < 0 || c.Server.DrainDelay > time.Minute {
+		return errors.New("server.drain_delay must be between 0 and 1m")
 	}
 	if len(c.Providers) == 0 {
 		return errors.New("at least one provider is required")
@@ -746,7 +758,7 @@ func (p Provider) validate() error {
 	if err := p.validateConcurrency(); err != nil {
 		return err
 	}
-	return validateBaseURL(p.BaseURL)
+	return validateBaseURL(p.BaseURL, p.AllowInsecureHTTP)
 }
 
 func (p Provider) validateConcurrency() error {
@@ -762,7 +774,7 @@ func (p Provider) validateConcurrency() error {
 
 // validateBaseURL refuses plaintext to anything but loopback, because the
 // provider credential travels in every request.
-func validateBaseURL(raw string) error {
+func validateBaseURL(raw string, allowInsecure bool) error {
 	if raw == "" {
 		return errors.New("base_url is required")
 	}
@@ -773,8 +785,8 @@ func validateBaseURL(raw string) error {
 	switch u.Scheme {
 	case "https":
 	case "http":
-		if !isLoopback(u.Hostname()) {
-			return errors.New("base_url must use https for a host other than loopback")
+		if !isLoopback(u.Hostname()) && !allowInsecure {
+			return errors.New("base_url must use https for a host other than loopback, unless allow_insecure_http is set")
 		}
 	default:
 		return errors.New("base_url must use http or https")

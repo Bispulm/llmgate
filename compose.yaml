@@ -1,6 +1,20 @@
-# Local dependencies for development and integration tests. Ports bind to loopback
-# only. The password is a local development placeholder, not a credential.
+# Local dependencies for development and integration tests, and, with the "stack"
+# profile, the whole gateway with Prometheus and Grafana. Every port binds to loopback
+# only. The passwords and the admin token are local development placeholders, not
+# credentials.
 name: llmgate
+
+x-llmgate: &llmgate
+  image: llmgate:dev
+  build: .
+  profiles: ["stack"]
+  volumes:
+    - ./configs/compose.yaml:/etc/llmgate/config.yaml:ro
+  environment:
+    LLMGATE_DATABASE_URL: postgres://llmgate:llmgate_dev@postgres:5432/llmgate?sslmode=disable
+    LLMGATE_REDIS_URL: redis://redis:6379/0
+    LLMGATE_ADMIN_TOKEN: ${LLMGATE_ADMIN_TOKEN:-local-stack-admin-token}
+    LLMGATE_MOCK_PROVIDER_KEY: mock
 
 services:
   postgres:
@@ -30,6 +44,58 @@ services:
       interval: 2s
       timeout: 3s
       retries: 30
+
+  migrate:
+    <<: *llmgate
+    command: ["migrate", "--config", "/etc/llmgate/config.yaml"]
+    restart: "no"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  mock:
+    <<: *llmgate
+    entrypoint: ["/usr/local/bin/llmgate-mock", "-listen", "0.0.0.0:18301"]
+    ports:
+      - "127.0.0.1:${LLMGATE_MOCK_PORT:-18301}:18301"
+
+  gateway:
+    <<: *llmgate
+    command: ["serve", "--config", "/etc/llmgate/config.yaml"]
+    ports:
+      - "127.0.0.1:${LLMGATE_GATEWAY_PORT:-18300}:18300"
+      - "127.0.0.1:${LLMGATE_ADMIN_PORT:-18302}:18302"
+      - "127.0.0.1:${LLMGATE_METRICS_PORT:-18303}:18303"
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+      mock:
+        condition: service_started
+
+  prometheus:
+    image: prom/prometheus:v3.15.1@sha256:fa3302279710be2f21a8301ec17a8b4f2301fd829bd113839b3b6b02b6f191a2
+    profiles: ["stack"]
+    volumes:
+      - ./deploy/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    ports:
+      - "127.0.0.1:${LLMGATE_PROMETHEUS_PORT:-18304}:9090"
+    depends_on: [gateway]
+
+  grafana:
+    image: grafana/grafana:13.2.4@sha256:dbbc38ea21103cefb50396340cd88afec779c7e070b0a7bf5a75b4ce46651d3f
+    profiles: ["stack"]
+    environment:
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+      GF_SECURITY_ADMIN_PASSWORD: llmgate_dev
+    volumes:
+      - ./deploy/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./deploy/grafana/dashboards:/var/lib/grafana/dashboards/llmgate:ro
+    ports:
+      - "127.0.0.1:${LLMGATE_GRAFANA_PORT:-18305}:3000"
+    depends_on: [prometheus]
 
 volumes:
   postgres-data:

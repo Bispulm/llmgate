@@ -7,7 +7,7 @@ export LLMGATE_REDIS_PORT
 TEST_POSTGRES_URL = postgres://llmgate:llmgate_dev@127.0.0.1:$(LLMGATE_POSTGRES_PORT)/llmgate?sslmode=disable
 TEST_REDIS_URL = redis://127.0.0.1:$(LLMGATE_REDIS_PORT)/0
 
-.PHONY: build test vet lint vuln secrets check demo dev-up dev-down test-integration
+.PHONY: build test vet lint vuln secrets check demo dev-up dev-down test-integration stack-up stack-down image
 
 build:
 	go build ./...
@@ -37,7 +37,17 @@ dev-up:
 	docker compose up -d --wait
 
 dev-down:
-	docker compose down
+	docker compose --profile stack down
+
+# The whole gateway in containers: tenant mode, the mock, Prometheus, and Grafana.
+stack-up:
+	docker compose --profile stack up -d --build --wait
+
+stack-down:
+	docker compose --profile stack down
+
+image:
+	docker build -t llmgate:dev .
 
 # Runs every test, including those needing real Postgres and Redis. It fails rather
 # than skips if they can't be reached.

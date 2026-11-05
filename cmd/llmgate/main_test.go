@@ -502,6 +502,48 @@ func TestServeExportsMetricsOnTheirOwnListener(t *testing.T) {
 	if status, _ := get("http://" + addrs.Gateway + "/metrics"); status != http.StatusNotFound {
 		t.Fatalf("the gateway's listener serves metrics: %d", status)
 	}
+	// Profiling is off unless asked for.
+	if status, _ := get("http://" + addrs.Metrics + "/debug/pprof/"); status != http.StatusNotFound {
+		t.Fatalf("pprof without asking: %d", status)
+	}
+}
+
+func TestProfilingCanBeTurnedOnForTheMetricsListener(t *testing.T) {
+	config := testConfig + "metrics:\n  listen: 127.0.0.1:0\n  pprof: true\n"
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(path, []byte(config), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	started := make(chan listening, 1)
+	done := make(chan error, 1)
+	go func() {
+		done <- run(ctx, []string{"serve", "--config", path}, process{getenv: testEnv, stdout: io.Discard, stderr: io.Discard, started: func(l listening) { started <- l }})
+	}()
+	var addrs listening
+	select {
+	case addrs = <-started:
+	case err := <-done:
+		t.Fatalf("serve returned early: %v", err)
+	}
+	defer func() {
+		cancel()
+		if err := <-done; err != nil {
+			t.Error(err)
+		}
+	}()
+	resp, err := http.Get("http://" + addrs.Metrics + "/debug/pprof/heap?debug=1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK || !strings.Contains(string(body), "heap profile") {
+		t.Fatalf("status %d", resp.StatusCode)
+	}
+	if resp, err := http.Get("http://" + addrs.Gateway + "/debug/pprof/"); err != nil || resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("the gateway's listener serves pprof")
+	}
 }
 
 // Traces reach a configured OTLP endpoint, and the last ones are flushed at shutdown.
@@ -567,5 +609,87 @@ func TestTracesURL(t *testing.T) {
 		if got := tracesURL(in); got != want {
 			t.Errorf("tracesURL(%q) = %q, want %q", in, got, want)
 		}
+	}
+}
+
+func TestValidateChecksAConfigurationWithoutStarting(t *testing.T) {
+	var out bytes.Buffer
+	if err := run(context.Background(), []string{"validate", "--config", writeTestConfig(t)}, process{getenv: testEnv, stdout: &out, stderr: io.Discard}); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out.String(), "valid") {
+		t.Fatalf("printed %q", out.String())
+	}
+	bad := filepath.Join(t.TempDir(), "bad.yaml")
+	if err := os.WriteFile(bad, []byte(strings.Replace(testConfig, "max_output_tokens: 64", "max_output_tokens: 0", 1)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := run(context.Background(), []string{"validate", "--config", bad}, process{getenv: testEnv, stdout: io.Discard, stderr: io.Discard}); err == nil || !strings.Contains(err.Error(), "max_output_tokens") {
+		t.Fatalf("err = %v", err)
+	}
+	// It doesn't need credentials, so it can run where they aren't available, such as CI.
+	if err := run(context.Background(), []string{"validate", "--config", writeTestConfig(t)}, process{getenv: func(string) string { return "" }, stdout: io.Discard, stderr: io.Discard}); err != nil {
+		t.Fatalf("needed credentials: %v", err)
+	}
+}
+
+// During the drain delay a replica says it isn't ready but keeps serving, so that a load
+// balancer can stop sending to it before it stops accepting connections.
+func TestTheDrainDelayKeepsServingWhileNotReady(t *testing.T) {
+	upstream := httptest.NewServer(mock.New())
+	defer upstream.Close()
+	config := strings.Replace(testConfig, "http://127.0.0.1:18301/v1", upstream.URL+"/v1", 1)
+	config = strings.Replace(config, "shutdown_timeout: 2s", "shutdown_timeout: 2s\n  drain_delay: 1s", 1)
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(path, []byte(config), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	started := make(chan listening, 1)
+	done := make(chan error, 1)
+	go func() {
+		done <- run(ctx, []string{"serve", "--config", path}, process{getenv: testEnv, stdout: io.Discard, stderr: io.Discard, started: func(l listening) { started <- l }})
+	}()
+	var addrs listening
+	select {
+	case addrs = <-started:
+	case err := <-done:
+		t.Fatalf("serve returned early: %v", err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("serve didn't start")
+	}
+	cancel()
+	time.Sleep(200 * time.Millisecond)
+
+	resp, err := http.Get("http://" + addrs.Gateway + "/readyz")
+	if err != nil {
+		t.Fatalf("the listener closed during the drain delay: %v", err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("readyz = %d during the drain delay", resp.StatusCode)
+	}
+	req, err := http.NewRequest(http.MethodPost, "http://"+addrs.Gateway+"/v1/chat/completions", strings.NewReader(`{"model":"fast","messages":[{"role":"user","content":"hello"}]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Authorization", "Bearer dev")
+	// A new connection, as from a load balancer that hasn't noticed yet.
+	fresh := &http.Client{Transport: &http.Transport{DisableKeepAlives: true}}
+	resp, err = fresh.Do(req)
+	if err != nil {
+		t.Fatalf("a request during the drain delay failed: %v", err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d during the drain delay", resp.StatusCode)
+	}
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("serve didn't stop after the drain delay")
 	}
 }

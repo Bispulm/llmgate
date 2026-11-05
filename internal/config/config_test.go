@@ -94,6 +94,8 @@ func TestLoadRejectsInvalidConfig(t *testing.T) {
 		{"empty alias", "alias: fast", "alias: ''", "alias"},
 		{"a first-event timeout past the deadline", "request_timeout: 45s", "request_timeout: 45s\n  first_event_timeout: 46s", "first_event_timeout"},
 		{"a completion timeout past the deadline", "request_timeout: 45s", "request_timeout: 45s\n  completion_timeout: 46s", "completion_timeout"},
+		{"a negative drain delay", "listen: 127.0.0.1:18300", "listen: 127.0.0.1:18300\n  drain_delay: -1s", "drain_delay"},
+		{"a drain delay over a minute", "listen: 127.0.0.1:18300", "listen: 127.0.0.1:18300\n  drain_delay: 2m", "drain_delay"},
 		{"an admission timeout past the deadline", "request_timeout: 45s", "request_timeout: 45s\n  admission_timeout: 46s", "admission_timeout"},
 		{
 			"the same route twice",
@@ -329,6 +331,19 @@ func TestTracingSettings(t *testing.T) {
 		})
 	}
 	if _, err := Load(writeConfig(t, validYAML+"tracing:\n  otlp_endpoint: https://collector.example\n  sample_ratio: 0.1\n")); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// A mock or a provider on a private network can be reached over plaintext, but only when
+// the configuration says so in as many words, since the credential travels with it.
+func TestPlaintextToAPrivateHostNeedsSaying(t *testing.T) {
+	private := strings.Replace(validYAML, "base_url: http://127.0.0.1:18301/v1", "base_url: http://mock:18301/v1", 1)
+	if _, err := Load(writeConfig(t, private)); err == nil || !strings.Contains(err.Error(), "https") {
+		t.Fatalf("err = %v", err)
+	}
+	allowed := strings.Replace(private, "api_key_env: PRIMARY_KEY", "api_key_env: PRIMARY_KEY\n    allow_insecure_http: true", 1)
+	if _, err := Load(writeConfig(t, allowed)); err != nil {
 		t.Fatal(err)
 	}
 }
