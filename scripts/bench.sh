@@ -154,6 +154,12 @@ bench dev-stream "$GATEWAY" "$BENCH_DEV_KEY" bench -stream
 section "Failover before commit"
 bench dev-failover "$GATEWAY" "$BENCH_DEV_KEY" bench-failover
 
+section "Saturation: development mode"
+for c in 1 4 16 64 256; do
+  LLMGATE_BENCH_KEY=$BENCH_DEV_KEY "$WORK/llmgate-bench" -label "dev-c$c" -url "$GATEWAY" -model bench \
+    -concurrency "$c" -duration 10s -warmup 2s >"$OUT/saturation-dev-c$c.json"
+done
+
 section "Memory per active stream"
 IDLE_HEAP=$(metric go_memstats_heap_inuse_bytes); IDLE_GOROUTINES=$(metric go_goroutines)
 # Each stream lasts about ten seconds, so the heap is sampled while all of them are open.
@@ -181,6 +187,27 @@ bench tenant "$GATEWAY" "$KEY" bench
 wait "$PROFILE_PID"
 go tool pprof -top -nodecount=25 "$WORK/llmgate" "$OUT/tenant-cpu.pprof" >"$OUT/tenant-cpu.txt" 2>/dev/null || true
 bench tenant-stream "$GATEWAY" "$KEY" bench -stream
+
+section "Saturation: tenant mode, one team"
+for c in 1 4 16 64 256; do
+  LLMGATE_BENCH_KEY=$KEY "$WORK/llmgate-bench" -label "tenant-c$c" -url "$GATEWAY" -model bench \
+    -concurrency "$c" -duration 10s -warmup 2s >"$OUT/saturation-tenant-c$c.json"
+done
+
+section "Saturation: tenant mode, eight teams"
+TEAM_KEYS=()
+for i in $(seq 1 8); do TEAM_KEYS+=("$(team_key "bench-team-$i")"); done
+for c in 8 32 128; do
+  per=$((c / 8)); PIDS_SAT=()
+  for i in $(seq 0 7); do
+    LLMGATE_BENCH_KEY=${TEAM_KEYS[$i]} "$WORK/llmgate-bench" -label "teams8-c$c-$i" -url "$GATEWAY" -model bench \
+      -concurrency "$per" -duration 10s -warmup 2s >"$WORK/teams8-c$c-$i.json" & PIDS_SAT+=($!)
+  done
+  wait "${PIDS_SAT[@]}"
+  jq -s --arg label "8 teams, $c in flight" '{label: $label, requests: (map(.requests) | add), ok: (map(.ok) | add),
+    throughput_rps: (map(.throughput_rps) | add), latency_ms: {p50: (map(.latency_ms.p50) | max), p99: (map(.latency_ms.p99) | max)}}' \
+    "$WORK"/teams8-c$c-*.json >"$OUT/saturation-teams8-c$c.json"
+done
 stop_gateway
 
 section "Fairness under a saturated team"
@@ -228,6 +255,16 @@ section "Report"
   "$WORK/llmgate-bench" compare "$OUT/direct-stream.json" "$OUT/dev-stream.json" "$OUT/tenant-stream.json"
   echo
   echo "The difference between development and tenant mode is the cost of authentication, team limits, and accounting."
+  echo
+  echo "## Saturation"
+  echo
+  echo "Throughput and latency as concurrency rises, 10 seconds each after 2 seconds of warm-up. One team's admissions take turns on its budget row, so eight teams show how tenant mode scales across teams. For eight teams, latency is the worst team's."
+  echo
+  echo "| Run | Req/s | p50 ms | p99 ms | Errors |"
+  echo "|---|---|---|---|---|"
+  for f in "$OUT"/saturation-dev-c{1,4,16,64,256}.json "$OUT"/saturation-tenant-c{1,4,16,64,256}.json "$OUT"/saturation-teams8-c{8,32,128}.json; do
+    jq -r '"| \(.label) | \(.throughput_rps | floor) | \(.latency_ms.p50) | \(.latency_ms.p99) | \(.requests - .ok) |"' "$f"
+  done
   echo
   echo "## Failover before commit"
   echo
