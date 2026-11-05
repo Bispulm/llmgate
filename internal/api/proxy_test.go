@@ -1021,6 +1021,32 @@ func TestWriteTimeoutDoesNotLimitSlowProviders(t *testing.T) {
 	})
 }
 
+// The body read timeout limits how long a request body can take, not the request.
+// net/http clears the deadline once the body is consumed, and this guards against
+// that changing, because an expired deadline reads as the client disconnecting.
+func TestBodyReadTimeoutDoesNotLimitSlowProviders(t *testing.T) {
+	short := func(o *Options) { o.Limits.BodyReadTimeout = 100 * time.Millisecond }
+
+	t.Run("a slow non-streaming response", func(t *testing.T) {
+		g := newGateway(t, "alpha;tokens=2;latency=400ms", short)
+		if resp := g.post(t, chatBody(false, "")); resp.StatusCode != http.StatusOK {
+			t.Fatalf("status = %d", resp.StatusCode)
+		}
+		if a := g.recorder.wait(t); a.Outcome != accounting.OutcomeCompleted {
+			t.Fatalf("attempt = %+v", a)
+		}
+	})
+	t.Run("a stream lasting longer than the timeout", func(t *testing.T) {
+		g := newGateway(t, "alpha;tokens=5;interval=100ms", short)
+		if s := readStream(t, g.post(t, chatBody(true, "")).Body); !s.done {
+			t.Fatalf("stream = %+v", s)
+		}
+		if a := g.recorder.wait(t); a.Outcome != accounting.OutcomeCompleted {
+			t.Fatalf("attempt = %+v", a)
+		}
+	})
+}
+
 // A write deadline applies to the connection, so a stale one from an earlier
 // response must not break a later request on the same connection.
 func TestDeadlinesDoNotOutliveTheirRequest(t *testing.T) {
@@ -1093,10 +1119,10 @@ func TestSlowRequestBodyIsCutOff(t *testing.T) {
 	}
 }
 
-// A request rejected without reading its body must not wait for that body, because
-// net/http drains an unread body before replying. Without this, any caller could
-// hold a connection and a goroutine open without authenticating.
-func TestRejectionsDoNotWaitForAnUnreadBody(t *testing.T) {
+// net/http drains an unread body before replying. Without a read deadline, any
+// caller could hold a connection and a goroutine open forever without
+// authenticating, by declaring a body and never sending it.
+func TestRejectionsDoNotWaitIndefinitelyForAnUnreadBody(t *testing.T) {
 	tests := []struct {
 		name, method, path, auth string
 		status                   int
@@ -1130,6 +1156,10 @@ func TestRejectionsDoNotWaitForAnUnreadBody(t *testing.T) {
 			if resp.StatusCode != tt.status {
 				t.Fatalf("status = %d, want %d", resp.StatusCode, tt.status)
 			}
+			// The unread bytes must never be parsed as another request.
+			if !resp.Close {
+				t.Error("the response does not announce that the connection will close")
+			}
 			if _, err := io.Copy(io.Discard, resp.Body); err != nil {
 				t.Fatal(err)
 			}
@@ -1141,7 +1171,7 @@ func TestRejectionsDoNotWaitForAnUnreadBody(t *testing.T) {
 		})
 	}
 
-	t.Run("a client that did send its body still gets a clean rejection", func(t *testing.T) {
+	t.Run("a client that did send its body is rejected and keeps its connection", func(t *testing.T) {
 		g := newGateway(t, "alpha")
 		req, err := http.NewRequest(http.MethodPost, g.url+"/v1/chat/completions", strings.NewReader(chatBody(false, "")))
 		if err != nil {
@@ -1153,6 +1183,9 @@ func TestRejectionsDoNotWaitForAnUnreadBody(t *testing.T) {
 		}
 		defer func() { _ = resp.Body.Close() }()
 		expectError(t, resp, 401, "authentication_error", "invalid_api_key")
+		if resp.Close {
+			t.Error("the connection was closed for a client that behaved correctly")
+		}
 	})
 	t.Run("requests without a body keep their connection", func(t *testing.T) {
 		g := newGateway(t, "alpha")
