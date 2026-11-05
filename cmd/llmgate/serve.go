@@ -72,6 +72,7 @@ func serve(ctx context.Context, configPath string, p process) error {
 			CompletionTimeout:  cfg.Limits.CompletionTimeout,
 			ClientWriteTimeout: cfg.Limits.ClientWriteTimeout,
 			BodyReadTimeout:    cfg.Limits.BodyReadTimeout,
+			AdmissionTimeout:   cfg.Limits.AdmissionTimeout,
 		},
 	}
 
