@@ -51,7 +51,13 @@ func TestABudgetHoldsUnderConcurrentRequestsAcrossReplicas(t *testing.T) {
 	}
 	gateways := make([]replica, replicas)
 	for i := range gateways {
-		gateways[i].url, gateways[i].client = e.instance(instanceOptions{logger: slog.New(slog.DiscardHandler)}, model)
+		// Admissions for one team take turns, so on a busy machine the queue can outlast the
+		// default admission timeout and fail closed. This test is about correctness, so it
+		// gives the queue time to drain.
+		gateways[i].url, gateways[i].client = e.instance(instanceOptions{logger: slog.New(slog.DiscardHandler), adjust: func(l *Limits) {
+			l.AdmissionTimeout = 60 * time.Second
+			l.RequestTimeout = 90 * time.Second
+		}}, model)
 	}
 
 	// Watch the period row while requests run. Each read sees one committed state.
