@@ -102,6 +102,12 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	// Authenticate before reading the body, so an unauthenticated caller can't make
 	// the gateway buffer or parse anything.
 	principal, err := s.auth.Authenticate(r.Context(), auth.BearerToken(r.Header))
+	if err != nil && !errors.Is(err, auth.ErrInvalidCredential) {
+		// Still a refusal, but the key may be perfectly good.
+		s.logger.LogAttrs(r.Context(), slog.LevelWarn, "a key could not be checked", attrRequestID(id), slog.Any("error", err))
+		writeError(w, authUnavailable())
+		return
+	}
 	if err != nil {
 		header.Set("WWW-Authenticate", "Bearer")
 		writeError(w, &apiError{

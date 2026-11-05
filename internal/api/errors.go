@@ -46,6 +46,7 @@ const (
 	codeCapacityExceeded      = "capacity_exceeded"
 	codeBudgetExhausted       = "budget_exhausted"
 	codeAccountingUnavailable = "accounting_unavailable"
+	codeAuthUnavailable       = "auth_unavailable"
 	codeRateLimitExceeded     = "rate_limit_exceeded"
 	codeRateLimitUnavailable  = "rate_limit_unavailable"
 )
@@ -201,6 +202,16 @@ func accountingUnavailable() *apiError {
 		Type:       errTypeServer,
 		Code:       codeAccountingUnavailable,
 		Message:    "the gateway can't check this team's budget right now",
+		RetryAfter: outageRetryAfter,
+	}
+}
+
+func authUnavailable() *apiError {
+	return &apiError{
+		Status:     http.StatusServiceUnavailable,
+		Type:       errTypeServer,
+		Code:       codeAuthUnavailable,
+		Message:    "the gateway can't check API keys right now",
 		RetryAfter: outageRetryAfter,
 	}
 }
