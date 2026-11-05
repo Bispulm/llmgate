@@ -90,9 +90,27 @@ func New(opts Options) *Server {
 //
 // The timeout limits how long one write can block, not how long a provider can
 // take, so anything writing after a wait must call extendWriteDeadline first.
+//
+// The read deadline bounds the request body, including when no handler reads it,
+// because net/http reads an unread body itself when a handler finishes. The chat
+// endpoint clears it once it has the whole body.
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	s.extendWriteDeadline(http.NewResponseController(w))
+	rc := http.NewResponseController(w)
+	s.extendWriteDeadline(rc)
+	if s.limits.BodyReadTimeout > 0 {
+		_ = rc.SetReadDeadline(time.Now().Add(s.limits.BodyReadTimeout))
+	}
 	s.mux.ServeHTTP(w, r)
+}
+
+// abandonBody prepares to reply without reading the request body. Without this,
+// net/http would wait for the body before sending the response, so a client that
+// never sends it would never get an answer. The connection can't carry another
+// request, because the unread bytes would be parsed as one.
+func abandonBody(w http.ResponseWriter, r *http.Request) {
+	if r.ContentLength != 0 {
+		w.Header().Set("Connection", "close")
+	}
 }
 
 func (s *Server) extendWriteDeadline(rc *http.ResponseController) {
@@ -106,11 +124,13 @@ func (s *Server) extendWriteDeadline(rc *http.ResponseController) {
 // requests while in-flight ones finish.
 func (s *Server) SetDraining() { s.draining.Store(true) }
 
-func (s *Server) handleHealth(w http.ResponseWriter, _ *http.Request) {
+func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
+	abandonBody(w, r)
 	writeStatus(w, http.StatusOK, "ok")
 }
 
-func (s *Server) handleReady(w http.ResponseWriter, _ *http.Request) {
+func (s *Server) handleReady(w http.ResponseWriter, r *http.Request) {
+	abandonBody(w, r)
 	if s.draining.Load() {
 		writeStatus(w, http.StatusServiceUnavailable, "draining")
 		return
@@ -118,7 +138,8 @@ func (s *Server) handleReady(w http.ResponseWriter, _ *http.Request) {
 	writeStatus(w, http.StatusOK, "ready")
 }
 
-func (s *Server) handleNotFound(w http.ResponseWriter, _ *http.Request) {
+func (s *Server) handleNotFound(w http.ResponseWriter, r *http.Request) {
+	abandonBody(w, r)
 	writeError(w, &apiError{
 		Status:  http.StatusNotFound,
 		Type:    errTypeInvalidRequest,
