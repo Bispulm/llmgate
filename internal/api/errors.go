@@ -37,6 +37,8 @@ const (
 	codeUpstreamMisconfigured = "upstream_misconfigured"
 	codeUpstreamAccountLimit  = "upstream_account_limit"
 	codeStreamInterrupted     = "stream_interrupted"
+	codeNoCapableRoute        = "no_capable_route"
+	codeNoRouteAvailable      = "no_route_available"
 )
 
 // apiError is an error returned to a client.

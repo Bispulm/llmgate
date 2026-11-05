@@ -74,7 +74,7 @@ func New(opts Options) *Server {
 		s.auth = denyAll{}
 	}
 	if s.routes == nil {
-		s.routes = routing.NewTable(nil)
+		s.routes = routing.NewTable(nil, routing.Options{})
 	}
 	if s.recorder == nil {
 		s.recorder = accounting.NewLogRecorder(s.logger)

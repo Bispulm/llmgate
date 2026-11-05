@@ -33,6 +33,20 @@ const (
 	OutcomeClientStalled Outcome = "client_stalled"
 )
 
+// Reason says why this attempt was made. The values are a small fixed set, so they
+// are safe as metric labels.
+type Reason string
+
+// Attempt reasons.
+const (
+	// ReasonPrimary is a request's first attempt.
+	ReasonPrimary Reason = "primary"
+	// ReasonFallback follows a failed attempt on another route.
+	ReasonFallback Reason = "fallback"
+	// ReasonRetryAfter follows waiting for a provider's Retry-After hint.
+	ReasonRetryAfter Reason = "retry_after"
+)
+
 // UsageAbsent is the logged usage state when a provider reported nothing.
 const UsageAbsent = "absent"
 
@@ -47,6 +61,7 @@ type Attempt struct {
 	Model     string
 	Number    int
 	Stream    bool
+	Reason    Reason
 
 	Outcome   Outcome
 	Committed bool // the client received response headers
@@ -96,6 +111,7 @@ func (r *LogRecorder) RecordAttempt(ctx context.Context, a Attempt) {
 		slog.String("provider", a.Provider),
 		slog.String("model", a.Model),
 		slog.Int("attempt", a.Number),
+		slog.String("reason", string(a.Reason)),
 		slog.Bool("stream", a.Stream),
 		slog.String("outcome", string(a.Outcome)),
 		slog.Bool("committed", a.Committed),
