@@ -25,11 +25,12 @@ spec:
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           args: ["migrate", "--config", "/etc/llmgate/config.yaml"]
           env:
-            - name: LLMGATE_DATABASE_URL
+            {{- $var := .Values.config.database.url_env }}
+            - name: {{ $var }}
               valueFrom:
                 secretKeyRef:
                   name: {{ .Values.secret.name }}
-                  key: {{ index .Values.secretEnv "LLMGATE_DATABASE_URL" }}
+                  key: {{ required (printf "secretEnv needs an entry for %s, the database URL" $var) (index .Values.secretEnv $var) }}
           securityContext:
             {{- include "llmgate.securityContext" . | nindent 12 }}
           volumeMounts:
@@ -37,5 +38,5 @@ spec:
       volumes:
         - name: config
           configMap:
-            name: {{ include "llmgate.name" . }}-config
+            name: {{ include "llmgate.name" . }}-migrate-config
 {{- end }}
