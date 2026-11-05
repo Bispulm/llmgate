@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/http/pprof"
 	"sync"
 	"time"
 
@@ -159,7 +160,14 @@ func serve(ctx context.Context, configPath string, p process) error {
 		addrs.Metrics = metricsListener.Addr().String()
 		mux := http.NewServeMux()
 		mux.Handle("GET /metrics", gatewayMetrics.Handler())
-		metricsServer = &http.Server{Handler: mux, ReadHeaderTimeout: 10 * time.Second, WriteTimeout: 30 * time.Second}
+		if cfg.Metrics.PProf {
+			mux.HandleFunc("/debug/pprof/", pprof.Index)
+			mux.HandleFunc("/debug/pprof/cmdline", pprof.Cmdline)
+			mux.HandleFunc("/debug/pprof/profile", pprof.Profile)
+			mux.HandleFunc("/debug/pprof/symbol", pprof.Symbol)
+			mux.HandleFunc("/debug/pprof/trace", pprof.Trace)
+		}
+		metricsServer = &http.Server{Handler: mux, ReadHeaderTimeout: 10 * time.Second, WriteTimeout: 2 * time.Minute}
 		go func() { serveErr <- metricsServer.Serve(metricsListener) }()
 		logger.Info("metrics listening", "addr", addrs.Metrics)
 	}

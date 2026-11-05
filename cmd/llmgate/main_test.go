@@ -502,6 +502,48 @@ func TestServeExportsMetricsOnTheirOwnListener(t *testing.T) {
 	if status, _ := get("http://" + addrs.Gateway + "/metrics"); status != http.StatusNotFound {
 		t.Fatalf("the gateway's listener serves metrics: %d", status)
 	}
+	// Profiling is off unless asked for.
+	if status, _ := get("http://" + addrs.Metrics + "/debug/pprof/"); status != http.StatusNotFound {
+		t.Fatalf("pprof without asking: %d", status)
+	}
+}
+
+func TestProfilingCanBeTurnedOnForTheMetricsListener(t *testing.T) {
+	config := testConfig + "metrics:\n  listen: 127.0.0.1:0\n  pprof: true\n"
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(path, []byte(config), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	started := make(chan listening, 1)
+	done := make(chan error, 1)
+	go func() {
+		done <- run(ctx, []string{"serve", "--config", path}, process{getenv: testEnv, stdout: io.Discard, stderr: io.Discard, started: func(l listening) { started <- l }})
+	}()
+	var addrs listening
+	select {
+	case addrs = <-started:
+	case err := <-done:
+		t.Fatalf("serve returned early: %v", err)
+	}
+	defer func() {
+		cancel()
+		if err := <-done; err != nil {
+			t.Error(err)
+		}
+	}()
+	resp, err := http.Get("http://" + addrs.Metrics + "/debug/pprof/heap?debug=1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK || !strings.Contains(string(body), "heap profile") {
+		t.Fatalf("status %d", resp.StatusCode)
+	}
+	if resp, err := http.Get("http://" + addrs.Gateway + "/debug/pprof/"); err != nil || resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("the gateway's listener serves pprof")
+	}
 }
 
 // Traces reach a configured OTLP endpoint, and the last ones are flushed at shutdown.

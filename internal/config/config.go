@@ -191,6 +191,9 @@ func (d *Decimal) UnmarshalYAML(node *yaml.Node) error {
 type Metrics struct {
 	Listen           string `yaml:"listen"`
 	AllowNonLoopback bool   `yaml:"allow_non_loopback"`
+	// PProf serves Go's profiling endpoints under /debug/pprof on the same listener. A
+	// profile reveals nothing about requests, but it does cost CPU, so it's off unless set.
+	PProf bool `yaml:"pprof"`
 }
 
 // Tracing exports OpenTelemetry traces over OTLP/HTTP, and is off unless an endpoint is

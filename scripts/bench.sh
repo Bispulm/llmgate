@@ -112,7 +112,7 @@ auth: {mode: tenant}
 database: {url_env: BENCH_DATABASE_URL}
 redis: {url_env: BENCH_REDIS_URL, key_prefix: "bench:"}
 admin: {listen: 127.0.0.1:18302, token_env: BENCH_ADMIN_TOKEN}
-metrics: {listen: 127.0.0.1:18303}
+metrics: {listen: 127.0.0.1:18303, pprof: true}
 pricing:
   version: bench-1
   prices:
@@ -175,7 +175,11 @@ tenant_config >"$WORK/tenant.yaml"
 "$WORK/llmgate" migrate --config "$WORK/tenant.yaml" >/dev/null
 start_gateway "$WORK/tenant.yaml"
 KEY=$(team_key bench)
+# A CPU profile of the gateway while it serves the non-streaming run, after warm-up.
+(sleep "${WARMUP%s}"; curl -s "http://127.0.0.1:18303/debug/pprof/profile?seconds=10" >"$OUT/tenant-cpu.pprof") & PROFILE_PID=$!
 bench tenant "$GATEWAY" "$KEY" bench
+wait "$PROFILE_PID"
+go tool pprof -top -nodecount=25 "$WORK/llmgate" "$OUT/tenant-cpu.pprof" >"$OUT/tenant-cpu.txt" 2>/dev/null || true
 bench tenant-stream "$GATEWAY" "$KEY" bench -stream
 stop_gateway
 
@@ -240,6 +244,14 @@ section "Report"
   echo "The provider allows 8 attempts at once. A noisy team keeps 64 requests in flight, and a quiet team 2. The quiet team alone, then beside the noisy one:"
   echo
   "$WORK/llmgate-bench" compare "$OUT/quiet-alone.json" "$OUT/quiet-beside-noisy.json" "$OUT/noisy.json"
+  echo
+  echo "## Where tenant mode spends CPU"
+  echo
+  echo "A 10-second CPU profile of the gateway during the non-streaming tenant run, top 25 functions:"
+  echo
+  echo '```'
+  sed -n '1,40p' "$OUT/tenant-cpu.txt"
+  echo '```'
   echo
   echo "## Liability and settlement"
   echo
