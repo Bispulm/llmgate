@@ -6,6 +6,7 @@ package api
 import (
 	"context"
 	"crypto/rand"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"sync/atomic"
@@ -15,6 +16,8 @@ import (
 	"github.com/Bispulm/llmgate/internal/auth"
 	"github.com/Bispulm/llmgate/internal/routing"
 )
+
+const waitForRequestsInterval = 10 * time.Millisecond
 
 // Limits bounds what one request can consume. A zero duration disables that
 // timer. Configuration always sets them, so this only affects tests.
@@ -50,6 +53,7 @@ type Server struct {
 	limits   Limits
 	mux      *http.ServeMux
 	draining atomic.Bool
+	inflight atomic.Int64
 }
 
 // New returns a Server. Without an Authenticator every request is rejected, so a
@@ -96,6 +100,9 @@ func New(opts Options) *Server {
 // because net/http reads an unread body itself when a handler finishes. The chat
 // endpoint clears it once it has the whole body.
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	s.inflight.Add(1)
+	defer s.inflight.Add(-1)
+
 	rc := http.NewResponseController(w)
 	s.extendWriteDeadline(rc)
 	if s.limits.BodyReadTimeout > 0 {
@@ -119,6 +126,22 @@ func (s *Server) extendWriteDeadline(rc *http.ResponseController) {
 		// Unsupported only for test recorders, which have no connection to stall.
 		_ = rc.SetWriteDeadline(time.Now().Add(s.limits.ClientWriteTimeout))
 	}
+}
+
+// WaitForRequests blocks until no request is being handled, or ctx ends. A handler
+// records its attempt before it finishes, so a process that waits for this before
+// exiting doesn't lose those records.
+func (s *Server) WaitForRequests(ctx context.Context) error {
+	ticker := time.NewTicker(waitForRequestsInterval)
+	defer ticker.Stop()
+	for s.inflight.Load() > 0 {
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("waiting for requests to finish: %w", ctx.Err())
+		case <-ticker.C:
+		}
+	}
+	return nil
 }
 
 // SetDraining makes readiness fail, so that load balancers stop sending new
