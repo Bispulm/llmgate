@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/Bispulm/llmgate/internal/chat"
+	"github.com/Bispulm/llmgate/internal/limits"
 	"github.com/Bispulm/llmgate/internal/provider"
 )
 
@@ -20,6 +21,9 @@ const (
 	errTypeAuthentication = "authentication_error"
 	errTypeRateLimit      = "rate_limit_error"
 	errTypeUpstream       = "upstream_error"
+	errTypeServer         = "server_error"
+	// errTypeQuota matches what SDKs already treat as not worth retrying.
+	errTypeQuota = "insufficient_quota"
 
 	codeInvalidAPIKey         = "invalid_api_key"
 	codeModelNotFound         = "model_not_found"
@@ -40,7 +44,14 @@ const (
 	codeNoCapableRoute        = "no_capable_route"
 	codeNoRouteAvailable      = "no_route_available"
 	codeCapacityExceeded      = "capacity_exceeded"
+	codeBudgetExhausted       = "budget_exhausted"
+	codeAccountingUnavailable = "accounting_unavailable"
+	codeRateLimitExceeded     = "rate_limit_exceeded"
+	codeRateLimitUnavailable  = "rate_limit_unavailable"
 )
+
+// outageRetryAfter is a short hint, for dependencies that usually come back quickly.
+const outageRetryAfter = time.Second
 
 // apiError is an error returned to a client.
 type apiError struct {
@@ -170,6 +181,55 @@ func upstreamError(e *provider.Error) *apiError {
 		out.Message = "the provider request failed"
 	}
 	return out
+}
+
+// budgetExhausted has no retry hint, because waiting won't help until the budget changes.
+func budgetExhausted() *apiError {
+	return &apiError{
+		Status:  http.StatusTooManyRequests,
+		Type:    errTypeQuota,
+		Code:    codeBudgetExhausted,
+		Message: "this team's budget can't cover the most this request could cost",
+	}
+}
+
+// accountingUnavailable is how budgets fail closed: if spending can't be checked, nothing
+// is spent.
+func accountingUnavailable() *apiError {
+	return &apiError{
+		Status:     http.StatusServiceUnavailable,
+		Type:       errTypeServer,
+		Code:       codeAccountingUnavailable,
+		Message:    "the gateway can't check this team's budget right now",
+		RetryAfter: outageRetryAfter,
+	}
+}
+
+func rateLimitUnavailable() *apiError {
+	return &apiError{
+		Status:     http.StatusServiceUnavailable,
+		Type:       errTypeServer,
+		Code:       codeRateLimitUnavailable,
+		Message:    "the gateway can't check this team's rate limits right now",
+		RetryAfter: outageRetryAfter,
+	}
+}
+
+func teamLimited(decision limits.Decision) *apiError {
+	message := "this team has too many requests in flight"
+	switch decision.Reason {
+	case limits.ReasonRequests:
+		message = "this team is over its request rate limit"
+	case limits.ReasonTokens:
+		message = "this team is over its token rate limit"
+	}
+	return &apiError{
+		Status:     http.StatusTooManyRequests,
+		Type:       errTypeRateLimit,
+		Code:       codeRateLimitExceeded,
+		Message:    message,
+		RetryAfter: decision.RetryAfter,
+	}
 }
 
 // streamInterrupted is the error event sent when a committed stream fails.

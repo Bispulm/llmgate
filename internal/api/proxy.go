@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"errors"
 	"io"
+	"log/slog"
 	"net/http"
 	"os"
 	"strconv"
@@ -29,9 +30,29 @@ const (
 
 	// budgetEnforcementNone says plainly that no budget protects this request.
 	budgetEnforcementNone = "none"
+	// budgetEnforcementStrict says the ledger admitted this request's attempts.
+	budgetEnforcementStrict = "strict"
 
 	// capacityRetryAfter is a short hint, because a slot could free at any moment.
 	capacityRetryAfter = time.Second
+
+	// admissionTimeout bounds reserving and marking an attempt, so that a database that
+	// has hung refuses requests soon, rather than holding them until their deadline.
+	admissionTimeout = 5 * time.Second
+	// reserveLease is how long a reservation can go unsent before a reconciler may release
+	// it. It's only ever that long if this replica stopped between two statements.
+	reserveLease = time.Minute
+	// leaseMargin is added to the longest an attempt could run, because a lease running out
+	// early hands a live attempt to a reconciler. That costs accuracy, but not money, and a
+	// late settlement corrects it.
+	leaseMargin = 30 * time.Second
+	// noDeadlineLease is used when no request timeout is configured, which only tests do.
+	noDeadlineLease = time.Hour
+
+	// settleTries and settleBackoff retry a brief database failure. Past that the attempt
+	// stays open with its liability held, and a reconciler resolves it.
+	settleTries   = 4
+	settleBackoff = 50 * time.Millisecond
 )
 
 // Causes for canceling an attempt, which separate a timeout from a client leaving.
@@ -61,7 +82,11 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	id := rand.Text()
 	header := w.Header()
 	header.Set("X-Request-Id", id)
-	header.Set(headerBudgetEnforcement, budgetEnforcementNone)
+	if s.ledger != nil {
+		header.Set(headerBudgetEnforcement, budgetEnforcementStrict)
+	} else {
+		header.Set(headerBudgetEnforcement, budgetEnforcementNone)
+	}
 
 	if r.Method != http.MethodPost {
 		header.Set("Allow", http.MethodPost)
@@ -87,6 +112,14 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		})
 		return
 	}
+
+	// Limits come before the body too, so a team over its limit costs little to refuse.
+	releaseTeam, apiErr := s.admitTeam(r.Context(), principal, id)
+	if apiErr != nil {
+		writeError(w, apiErr)
+		return
+	}
+	defer releaseTeam()
 
 	rc := http.NewResponseController(w)
 	body, apiErr := s.readBody(w, r)
@@ -185,8 +218,9 @@ func (s *Server) runAttempts(ctx context.Context, x *exchange, alias *routing.Al
 			continue
 		}
 
-		// Capacity comes before the attempt, because a route that was never called
-		// isn't an attempt, costs nothing, and says nothing about the route's health.
+		// Capacity comes before the attempt and its reservation, because a route that was
+		// never called isn't an attempt, costs nothing, and says nothing about the route's
+		// health. Queueing first also means waiting doesn't tie up a team's budget.
 		release, err := selected.Route.Limiter.Acquire(ctx, x.principal.TeamID)
 		if err != nil {
 			selected.Abandon()
@@ -200,12 +234,21 @@ func (s *Server) runAttempts(ctx context.Context, x *exchange, alias *routing.Al
 			break
 		}
 
-		x.attempts++
-		lastRoute = routeName(selected.Route)
-		failure := s.attemptWithSlot(ctx, x, selected, reason, release)
+		failure, err := s.attemptWithSlot(ctx, x, selected, reason, release)
+		if errors.Is(err, accounting.ErrNoPrice) {
+			plan.NoteUnpriced()
+			s.logger.LogAttrs(ctx, slog.LevelWarn, "a route has no price, so it can't be used",
+				slog.String("provider", selected.Route.ProviderName), slog.String("model", selected.Route.Model))
+			continue
+		}
+		if err != nil {
+			s.refuseAttempt(ctx, x, err, lastRoute)
+			return
+		}
 		if failure == nil {
 			return
 		}
+		lastRoute = routeName(selected.Route)
 		last = failure
 		reason = accounting.ReasonFallback
 		if !routing.Classify(failure).Failover || ctx.Err() != nil {
@@ -237,16 +280,118 @@ func sleep(ctx context.Context, d time.Duration) bool {
 // attemptWithSlot runs an attempt holding what it was given. net/http recovers a panic
 // and keeps serving, so these have to come back even then, or capacity and breaker
 // probes would drain away until the gateway stopped serving.
-func (s *Server) attemptWithSlot(ctx context.Context, x *exchange, selected *routing.Selected, reason accounting.Reason, release func()) *provider.Error {
+//
+// An error means nothing was sent, and that the ledger refused or couldn't be asked. A
+// provider failure is the other result, and only one of the two is ever set.
+func (s *Server) attemptWithSlot(ctx context.Context, x *exchange, selected *routing.Selected, reason accounting.Reason, release func()) (*provider.Error, error) {
 	defer release()
 	defer selected.Abandon()
-	return s.attempt(ctx, x, selected, reason)
+	reservation, err := s.reserve(ctx, x, selected)
+	if err != nil {
+		return nil, err
+	}
+	x.attempts++
+	return s.attempt(ctx, x, selected, reason, reservation), nil
+}
+
+// reserve holds the most this attempt could cost, then commits the intent to send it. Both
+// have to succeed before anything is sent, because that's what lets a crash at any point be
+// resolved conservatively: see ADR 0002. Without a ledger there's nothing to hold, and the
+// response says so in its enforcement header.
+func (s *Server) reserve(ctx context.Context, x *exchange, selected *routing.Selected) (*accounting.Reservation, error) {
+	if s.ledger == nil {
+		return nil, nil
+	}
+	admitCtx, cancel := context.WithTimeout(ctx, admissionTimeout)
+	defer cancel()
+
+	reservation, err := s.ledger.Reserve(admitCtx, accounting.ReserveRequest{
+		RequestID:   x.id,
+		TeamID:      x.principal.TeamID,
+		KeyID:       x.principal.KeyID,
+		Alias:       x.alias,
+		Stream:      x.req.Stream,
+		Number:      x.attempts + 1,
+		Provider:    selected.Route.ProviderName,
+		Model:       selected.Route.Model,
+		InputBound:  accounting.InputBound(x.req),
+		OutputBound: x.req.MaxOutputTokens,
+		Lease:       reserveLease,
+	})
+	if err != nil {
+		return nil, err
+	}
+	if err := s.ledger.MarkDispatched(admitCtx, reservation.AttemptID, s.dispatchLease(ctx)); err != nil {
+		// This replica knows nothing was sent, whatever that call managed to do, so the
+		// money can come back now. If it can't, a reconciler gets to it later: a reserved
+		// attempt is released, and a dispatched one is charged conservatively.
+		s.settle(ctx, reservation, accounting.Attempt{Outcome: accounting.OutcomeNotSent, Delivery: provider.DeliveryNotSent})
+		return nil, err
+	}
+	return reservation, nil
+}
+
+// dispatchLease is longer than an attempt can run, so that a reconciler only takes over an
+// attempt whose owner has gone.
+func (s *Server) dispatchLease(ctx context.Context) time.Duration {
+	deadline, ok := ctx.Deadline()
+	if !ok {
+		return noDeadlineLease
+	}
+	return time.Until(deadline) + s.limits.ClientWriteTimeout + recordTimeout + leaseMargin
+}
+
+// refuseAttempt answers a request whose attempt the ledger wouldn't admit. Nothing was
+// sent for this attempt, although an earlier one may have failed.
+func (s *Server) refuseAttempt(ctx context.Context, x *exchange, err error, lastRoute string) {
+	if x.r.Context().Err() != nil {
+		return // Nobody is left to tell.
+	}
+	s.extendWriteDeadline(x.rc)
+	header := x.w.Header()
+	header.Set(headerAttempts, strconv.Itoa(x.attempts))
+	if lastRoute != "" {
+		header.Set(headerRoute, lastRoute)
+	}
+	switch {
+	case errors.Is(err, accounting.ErrBudgetExhausted):
+		writeError(x.w, budgetExhausted())
+	case ctx.Err() != nil:
+		// The request ran out of time, which isn't the ledger's fault.
+		writeError(x.w, upstreamError(&provider.Error{Kind: provider.KindTimeout, Delivery: provider.DeliveryNotSent, Err: err}))
+	default:
+		s.logger.LogAttrs(ctx, slog.LevelError, "the ledger could not admit an attempt", attrRequestID(x.id), slog.Any("error", err))
+		writeError(x.w, accountingUnavailable())
+	}
+}
+
+// admitTeam applies the limits a team is promised across replicas. The returned function
+// gives back its in-flight slot. Budgets don't depend on any of this.
+func (s *Server) admitTeam(ctx context.Context, principal auth.Principal, requestID string) (func(), *apiError) {
+	if s.teamLimiter == nil {
+		return func() {}, nil
+	}
+	decision, release, err := s.teamLimiter.Admit(ctx, principal.TeamID, limits.TeamLimits(principal.Limits), requestID, s.inFlightHold())
+	if err != nil {
+		s.logger.LogAttrs(ctx, slog.LevelWarn, "team limits could not be checked", attrRequestID(requestID), slog.Any("error", err))
+		return nil, rateLimitUnavailable()
+	}
+	if !decision.Allowed {
+		return nil, teamLimited(decision)
+	}
+	return release, nil
+}
+
+// inFlightHold is the most a request could run, after which its slot expires by itself if
+// this replica has crashed.
+func (s *Server) inFlightHold() time.Duration {
+	return s.limits.BodyReadTimeout + s.limits.RequestTimeout + s.limits.ClientWriteTimeout + recordTimeout + leaseMargin
 }
 
 // attempt makes one upstream attempt and records it. A nil result means the response
 // is finished with, even if it failed partway: only a failure from before commit is
 // returned, because that's the only kind another route could still rescue.
-func (s *Server) attempt(ctx context.Context, x *exchange, selected *routing.Selected, reason accounting.Reason) *provider.Error {
+func (s *Server) attempt(ctx context.Context, x *exchange, selected *routing.Selected, reason accounting.Reason, reservation *accounting.Reservation) *provider.Error {
 	start := time.Now()
 	record := accounting.Attempt{
 		RequestID: x.id,
@@ -261,6 +406,8 @@ func (s *Server) attempt(ctx context.Context, x *exchange, selected *routing.Sel
 	}
 	defer func() {
 		record.Duration = time.Since(start)
+		s.settle(ctx, reservation, record)
+		s.debitTokens(ctx, x, record.Usage)
 		s.record(ctx, record)
 	}()
 
@@ -268,6 +415,58 @@ func (s *Server) attempt(ctx context.Context, x *exchange, selected *routing.Sel
 		return s.streamAttempt(ctx, x, selected, &record)
 	}
 	return s.completionAttempt(ctx, x, selected, &record)
+}
+
+// settle reports how an attempt ended to the ledger, on a context of its own: a client
+// leaving doesn't mean the attempt was free, and doesn't stop it being accounted for. If
+// this can't finish, the attempt stays open with its liability held.
+func (s *Server) settle(requestCtx context.Context, reservation *accounting.Reservation, record accounting.Attempt) {
+	if reservation == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(requestCtx), recordTimeout)
+	defer cancel()
+
+	finish := accounting.FinishRequest{
+		AttemptID:      reservation.AttemptID,
+		Outcome:        record.Outcome,
+		ErrorKind:      record.ErrorKind,
+		Delivery:       record.Delivery,
+		UpstreamStatus: record.UpstreamStatus,
+		UpstreamCode:   record.UpstreamCode,
+		Usage:          record.Usage,
+	}
+	var err error
+	for try, backoff := 0, settleBackoff; try < settleTries; try, backoff = try+1, backoff*2 {
+		var settlement accounting.Settlement
+		settlement, err = s.ledger.Finish(ctx, finish)
+		if err == nil {
+			if settlement.OverReservation {
+				s.logger.LogAttrs(ctx, slog.LevelWarn, "an attempt cost more than was reserved",
+					slog.String("attempt_id", reservation.AttemptID), slog.Int64("charge_micros", settlement.ChargeMicros), slog.Int64("reserved_micros", reservation.ReservedMicros))
+			}
+			return
+		}
+		if try < settleTries-1 && !sleep(ctx, backoff) {
+			break
+		}
+	}
+	s.logger.LogAttrs(ctx, slog.LevelError, "an attempt could not be settled, and a reconciler will resolve it",
+		slog.String("attempt_id", reservation.AttemptID), slog.Any("error", err))
+}
+
+// debitTokens spends what a provider reported against the team's limit. This isn't money,
+// so failing is only worth a log line: the limit is a little looser during an outage.
+func (s *Server) debitTokens(requestCtx context.Context, x *exchange, usage *chat.Usage) {
+	if s.teamLimiter == nil || !usage.Reportable() {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(requestCtx), recordTimeout)
+	defer cancel()
+	tokens := usage.PromptTokens + usage.CompletionTokens
+	if err := s.teamLimiter.DebitTokens(ctx, x.principal.TeamID, limits.TeamLimits(x.principal.Limits), tokens); err != nil {
+		s.logger.LogAttrs(ctx, slog.LevelWarn, "tokens could not be counted against a team's limit", attrRequestID(x.id), slog.Any("error", err))
+	}
 }
 
 // record reports an attempt on a context of its own: the request may already be
@@ -476,8 +675,15 @@ func (s *Server) completionAttempt(parent context.Context, x *exchange, selected
 	s.extendWriteDeadline(x.rc)
 	x.setRouteHeaders(selected)
 	x.w.Header().Set("Content-Type", "application/json")
+	// Settling happens after this and shouldn't delay the client, so the response goes out
+	// now. Declaring the length keeps it from being chunked by the flush.
+	x.w.Header().Set("Content-Length", strconv.Itoa(len(body)))
 	x.w.WriteHeader(http.StatusOK)
-	if _, err := x.w.Write(body); err != nil {
+	_, err = x.w.Write(body)
+	if err == nil {
+		err = x.rc.Flush()
+	}
+	if err != nil {
 		if errors.Is(err, os.ErrDeadlineExceeded) {
 			record.Outcome = accounting.OutcomeClientStalled
 		} else {

@@ -31,6 +31,8 @@ const (
 	OutcomeClientCanceled Outcome = "client_canceled"
 	// OutcomeClientStalled means the client stopped reading until a write timed out.
 	OutcomeClientStalled Outcome = "client_stalled"
+	// OutcomeNotSent means the attempt was reserved, but the gateway never sent it.
+	OutcomeNotSent Outcome = "not_sent"
 )
 
 // Reason says why this attempt was made. The values are a small fixed set, so they
