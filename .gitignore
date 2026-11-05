@@ -1,0 +1,14 @@
+# Build output
+/bin/
+/dist/
+
+# Test and profiling artifacts
+*.test
+*.out
+*.prof
+coverage.*
+
+# Local configuration and environment files
+.env
+.env.*
+!.env.example
