@@ -1,0 +1,87 @@
+# Values for the llmgate chart. Postgres and Redis aren't part of the chart: point the
+# gateway at your own, through the Secret named in secret.name.
+
+image:
+  repository: llmgate
+  tag: dev
+  pullPolicy: IfNotPresent
+
+replicaCount: 2
+
+# The Secret holding credentials, with these keys:
+#   database-url, redis-url, admin-token, and one per provider (see config.providers).
+# The chart never creates it, so credentials stay out of values files.
+secret:
+  name: llmgate
+
+# Runs `llmgate migrate` as a hook before install and upgrade. The gateway never
+# migrates by itself.
+migrate:
+  enabled: true
+
+# A deterministic mock provider, for demos and tests. It never calls a real provider.
+mock:
+  enabled: false
+
+# The gateway's configuration file, as documented in docs/admin.md. Credentials are
+# named by environment variable here, and come from the Secret.
+config:
+  server:
+    listen: 0.0.0.0:18300
+    # Keep serving while not ready, so Services stop sending new connections first.
+    drain_delay: 5s
+    shutdown_timeout: 25s
+  auth:
+    mode: tenant
+    key_cache_ttl: 30s
+  database:
+    url_env: LLMGATE_DATABASE_URL
+  redis:
+    url_env: LLMGATE_REDIS_URL
+  admin:
+    # Reachable only through its own ClusterIP Service, behind the admin token.
+    listen: 0.0.0.0:18302
+    token_env: LLMGATE_ADMIN_TOKEN
+    allow_non_loopback: true
+  metrics:
+    listen: 0.0.0.0:18303
+    allow_non_loopback: true
+  pricing:
+    version: demo-2026-11-05
+    prices:
+      - provider: mock
+        model: alpha;tokens=5;interval=100ms
+        input_usd_per_mtok: "3.00"
+        cached_input_usd_per_mtok: "0.30"
+        cache_write_usd_per_mtok: "3.75"
+        output_usd_per_mtok: "15.00"
+  providers:
+    - name: mock
+      type: openai-compatible
+      base_url: http://llmgate-mock:18301/v1
+      api_key_env: LLMGATE_MOCK_PROVIDER_KEY
+      allow_insecure_http: true
+  models:
+    - alias: demo-fast
+      max_output_tokens: 256
+      routes:
+        - provider: mock
+          model: alpha;tokens=5;interval=100ms
+
+# Environment variables read from the Secret, by variable name and Secret key. Add one
+# per provider credential.
+secretEnv:
+  LLMGATE_DATABASE_URL: database-url
+  LLMGATE_REDIS_URL: redis-url
+  LLMGATE_ADMIN_TOKEN: admin-token
+  LLMGATE_MOCK_PROVIDER_KEY: mock-provider-key
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 64Mi
+  limits:
+    memory: 256Mi
+
+podDisruptionBudget:
+  minAvailable: 1

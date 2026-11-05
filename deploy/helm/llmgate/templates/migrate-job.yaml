@@ -1,0 +1,41 @@
+{{- if .Values.migrate.enabled }}
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ include "llmgate.name" . }}-migrate
+  labels:
+    {{- include "llmgate.labels" . | nindent 4 }}
+  annotations:
+    helm.sh/hook: pre-install,pre-upgrade
+    helm.sh/hook-weight: "0"
+    helm.sh/hook-delete-policy: before-hook-creation,hook-succeeded
+spec:
+  backoffLimit: 3
+  template:
+    spec:
+      restartPolicy: Never
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+      containers:
+        - name: migrate
+          image: {{ include "llmgate.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args: ["migrate", "--config", "/etc/llmgate/config.yaml"]
+          env:
+            - name: LLMGATE_DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.secret.name }}
+                  key: {{ index .Values.secretEnv "LLMGATE_DATABASE_URL" }}
+          securityContext:
+            {{- include "llmgate.securityContext" . | nindent 12 }}
+          volumeMounts:
+            - {name: config, mountPath: /etc/llmgate, readOnly: true}
+      volumes:
+        - name: config
+          configMap:
+            name: {{ include "llmgate.name" . }}-config
+{{- end }}
