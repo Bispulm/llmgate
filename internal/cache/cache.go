@@ -98,6 +98,9 @@ type Options struct {
 	MaxEntryBytes int
 	// MaxFlights bounds duplicate suppression. Zero uses DefaultMaxFlights.
 	MaxFlights int
+	// OnFailure hears about a Redis failure, at most once each time the cache stops using
+	// Redis for a moment, so that an outage is visible without flooding logs.
+	OnFailure func(error)
 }
 
 // Cache stores responses. Its size is bounded by each entry's size and TTL, and Redis's
@@ -107,6 +110,7 @@ type Cache struct {
 	prefix     string
 	maxEntry   int
 	maxFlights int
+	onFailure  func(error)
 	downUntil  atomic.Int64
 
 	mu      sync.Mutex
@@ -121,7 +125,8 @@ type flight struct {
 
 // New returns a Cache.
 func New(opts Options) *Cache {
-	c := &Cache{client: opts.Client, prefix: opts.Prefix, maxEntry: opts.MaxEntryBytes, maxFlights: opts.MaxFlights, flights: make(map[string]*flight)}
+	c := &Cache{client: opts.Client, prefix: opts.Prefix, maxEntry: opts.MaxEntryBytes, maxFlights: opts.MaxFlights,
+		onFailure: opts.OnFailure, flights: make(map[string]*flight)}
 	if c.maxEntry <= 0 {
 		c.maxEntry = DefaultMaxEntryBytes
 	}
@@ -148,6 +153,9 @@ func (c *Cache) run(ctx context.Context, call func(context.Context) error) error
 	err := call(opCtx)
 	if err != nil && !errors.Is(err, redis.Nil) && ctx.Err() == nil {
 		c.downUntil.Store(time.Now().Add(outageRetryInterval).UnixNano())
+		if c.onFailure != nil {
+			c.onFailure(err)
+		}
 	}
 	return err
 }
