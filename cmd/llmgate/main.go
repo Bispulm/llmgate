@@ -15,8 +15,13 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/Bispulm/llmgate/internal/accounting"
 	"github.com/Bispulm/llmgate/internal/api"
+	"github.com/Bispulm/llmgate/internal/auth"
 	"github.com/Bispulm/llmgate/internal/config"
+	"github.com/Bispulm/llmgate/internal/provider"
+	"github.com/Bispulm/llmgate/internal/provider/openai"
+	"github.com/Bispulm/llmgate/internal/routing"
 )
 
 const usage = "usage: llmgate serve -config <path>"
@@ -60,12 +65,31 @@ func serve(ctx context.Context, args []string, getenv func(string) string, stder
 	if err != nil {
 		return err
 	}
-	if _, err := cfg.ResolveSecrets(getenv); err != nil {
+	secrets, err := cfg.ResolveSecrets(getenv)
+	if err != nil {
+		return err
+	}
+	routes, err := buildRoutes(cfg, secrets)
+	if err != nil {
 		return err
 	}
 
 	logger := slog.New(slog.NewJSONHandler(stderr, nil))
-	handler := api.New(api.Options{Logger: logger})
+	logger.Warn("budgets are not enforced and usage is only logged: this build is for local development")
+	handler := api.New(api.Options{
+		Logger:   logger,
+		Auth:     auth.NewDevKey(secrets.DevKey),
+		Routes:   routes,
+		Recorder: accounting.NewLogRecorder(logger),
+		Limits: api.Limits{
+			MaxRequestBytes:    cfg.Limits.MaxRequestBytes,
+			RequestTimeout:     cfg.Limits.RequestTimeout,
+			FirstEventTimeout:  cfg.Limits.FirstEventTimeout,
+			StreamIdleTimeout:  cfg.Limits.StreamIdleTimeout,
+			ClientWriteTimeout: cfg.Limits.ClientWriteTimeout,
+			BodyReadTimeout:    cfg.Limits.BodyReadTimeout,
+		},
+	})
 
 	var lc net.ListenConfig
 	listener, err := lc.Listen(ctx, "tcp", cfg.Server.Listen)
@@ -115,4 +139,32 @@ func serve(ctx context.Context, args []string, getenv func(string) string, stder
 		return fmt.Errorf("serving: %w", err)
 	}
 	return nil
+}
+
+// buildRoutes creates each configured provider and the alias table that uses them.
+func buildRoutes(cfg *config.Config, secrets *config.Secrets) (*routing.Table, error) {
+	providers := make(map[string]provider.Provider, len(cfg.Providers))
+	for _, p := range cfg.Providers {
+		adapter, err := openai.New(openai.Options{
+			BaseURL:          p.BaseURL,
+			APIKey:           secrets.ProviderKeys[p.Name],
+			UseMaxTokens:     p.MaxTokensParam == config.MaxTokens,
+			MaxResponseBytes: cfg.Limits.MaxResponseBytes,
+			MaxEventBytes:    cfg.Limits.MaxEventBytes,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("provider %q: %w", p.Name, err)
+		}
+		providers[p.Name] = adapter
+	}
+
+	aliases := make([]routing.Alias, len(cfg.Models))
+	for i, m := range cfg.Models {
+		routes := make([]routing.Route, len(m.Routes))
+		for j, r := range m.Routes {
+			routes[j] = routing.Route{ProviderName: r.Provider, Provider: providers[r.Provider], Model: r.Model}
+		}
+		aliases[i] = routing.Alias{Name: m.Alias, MaxOutputTokens: m.MaxOutputTokens, Routes: routes}
+	}
+	return routing.NewTable(aliases), nil
 }
