@@ -1,0 +1,30 @@
+{
+  "label": "dev-c1",
+  "url": "http://127.0.0.1:18300/v1/chat/completions",
+  "model": "bench",
+  "stream": false,
+  "concurrency": 1,
+  "duration": "10s",
+  "warmup": "2s",
+  "requests": 65197,
+  "ok": 65197,
+  "errors": {},
+  "throughput_rps": 6519.7,
+  "latency_ms": {
+    "p50": 0.145,
+    "p95": 0.201,
+    "p99": 0.346,
+    "max": 5.763,
+    "mean": 0.153
+  },
+  "ttfb_ms": {
+    "p50": 0.143,
+    "p95": 0.198,
+    "p99": 0.343,
+    "max": 5.757,
+    "mean": 0.151
+  },
+  "started_at": "2026-11-05T21:46:14.517183Z",
+  "go_version": "go1.27.3",
+  "gomaxprocs": 14
+}

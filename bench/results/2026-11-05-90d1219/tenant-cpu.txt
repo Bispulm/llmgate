@@ -1,0 +1,33 @@
+File: llmgate
+Type: cpu
+Time: 2026-11-05 15:33:10 CST
+Duration: 10.10s, Total samples = 4.42s (43.74%)
+Showing nodes accounting for 4.29s, 97.06% of 4.42s total
+Dropped 56 nodes (cum <= 0.02s)
+Showing top 25 nodes out of 190
+      flat  flat%   sum%        cum   cum%
+     1.59s 35.97% 35.97%      1.59s 35.97%  syscall.rawsyscalln
+     1.36s 30.77% 66.74%      1.36s 30.77%  runtime.kevent
+     0.65s 14.71% 81.45%      0.65s 14.71%  runtime.pthread_cond_signal
+     0.53s 11.99% 93.44%      0.53s 11.99%  runtime.pthread_cond_wait
+     0.11s  2.49% 95.93%      0.11s  2.49%  runtime.usleep
+     0.03s  0.68% 96.61%      0.03s  0.68%  runtime.pthread_kill
+     0.01s  0.23% 96.83%      0.03s  0.68%  runtime.scanblock
+     0.01s  0.23% 97.06%      0.03s  0.68%  runtime.stealWork
+         0     0% 97.06%      0.17s  3.85%  _.goready.func1
+         0     0% 97.06%      0.33s  7.47%  bufio.(*Reader).Peek
+         0     0% 97.06%      0.33s  7.47%  bufio.(*Reader).fill
+         0     0% 97.06%      0.26s  5.88%  bufio.(*Writer).Flush
+         0     0% 97.06%      0.43s  9.73%  github.com/Bispulm/llmgate/internal/accounting.(*Ledger).Finish
+         0     0% 97.06%      0.25s  5.66%  github.com/Bispulm/llmgate/internal/accounting.(*Ledger).Finish.func1
+         0     0% 97.06%      0.10s  2.26%  github.com/Bispulm/llmgate/internal/accounting.(*Ledger).MarkDispatched
+         0     0% 97.06%      0.15s  3.39%  github.com/Bispulm/llmgate/internal/accounting.(*Ledger).Reserve
+         0     0% 97.06%      0.15s  3.39%  github.com/Bispulm/llmgate/internal/accounting.(*Ledger).reserveInOneStatement
+         0     0% 97.06%      0.14s  3.17%  github.com/Bispulm/llmgate/internal/accounting.(*LogRecorder).RecordAttempt
+         0     0% 97.06%      0.08s  1.81%  github.com/Bispulm/llmgate/internal/accounting.lockAttempt
+         0     0% 97.06%      0.17s  3.85%  github.com/Bispulm/llmgate/internal/accounting.settle
+         0     0% 97.06%      1.36s 30.77%  github.com/Bispulm/llmgate/internal/api.(*Server).ServeHTTP
+         0     0% 97.06%      0.22s  4.98%  github.com/Bispulm/llmgate/internal/api.(*Server).admitTeam
+         0     0% 97.06%      0.81s 18.33%  github.com/Bispulm/llmgate/internal/api.(*Server).attempt
+         0     0% 97.06%      0.68s 15.38%  github.com/Bispulm/llmgate/internal/api.(*Server).attempt.func1
+         0     0% 97.06%      1.06s 23.98%  github.com/Bispulm/llmgate/internal/api.(*Server).attemptWithSlot
