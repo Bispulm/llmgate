@@ -1,0 +1,87 @@
+# Tenant mode: virtual keys, budgets, and team limits, backed by Postgres and Redis.
+# Every provider here is the local mock, so nothing in this file can spend money.
+# Credentials come from the environment, never from this file.
+#
+# The prices below are made up for the demo. Real prices change: copy them from the
+# provider's pricing page into a new pricing.version, because a price list can't
+# change once stored.
+server:
+  listen: 127.0.0.1:18300
+
+auth:
+  mode: tenant
+  # The most a revoked key, or a team's old limits, can keep working on a replica.
+  key_cache_ttl: 30s
+
+database:
+  url_env: LLMGATE_DATABASE_URL
+
+redis:
+  url_env: LLMGATE_REDIS_URL
+
+rate_limits:
+  # closed refuses requests if Redis is down. open falls back to per-replica limits.
+  # Budgets never depend on Redis.
+  on_redis_failure: closed
+
+admin:
+  listen: 127.0.0.1:18302
+  token_env: LLMGATE_ADMIN_TOKEN
+
+pricing:
+  version: demo-2026-11-05
+  prices:
+    - provider: mock
+      model: alpha;tokens=5;interval=100ms
+      input_usd_per_mtok: "3.00"
+      cached_input_usd_per_mtok: "0.30"
+      cache_write_usd_per_mtok: "3.75"
+      output_usd_per_mtok: "15.00"
+    - provider: mock
+      model: primary;fail=status;status=500
+      input_usd_per_mtok: "3.00"
+      cached_input_usd_per_mtok: "0.30"
+      cache_write_usd_per_mtok: "3.75"
+      output_usd_per_mtok: "15.00"
+    - provider: mock
+      model: backup;tokens=4
+      input_usd_per_mtok: "1.00"
+      cached_input_usd_per_mtok: "0.10"
+      cache_write_usd_per_mtok: "1.25"
+      output_usd_per_mtok: "5.00"
+
+accounting:
+  reconcile_interval: 15s
+  # How long an attempt of unknown cost waits for usage before it's charged in full.
+  uncertain_grace: 10m
+  rejected_attempt_charge: none
+
+limits:
+  request_timeout: 30s
+  first_event_timeout: 5s
+  stream_idle_timeout: 5s
+
+providers:
+  - name: mock
+    type: openai-compatible
+    base_url: http://127.0.0.1:18301/v1
+    api_key_env: LLMGATE_MOCK_PROVIDER_KEY
+
+models:
+  - alias: demo-fast
+    max_output_tokens: 256
+    routes:
+      - provider: mock
+        model: alpha;tokens=5;interval=100ms
+
+  # The first route fails before any content, and the second serves the request. Both
+  # attempts are accounted for.
+  - alias: demo-failover
+    max_output_tokens: 256
+    routes:
+      - provider: mock
+        model: primary;fail=status;status=500
+        tier: 0
+      - provider: mock
+        model: backup;tokens=4
+        tier: 1
