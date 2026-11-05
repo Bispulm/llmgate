@@ -44,11 +44,22 @@ const (
 
 // Config is the validated contents of a configuration file.
 type Config struct {
-	Server    Server     `yaml:"server"`
-	Auth      Auth       `yaml:"auth"`
-	Limits    Limits     `yaml:"limits"`
-	Providers []Provider `yaml:"providers"`
-	Models    []Model    `yaml:"models"`
+	Server         Server         `yaml:"server"`
+	Auth           Auth           `yaml:"auth"`
+	Limits         Limits         `yaml:"limits"`
+	CircuitBreaker CircuitBreaker `yaml:"circuit_breaker"`
+	Providers      []Provider     `yaml:"providers"`
+	Models         []Model        `yaml:"models"`
+}
+
+// CircuitBreaker configures every route's breaker. Each route has its own, in each
+// process. Zero values take the defaults in the routing package.
+type CircuitBreaker struct {
+	Window         time.Duration `yaml:"window"`
+	MinRequests    int           `yaml:"min_requests"`
+	ErrorRate      float64       `yaml:"error_rate"`
+	Cooldown       time.Duration `yaml:"cooldown"`
+	HalfOpenProbes int           `yaml:"half_open_probes"`
 }
 
 // Server configures the client-facing listener.
@@ -86,16 +97,25 @@ type Provider struct {
 
 // Model is a client-visible alias and the routes that can serve it.
 type Model struct {
-	Alias           string  `yaml:"alias"`
-	MaxOutputTokens int64   `yaml:"max_output_tokens"`
-	Routes          []Route `yaml:"routes"`
+	Alias           string `yaml:"alias"`
+	MaxOutputTokens int64  `yaml:"max_output_tokens"`
+	// MaxAttempts bounds upstream attempts per request. Zero means one per route.
+	MaxAttempts int     `yaml:"max_attempts"`
+	Routes      []Route `yaml:"routes"`
 }
 
 // Route points an alias at a model on a provider.
 type Route struct {
 	Provider string `yaml:"provider"`
 	Model    string `yaml:"model"`
+	// Tier orders fallback. Lower tiers are tried first.
+	Tier int `yaml:"tier"`
+	// Weight shares traffic within a tier. Zero means 1.
+	Weight int `yaml:"weight"`
 }
+
+// maxAttemptsLimit keeps a configuration from allowing unbounded retries.
+const maxAttemptsLimit = 10
 
 // Secrets holds credentials read from the environment. It is kept apart from
 // Config so that a configuration value can be logged without risk.
@@ -173,6 +193,9 @@ func (c *Config) validate() error {
 		return errors.New("auth.dev_key_env is required")
 	}
 	if err := c.Limits.validate(); err != nil {
+		return err
+	}
+	if err := c.CircuitBreaker.validate(); err != nil {
 		return err
 	}
 	if c.Server.ShutdownTimeout < 0 {
@@ -318,10 +341,10 @@ func (m Model) validate(providers map[string]bool) error {
 	if len(m.Routes) == 0 {
 		return errors.New("at least one route is required")
 	}
-	// Accepting more would imply failover that doesn't exist yet.
-	if len(m.Routes) > 1 {
-		return errors.New("only one route per alias is supported until fallback is implemented")
+	if m.MaxAttempts < 0 || m.MaxAttempts > maxAttemptsLimit {
+		return fmt.Errorf("max_attempts must be between 0 and %d", maxAttemptsLimit)
 	}
+	seen := make(map[[2]string]bool, len(m.Routes))
 	for i, r := range m.Routes {
 		if !providers[r.Provider] {
 			return fmt.Errorf("routes[%d] uses unknown provider %q", i, r.Provider)
@@ -329,6 +352,30 @@ func (m Model) validate(providers map[string]bool) error {
 		if r.Model == "" {
 			return fmt.Errorf("routes[%d].model is required", i)
 		}
+		if r.Tier < 0 {
+			return fmt.Errorf("routes[%d].tier must not be negative", i)
+		}
+		if r.Weight < 0 {
+			return fmt.Errorf("routes[%d].weight must not be negative", i)
+		}
+		key := [2]string{r.Provider, r.Model}
+		if seen[key] {
+			return fmt.Errorf("routes[%d] duplicates an earlier route", i)
+		}
+		seen[key] = true
+	}
+	return nil
+}
+
+func (b CircuitBreaker) validate() error {
+	if b.Window < 0 || b.Cooldown < 0 {
+		return errors.New("circuit_breaker durations must not be negative")
+	}
+	if b.MinRequests < 0 || b.HalfOpenProbes < 0 {
+		return errors.New("circuit_breaker counts must not be negative")
+	}
+	if b.ErrorRate < 0 || b.ErrorRate > 1 {
+		return errors.New("circuit_breaker.error_rate must be between 0 and 1")
 	}
 	return nil
 }

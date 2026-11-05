@@ -170,11 +170,28 @@ func buildRoutes(cfg *config.Config, secrets *config.Secrets) (*routing.Table, e
 	for i, m := range cfg.Models {
 		routes := make([]routing.Route, len(m.Routes))
 		for j, r := range m.Routes {
-			routes[j] = routing.Route{ProviderName: r.Provider, Provider: providers[r.Provider], Model: r.Model}
+			routes[j] = routing.Route{
+				ProviderName: r.Provider,
+				Provider:     providers[r.Provider],
+				Model:        r.Model,
+				Tier:         r.Tier,
+				Weight:       r.Weight,
+			}
 		}
-		aliases[i] = routing.Alias{Name: m.Alias, MaxOutputTokens: m.MaxOutputTokens, Routes: routes}
+		aliases[i] = routing.Alias{
+			Name:            m.Alias,
+			MaxOutputTokens: m.MaxOutputTokens,
+			MaxAttempts:     m.MaxAttempts,
+			Routes:          routes,
+		}
 	}
-	return routing.NewTable(aliases, routing.Options{}), nil
+	return routing.NewTable(aliases, routing.Options{Breaker: routing.BreakerConfig{
+		Window:         cfg.CircuitBreaker.Window,
+		MinRequests:    cfg.CircuitBreaker.MinRequests,
+		ErrorRate:      cfg.CircuitBreaker.ErrorRate,
+		Cooldown:       cfg.CircuitBreaker.Cooldown,
+		HalfOpenProbes: cfg.CircuitBreaker.HalfOpenProbes,
+	}}), nil
 }
 
 func newProvider(p config.Provider, apiKey string, limits config.Limits) (provider.Provider, error) {
