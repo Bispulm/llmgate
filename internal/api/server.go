@@ -36,6 +36,9 @@ type Limits struct {
 	ClientWriteTimeout time.Duration
 	// BodyReadTimeout bounds reading the request body.
 	BodyReadTimeout time.Duration
+	// AdmissionTimeout bounds each check against Postgres before anything is sent: the
+	// key lookup, and an attempt's reservation. Zero uses defaultAdmissionTimeout.
+	AdmissionTimeout time.Duration
 }
 
 // Ledger is the authority for money, and the only thing that can admit an attempt.
