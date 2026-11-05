@@ -332,3 +332,16 @@ func TestTracingSettings(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+// A mock or a provider on a private network can be reached over plaintext, but only when
+// the configuration says so in as many words, since the credential travels with it.
+func TestPlaintextToAPrivateHostNeedsSaying(t *testing.T) {
+	private := strings.Replace(validYAML, "base_url: http://127.0.0.1:18301/v1", "base_url: http://mock:18301/v1", 1)
+	if _, err := Load(writeConfig(t, private)); err == nil || !strings.Contains(err.Error(), "https") {
+		t.Fatalf("err = %v", err)
+	}
+	allowed := strings.Replace(private, "api_key_env: PRIMARY_KEY", "api_key_env: PRIMARY_KEY\n    allow_insecure_http: true", 1)
+	if _, err := Load(writeConfig(t, allowed)); err != nil {
+		t.Fatal(err)
+	}
+}
