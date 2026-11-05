@@ -20,6 +20,44 @@ jobs:
       - run: go vet ./...
       - run: go test -race -count=1 ./...
 
+  integration:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: llmgate
+          POSTGRES_PASSWORD: llmgate_dev
+          POSTGRES_DB: llmgate
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U llmgate -d llmgate"
+          --health-interval 2s
+          --health-timeout 3s
+          --health-retries 30
+      redis:
+        image: redis:7.4-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 2s
+          --health-timeout 3s
+          --health-retries 30
+    env:
+      LLMGATE_TEST_POSTGRES_URL: postgres://llmgate:llmgate_dev@127.0.0.1:5432/llmgate?sslmode=disable
+      LLMGATE_TEST_REDIS_URL: redis://127.0.0.1:6379/0
+      # A skipped integration test must fail here, or a misconfiguration could
+      # silently stop proving database behavior.
+      LLMGATE_REQUIRE_INTEGRATION: "1"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+      - run: go test -race -count=1 -p 2 ./...
+
   lint:
     runs-on: ubuntu-latest
     steps:
