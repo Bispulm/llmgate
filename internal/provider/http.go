@@ -18,6 +18,9 @@ const (
 	drainTimeout = 100 * time.Millisecond
 	// maxIdentifierLength bounds an upstream error code kept from a response.
 	maxIdentifierLength = 64
+	// maxRetryAfter clamps a provider's hint before arithmetic can overflow. Whoever
+	// acts on a hint applies its own, much shorter, cap.
+	maxRetryAfter = 24 * time.Hour
 )
 
 // TransportError classifies a failure to get a response. Only a failure to connect
@@ -91,6 +94,9 @@ func ParseRetryAfter(value string, now time.Time) time.Duration {
 	if seconds, err := strconv.Atoi(value); err == nil {
 		if seconds <= 0 {
 			return 0
+		}
+		if seconds > int(maxRetryAfter/time.Second) {
+			return maxRetryAfter
 		}
 		return time.Duration(seconds) * time.Second
 	}

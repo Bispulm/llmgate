@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -623,6 +624,11 @@ func (teamAuth) Authenticate(_ context.Context, token string) (auth.Principal, e
 // limitedGateway runs routes on one mock, where the route's limiter is shared.
 func limitedGateway(t *testing.T, cfg limits.Config, models ...string) (*gateway, *limits.FairLimiter) {
 	t.Helper()
+	return limitedGatewayWith(t, cfg, nil, models...)
+}
+
+func limitedGatewayWith(t *testing.T, cfg limits.Config, adjust func(*Limits), models ...string) (*gateway, *limits.FairLimiter) {
+	t.Helper()
 	m := mock.New()
 	upstream := httptest.NewServer(m)
 	t.Cleanup(upstream.Close)
@@ -641,10 +647,14 @@ func limitedGateway(t *testing.T, cfg limits.Config, models ...string) (*gateway
 		}
 	}
 	rec := &attemptRecorder{attempts: make(chan recordedAttempt, 256)}
+	serverLimits := testLimits()
+	if adjust != nil {
+		adjust(&serverLimits)
+	}
 	ts := httptest.NewServer(New(Options{
 		Auth:     teamAuth{},
 		Recorder: rec,
-		Limits:   testLimits(),
+		Limits:   serverLimits,
 		Routes: routing.NewTable([]routing.Alias{{Name: "fast", MaxOutputTokens: 100, Routes: routes}},
 			routing.Options{Breaker: routing.BreakerConfig{MinRequests: 1000}}),
 	}))
@@ -881,4 +891,258 @@ func TestSaturatedTeamDoesNotStarveAQuietTeam(t *testing.T) {
 			t.Fatalf("only %d of %d greedy requests finished", finished, greedyCount)
 		}
 	}
+}
+
+func TestRetryHintsOnlyApplyToTheRouteThatGaveThem(t *testing.T) {
+	t.Run("a route that failed for another reason isn't retried", func(t *testing.T) {
+		g := newRoutedGateway(t, tiers(
+			"failed;fail=status;status=503",
+			"hinted;tokens=1;fail=status;status=429;retry_after=1;fail_first=1",
+		), routedOptions{maxAttempts: 4})
+		resp := g.post(t, chatBody(false, ""))
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("status = %d", resp.StatusCode)
+		}
+		if got := completionText(t, resp); !strings.HasPrefix(got, "[hinted]") {
+			t.Fatalf("text = %q", got)
+		}
+		if got := g.mock.Stats()["failed"].Requests; got != 1 {
+			t.Fatalf("the failed route was tried %d times", got)
+		}
+		if got := resp.Header.Get("X-Llmgate-Attempts"); got != "3" {
+			t.Fatalf("attempts header = %q", got)
+		}
+	})
+	t.Run("another request's hold is no reason to wait", func(t *testing.T) {
+		g := newRoutedGateway(t, tiers(
+			"held;fail=status;status=429;retry_after=2",
+			"flaky;fail=status;status=500",
+		), routedOptions{maxAttempts: 2})
+		// Uses up both attempts, so it doesn't wait. It leaves the first route held.
+		expectError(t, g.post(t, chatBody(false, "")), 502, "upstream_error", "upstream_failed")
+
+		start := time.Now()
+		expectError(t, g.post(t, chatBody(false, "")), 502, "upstream_error", "upstream_failed")
+		if got := time.Since(start); got > time.Second {
+			t.Fatalf("waited %v for a hint that another request was given", got)
+		}
+	})
+}
+
+// panickingProvider panics the way a bug in an adapter would. net/http recovers it and
+// keeps serving, so whatever the attempt held has to come back regardless.
+type panickingProvider struct {
+	fakeProvider
+	healthy atomic.Bool
+}
+
+func (p *panickingProvider) Complete(context.Context, *chat.Request, string) (*chat.Completion, error) {
+	if p.healthy.Load() {
+		return &chat.Completion{Content: "ok", FinishReason: chat.FinishStop}, nil
+	}
+	panic(http.ErrAbortHandler)
+}
+
+func TestAPanicGivesBackWhatTheAttemptHeld(t *testing.T) {
+	send := func(t *testing.T, ts *httptest.Server, client *http.Client) (int, error) {
+		t.Helper()
+		req, err := http.NewRequest(http.MethodPost, ts.URL+"/v1/chat/completions", strings.NewReader(chatBody(false, "")))
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header.Set("Authorization", "Bearer team")
+		resp, err := client.Do(req)
+		if err != nil {
+			return 0, err
+		}
+		defer func() { _ = resp.Body.Close() }()
+		_, _ = io.Copy(io.Discard, resp.Body)
+		return resp.StatusCode, nil
+	}
+	start := func(t *testing.T, p provider.Provider, limiter *limits.FairLimiter, breaker routing.BreakerConfig) (*httptest.Server, *http.Client) {
+		t.Helper()
+		ts := httptest.NewServer(New(Options{
+			Auth:     teamAuth{},
+			Recorder: &attemptRecorder{attempts: make(chan recordedAttempt, 64)},
+			Limits:   testLimits(),
+			Routes: routing.NewTable([]routing.Alias{{Name: "fast", MaxOutputTokens: 100, Routes: []routing.Route{
+				{ProviderName: "p", Provider: p, Model: "m", Limiter: limiter},
+			}}}, routing.Options{Breaker: breaker}),
+		}))
+		t.Cleanup(ts.Close)
+		client := &http.Client{Transport: &http.Transport{}}
+		t.Cleanup(client.CloseIdleConnections)
+		return ts, client
+	}
+
+	t.Run("the concurrency slot", func(t *testing.T) {
+		limiter := limits.NewFairLimiter(limits.Config{MaxConcurrency: 1})
+		ts, client := start(t, &panickingProvider{}, limiter, routing.BreakerConfig{MinRequests: 1000})
+		if _, err := send(t, ts, client); err == nil {
+			t.Fatal("the panic didn't end the request")
+		}
+		waitForLimiter(t, limiter, func(s limits.Stats) bool { return s.InFlight == 0 })
+	})
+	t.Run("a half-open probe", func(t *testing.T) {
+		p := &panickingProvider{}
+		p.healthy.Store(true)
+		breaker := routing.BreakerConfig{Window: time.Minute, MinRequests: 1, ErrorRate: 0.01, Cooldown: 50 * time.Millisecond, HalfOpenProbes: 1}
+		fail := &failingThenPanicking{inner: p}
+		ts, client := start(t, fail, nil, breaker)
+
+		// One failure opens the breaker.
+		fail.failing.Store(true)
+		if got, err := send(t, ts, client); err != nil || got != http.StatusBadGateway {
+			t.Fatalf("status = %d, err = %v", got, err)
+		}
+		fail.failing.Store(false)
+
+		// The only probe panics. If that kept its slot, the breaker would never recover.
+		p.healthy.Store(false)
+		time.Sleep(80 * time.Millisecond)
+		if _, err := send(t, ts, client); err == nil {
+			t.Fatal("the panic didn't end the request")
+		}
+
+		p.healthy.Store(true)
+		deadline := time.Now().Add(5 * time.Second)
+		for {
+			got, err := send(t, ts, client)
+			if err == nil && got == http.StatusOK {
+				return
+			}
+			if time.Now().After(deadline) {
+				t.Fatalf("the breaker never recovered: status %d, err %v", got, err)
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+	})
+}
+
+// failingThenPanicking fails with an ordinary error while failing is set.
+type failingThenPanicking struct {
+	fakeProvider
+	inner   *panickingProvider
+	failing atomic.Bool
+}
+
+func (p *failingThenPanicking) Complete(ctx context.Context, req *chat.Request, model string) (*chat.Completion, error) {
+	if p.failing.Load() {
+		return nil, &provider.Error{Kind: provider.KindServer, Delivery: provider.DeliveryConfirmed}
+	}
+	return p.inner.Complete(ctx, req, model)
+}
+
+// Asking for a long output is the client's choice, and running out of the time a
+// request is allowed says nothing about the provider. Otherwise one team's long
+// requests could open a breaker for every team.
+func TestTheRequestDeadlineDoesNotCountAgainstHealth(t *testing.T) {
+	breaker := routing.BreakerConfig{Window: time.Minute, MinRequests: 2, ErrorRate: 0.5, Cooldown: time.Minute, HalfOpenProbes: 1}
+	short := func(l *Limits) { l.RequestTimeout = 100 * time.Millisecond }
+
+	t.Run("a stream that outlasts it", func(t *testing.T) {
+		g := newRoutedGateway(t, tiers("long;tokens=100;interval=20ms"), routedOptions{breaker: breaker, limits: short})
+		for range 5 {
+			s := readStream(t, g.post(t, chatBody(true, "")).Body)
+			if s.done || s.err == nil {
+				t.Fatalf("stream = %+v", s)
+			}
+		}
+		if got := g.mock.Stats()["long"].Requests; got != 5 {
+			t.Fatalf("the breaker opened: the route saw %d of 5 requests", got)
+		}
+	})
+	t.Run("a response that outlasts it", func(t *testing.T) {
+		g := newRoutedGateway(t, tiers("long;latency=30s"), routedOptions{breaker: breaker, limits: short})
+		for range 5 {
+			expectError(t, g.post(t, chatBody(false, "")), 504, "upstream_error", "upstream_timeout")
+		}
+		if got := g.mock.Stats()["long"].Requests; got != 5 {
+			t.Fatalf("the breaker opened: the route saw %d of 5 requests", got)
+		}
+	})
+	t.Run("a provider that doesn't start in time still counts", func(t *testing.T) {
+		g := newRoutedGateway(t, tiers("hung;ttfb=30s"), routedOptions{breaker: breaker, limits: func(l *Limits) {
+			l.FirstEventTimeout = 50 * time.Millisecond
+		}})
+		for range 2 {
+			expectError(t, g.post(t, chatBody(true, "")), 504, "upstream_error", "upstream_timeout")
+		}
+		expectError(t, g.post(t, chatBody(true, "")), 503, "upstream_error", "no_route_available")
+		if got := g.mock.Stats()["hung"].Requests; got != 2 {
+			t.Fatalf("the route saw %d requests", got)
+		}
+	})
+	t.Run("a stream that stalls still counts", func(t *testing.T) {
+		g := newRoutedGateway(t, tiers("stuck;tokens=5;interval=30s"), routedOptions{breaker: breaker, limits: func(l *Limits) {
+			l.StreamIdleTimeout = 50 * time.Millisecond
+		}})
+		for range 2 {
+			_ = readStream(t, g.post(t, chatBody(true, "")).Body)
+		}
+		expectError(t, g.post(t, chatBody(true, "")), 503, "upstream_error", "no_route_available")
+	})
+}
+
+func TestNonStreamingAttemptsHaveTheirOwnTimeout(t *testing.T) {
+	short := func(l *Limits) { l.CompletionTimeout = 100 * time.Millisecond }
+
+	t.Run("a hung attempt leaves time to fall back", func(t *testing.T) {
+		g := newRoutedGateway(t, tiers("hung;latency=30s", "backup;tokens=1"), routedOptions{limits: short})
+		if got := completionText(t, g.post(t, chatBody(false, ""))); !strings.HasPrefix(got, "[backup]") {
+			t.Fatalf("text = %q", got)
+		}
+		waitForMock(t, g, "hung", canceledUpstream)
+		first, second := g.recorder.wait(t), g.recorder.wait(t)
+		if first.ErrorKind != provider.KindTimeout || second.Outcome != accounting.OutcomeCompleted {
+			t.Fatalf("attempts = %+v, %+v", first.Attempt, second.Attempt)
+		}
+	})
+	t.Run("it counts against the route", func(t *testing.T) {
+		breaker := routing.BreakerConfig{Window: time.Minute, MinRequests: 2, ErrorRate: 0.5, Cooldown: time.Minute, HalfOpenProbes: 1}
+		g := newRoutedGateway(t, tiers("hung;latency=30s"), routedOptions{breaker: breaker, limits: short})
+		for range 2 {
+			expectError(t, g.post(t, chatBody(false, "")), 504, "upstream_error", "upstream_timeout")
+		}
+		expectError(t, g.post(t, chatBody(false, "")), 503, "upstream_error", "no_route_available")
+	})
+	t.Run("a slower response than the first-event timeout is fine", func(t *testing.T) {
+		g := newRoutedGateway(t, tiers("slow;tokens=1;latency=200ms"), routedOptions{limits: func(l *Limits) {
+			l.FirstEventTimeout = 50 * time.Millisecond
+			l.CompletionTimeout = 5 * time.Second
+		}})
+		if resp := g.post(t, chatBody(false, "")); resp.StatusCode != http.StatusOK {
+			t.Fatalf("status = %d", resp.StatusCode)
+		}
+	})
+}
+
+func TestADeadlineWhileQueuedIsATimeoutNotOverload(t *testing.T) {
+	g, l := limitedGatewayWith(t, limits.Config{MaxConcurrency: 1, MaxQueue: 5}, func(s *Limits) {
+		s.RequestTimeout = 300 * time.Millisecond
+	}, "busy;latency=30s")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		resp, err := g.sendAs(ctx, "holder", chatBody(false, ""))
+		if err == nil {
+			_ = resp.Body.Close()
+		}
+	}()
+	waitForLimiter(t, l, func(s limits.Stats) bool { return s.InFlight == 1 })
+
+	resp, err := g.sendAs(context.Background(), "someone", chatBody(false, ""))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	expectError(t, resp, 504, "upstream_error", "upstream_timeout")
+	if got := resp.Header.Get("Retry-After"); got != "" {
+		t.Fatalf("Retry-After = %q: telling a timed out client to hurry back makes overload worse", got)
+	}
+	cancel()
+	<-done
 }

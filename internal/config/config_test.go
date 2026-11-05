@@ -54,6 +54,9 @@ func TestLoadParsesAndAppliesDefaults(t *testing.T) {
 	if cfg.Limits.StreamIdleTimeout != DefaultStreamIdleTimeout {
 		t.Errorf("default stream_idle_timeout = %v", cfg.Limits.StreamIdleTimeout)
 	}
+	if got := cfg.Limits.CompletionTimeout; got != 45*time.Second/2 {
+		t.Errorf("default completion_timeout = %v: half the deadline leaves time to fall back", got)
+	}
 	if got := cfg.Providers[0].MaxTokensParam; got != MaxCompletionTokens {
 		t.Errorf("default max_tokens_param = %q", got)
 	}
@@ -86,6 +89,8 @@ func TestLoadRejectsInvalidConfig(t *testing.T) {
 		{"zero output limit", "max_output_tokens: 1024", "max_output_tokens: 0", "max_output_tokens"},
 		{"negative timeout", "request_timeout: 45s", "request_timeout: -1s", "request_timeout"},
 		{"empty alias", "alias: fast", "alias: ''", "alias"},
+		{"a first-event timeout past the deadline", "request_timeout: 45s", "request_timeout: 45s\n  first_event_timeout: 46s", "first_event_timeout"},
+		{"a completion timeout past the deadline", "request_timeout: 45s", "request_timeout: 45s\n  completion_timeout: 46s", "completion_timeout"},
 		{
 			"the same route twice",
 			"        model: alpha",
