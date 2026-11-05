@@ -12,7 +12,7 @@ The aim is depth on those problems, not a long list of providers.
 
 ## Quick start
 
-You need Go 1.27 or later, `curl`, `python3`, and `lsof`. The demo uses a local mock provider, so it needs no credentials and costs nothing.
+You need Go 1.27.3 or later, `curl`, `python3`, and `lsof`. The demo uses a local mock provider, so it needs no credentials and costs nothing.
 
 ```bash
 make demo
