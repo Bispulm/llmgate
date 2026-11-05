@@ -495,3 +495,69 @@ func TestServeExportsMetricsOnTheirOwnListener(t *testing.T) {
 		t.Fatalf("the gateway's listener serves metrics: %d", status)
 	}
 }
+
+// Traces reach a configured OTLP endpoint, and the last ones are flushed at shutdown.
+func TestServeExportsTraces(t *testing.T) {
+	upstream := httptest.NewServer(mock.New())
+	defer upstream.Close()
+	received := make(chan string, 16)
+	collector := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		received <- r.Method + " " + r.URL.Path
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer collector.Close()
+
+	config := strings.Replace(testConfig, "http://127.0.0.1:18301/v1", upstream.URL+"/v1", 1) + "tracing:\n  otlp_endpoint: " + collector.URL + "\n"
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(path, []byte(config), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	started := make(chan listening, 1)
+	done := make(chan error, 1)
+	go func() {
+		done <- run(ctx, []string{"serve", "--config", path}, process{getenv: testEnv, stdout: io.Discard, stderr: io.Discard, started: func(l listening) { started <- l }})
+	}()
+	var addrs listening
+	select {
+	case addrs = <-started:
+	case err := <-done:
+		t.Fatalf("serve returned early: %v", err)
+	}
+	req, err := http.NewRequest(http.MethodPost, "http://"+addrs.Gateway+"/v1/chat/completions", strings.NewReader(`{"model":"fast","messages":[{"role":"user","content":"hello"}]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Authorization", "Bearer dev")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case got := <-received:
+		if got != "POST /v1/traces" {
+			t.Fatalf("the collector got %s", got)
+		}
+	default:
+		t.Fatal("no spans reached the collector by shutdown")
+	}
+}
+
+func TestTracesURL(t *testing.T) {
+	for in, want := range map[string]string{
+		"http://127.0.0.1:4318":               "http://127.0.0.1:4318/v1/traces",
+		"http://127.0.0.1:4318/":              "http://127.0.0.1:4318/v1/traces",
+		"https://collector.example/custom":    "https://collector.example/custom",
+		"https://collector.example/v1/traces": "https://collector.example/v1/traces",
+	} {
+		if got := tracesURL(in); got != want {
+			t.Errorf("tracesURL(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
