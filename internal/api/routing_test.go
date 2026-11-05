@@ -310,12 +310,17 @@ func TestAttemptsAreBounded(t *testing.T) {
 			l.RequestTimeout = 150 * time.Millisecond
 		}})
 		start := time.Now()
-		expectError(t, g.post(t, chatBody(false, "")), 504, "upstream_error", "upstream_timeout")
+		resp := g.post(t, chatBody(false, ""))
+		expectError(t, resp, 504, "upstream_error", "upstream_timeout")
 		if got := time.Since(start); got > 5*time.Second {
 			t.Fatalf("took %v", got)
 		}
 		if got := g.mock.Stats()["b"].Requests; got != 0 {
 			t.Fatalf("an attempt was started after the deadline: %d", got)
+		}
+		// An attempt that can't reach anyone would still be recorded, and later, charged.
+		if got := resp.Header.Get("X-Llmgate-Attempts"); got != "1" {
+			t.Fatalf("attempts header = %q", got)
 		}
 	})
 }
@@ -1119,20 +1124,16 @@ func TestNonStreamingAttemptsHaveTheirOwnTimeout(t *testing.T) {
 
 func TestADeadlineWhileQueuedIsATimeoutNotOverload(t *testing.T) {
 	g, l := limitedGatewayWith(t, limits.Config{MaxConcurrency: 1, MaxQueue: 5}, func(s *Limits) {
-		s.RequestTimeout = 300 * time.Millisecond
-	}, "busy;latency=30s")
+		s.RequestTimeout = 200 * time.Millisecond
+	}, "busy")
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		resp, err := g.sendAs(ctx, "holder", chatBody(false, ""))
-		if err == nil {
-			_ = resp.Body.Close()
-		}
-	}()
-	waitForLimiter(t, l, func(s limits.Stats) bool { return s.InFlight == 1 })
+	// Holds the only slot for longer than the request's deadline. Another request can't do
+	// that, since it would have the same deadline.
+	release, err := l.Acquire(context.Background(), "holder")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer release()
 
 	resp, err := g.sendAs(context.Background(), "someone", chatBody(false, ""))
 	if err != nil {
@@ -1143,6 +1144,66 @@ func TestADeadlineWhileQueuedIsATimeoutNotOverload(t *testing.T) {
 	if got := resp.Header.Get("Retry-After"); got != "" {
 		t.Fatalf("Retry-After = %q: telling a timed out client to hurry back makes overload worse", got)
 	}
-	cancel()
-	<-done
+	if got := g.mock.Stats()["busy"].Requests; got != 0 {
+		t.Fatalf("the upstream saw %d requests", got)
+	}
+}
+
+// misleadingProvider reports a provider failure when it's really the client that left,
+// as can happen when a connection breaks at the moment a client cancels.
+type misleadingProvider struct {
+	fakeProvider
+	entered chan struct{}
+}
+
+func (p *misleadingProvider) Complete(ctx context.Context, _ *chat.Request, _ string) (*chat.Completion, error) {
+	p.entered <- struct{}{}
+	<-ctx.Done()
+	return nil, &provider.Error{Kind: provider.KindServer, Delivery: provider.DeliveryUncertain}
+}
+
+// Whatever a failure looks like, a client leaving says nothing about the provider.
+func TestAClientLeavingNeverCountsAgainstHealth(t *testing.T) {
+	p := &misleadingProvider{entered: make(chan struct{}, 8)}
+	ts := httptest.NewServer(New(Options{
+		Auth:     teamAuth{},
+		Recorder: &attemptRecorder{attempts: make(chan recordedAttempt, 64)},
+		Limits:   testLimits(),
+		Routes: routing.NewTable([]routing.Alias{{Name: "fast", MaxOutputTokens: 100, Routes: []routing.Route{
+			{ProviderName: "p", Provider: p, Model: "m"},
+		}}}, routing.Options{Breaker: routing.BreakerConfig{Window: time.Minute, MinRequests: 2, ErrorRate: 0.5, Cooldown: time.Minute, HalfOpenProbes: 1}}),
+	}))
+	defer ts.Close()
+	client := &http.Client{Transport: &http.Transport{}}
+	defer client.CloseIdleConnections()
+
+	send := func() {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, ts.URL+"/v1/chat/completions", strings.NewReader(chatBody(false, "")))
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header.Set("Authorization", "Bearer team")
+		errs := make(chan error, 1)
+		go func() {
+			resp, err := client.Do(req)
+			if err == nil {
+				_ = resp.Body.Close()
+			}
+			errs <- err
+		}()
+		select {
+		case <-p.entered:
+		case <-time.After(5 * time.Second):
+			t.Fatal("the request never reached the provider: the breaker opened")
+		}
+		cancel()
+		if err := <-errs; err == nil {
+			t.Error("the canceled request reported success")
+		}
+	}
+	for range 5 {
+		send()
+	}
 }
