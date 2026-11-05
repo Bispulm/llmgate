@@ -1,0 +1,35 @@
+# Local dependencies for development and integration tests. Ports bind to loopback
+# only. The password is a local development placeholder, not a credential.
+name: llmgate
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: llmgate
+      POSTGRES_PASSWORD: llmgate_dev
+      POSTGRES_DB: llmgate
+    command: ["postgres", "-c", "max_connections=200"]
+    ports:
+      - "127.0.0.1:${LLMGATE_POSTGRES_PORT:-15433}:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U llmgate -d llmgate"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  redis:
+    image: redis:7.4-alpine
+    command: ["redis-server", "--save", "", "--appendonly", "no", "--maxmemory", "256mb", "--maxmemory-policy", "noeviction"]
+    ports:
+      - "127.0.0.1:${LLMGATE_REDIS_PORT:-16383}:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+volumes:
+  postgres-data:
