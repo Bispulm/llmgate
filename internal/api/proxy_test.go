@@ -881,6 +881,7 @@ func TestDeadlines(t *testing.T) {
 	})
 	t.Run("a stall after commit", func(t *testing.T) {
 		g := newGateway(t, "stall;tokens=3;interval=30s", withLimits(func(l *Limits) { l.StreamIdleTimeout = 100 * time.Millisecond }))
+		start := time.Now()
 		resp := g.post(t, chatBody(true, ""))
 		if resp.StatusCode != http.StatusOK {
 			t.Fatalf("status = %d", resp.StatusCode)
@@ -889,7 +890,27 @@ func TestDeadlines(t *testing.T) {
 		if s.done || s.err == nil {
 			t.Fatalf("stream = %+v", s)
 		}
+		// The overall request deadline would end this too, much later.
+		if got := time.Since(start); got > 5*time.Second {
+			t.Fatalf("the stall was detected after %v", got)
+		}
 		waitForMock(t, g, "stall", canceledUpstream)
+		a := g.recorder.wait(t)
+		if !a.Committed || a.Outcome != accounting.OutcomeInterrupted || a.ErrorKind != provider.KindTimeout {
+			t.Fatalf("attempt = %+v", a)
+		}
+	})
+	t.Run("the overall request deadline after commit", func(t *testing.T) {
+		g := newGateway(t, "long;tokens=100;interval=50ms", withLimits(func(l *Limits) { l.RequestTimeout = 300 * time.Millisecond }))
+		resp := g.post(t, chatBody(true, ""))
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("status = %d", resp.StatusCode)
+		}
+		s := readStream(t, resp.Body)
+		if s.done || s.err == nil {
+			t.Fatalf("stream = %+v", s)
+		}
+		waitForMock(t, g, "long", canceledUpstream)
 		a := g.recorder.wait(t)
 		if !a.Committed || a.Outcome != accounting.OutcomeInterrupted || a.ErrorKind != provider.KindTimeout {
 			t.Fatalf("attempt = %+v", a)
@@ -948,6 +969,55 @@ func routingWithLimit(table *routing.Table, limit int64) *routing.Table {
 	updated := *alias
 	updated.MaxOutputTokens = limit
 	return routing.NewTable([]routing.Alias{updated})
+}
+
+// The write timeout limits how long one write can block. It must never limit how
+// long a provider can take, or every response slower than it would be lost.
+func TestWriteTimeoutDoesNotLimitSlowProviders(t *testing.T) {
+	const writeTimeout = 100 * time.Millisecond
+	short := func(o *Options) { o.Limits.ClientWriteTimeout = writeTimeout }
+
+	t.Run("a slow non-streaming response", func(t *testing.T) {
+		g := newGateway(t, "alpha;tokens=2;latency=400ms", short)
+		resp := g.post(t, chatBody(false, ""))
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("status = %d", resp.StatusCode)
+		}
+		raw, err := io.ReadAll(resp.Body)
+		if err != nil {
+			t.Fatalf("reading the response: %v", err)
+		}
+		if !bytes.Contains(raw, []byte("[alpha] token-1")) {
+			t.Fatalf("body = %s", raw)
+		}
+		if a := g.recorder.wait(t); a.Outcome != accounting.OutcomeCompleted {
+			t.Fatalf("attempt = %+v", a)
+		}
+	})
+	t.Run("a failure reported after a long wait", func(t *testing.T) {
+		g := newGateway(t, "a;latency=400ms;fail=status;status=500", short)
+		expectError(t, g.post(t, chatBody(false, "")), 502, "upstream_error", "upstream_failed")
+	})
+	t.Run("a timeout reported after a long wait", func(t *testing.T) {
+		g := newGateway(t, "a;ttfb=30s", short, func(o *Options) { o.Limits.FirstEventTimeout = 400 * time.Millisecond })
+		expectError(t, g.post(t, chatBody(true, "")), 504, "upstream_error", "upstream_timeout")
+	})
+	t.Run("a slow first event", func(t *testing.T) {
+		g := newGateway(t, "alpha;ttfb=400ms", short)
+		if s := readStream(t, g.post(t, chatBody(true, "")).Body); !s.done {
+			t.Fatalf("stream = %+v", s)
+		}
+	})
+	t.Run("a stream lasting longer than the write timeout", func(t *testing.T) {
+		g := newGateway(t, "alpha;tokens=5;interval=100ms", short)
+		s := readStream(t, g.post(t, chatBody(true, "")).Body)
+		if !s.done {
+			t.Fatalf("stream = %+v", s)
+		}
+		if a := g.recorder.wait(t); a.TextEvents != 5 {
+			t.Fatalf("attempt = %+v", a)
+		}
+	})
 }
 
 // A write deadline applies to the connection, so a stale one from an earlier
@@ -1020,6 +1090,32 @@ func TestSlowRequestBodyIsCutOff(t *testing.T) {
 	if _, err := reader.ReadByte(); !errors.Is(err, io.EOF) {
 		t.Errorf("connection not closed: read returned %v", err)
 	}
+}
+
+// Both timers start around the same moment, so the response to a stalled body must
+// not need the write deadline set when the request arrived.
+func TestSlowRequestBodyGetsAResponseWhenBothTimeoutsExpire(t *testing.T) {
+	g := newGateway(t, "alpha", func(o *Options) {
+		o.Limits.BodyReadTimeout = 300 * time.Millisecond
+		o.Limits.ClientWriteTimeout = 100 * time.Millisecond
+	})
+	conn, err := net.Dial("tcp", strings.TrimPrefix(g.url, "http://"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = conn.Close() }()
+	if _, err := fmt.Fprintf(conn, "POST /v1/chat/completions HTTP/1.1\r\nHost: test\r\nAuthorization: Bearer %s\r\nContent-Length: 1000\r\n\r\n{", testAPIKey); err != nil {
+		t.Fatal(err)
+	}
+	if err := conn.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	resp, err := http.ReadResponse(bufio.NewReader(conn), nil)
+	if err != nil {
+		t.Fatalf("no response: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	expectError(t, resp, 408, "invalid_request_error", "request_timeout")
 }
 
 func TestStreamFramingFromUpstreamDoesNotChangeOutput(t *testing.T) {
