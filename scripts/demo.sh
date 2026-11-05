@@ -60,24 +60,55 @@ PIDS+=($!)
 wait_for "$MOCK/__mock/stats"
 wait_for "$GATEWAY/healthz"
 
-section "Gateway health"
-curl -sS "$GATEWAY/healthz"
-echo
+KEY=demo-dev-key
+ask() { # alias, extra JSON fields
+  curl -sS -N -D "$WORK/headers" "$GATEWAY/v1/chat/completions" -H "Authorization: Bearer $KEY" \
+    -d "{\"model\":\"$1\",\"messages\":[{\"role\":\"user\",\"content\":\"hello\"}]$2}"
+  echo
+}
+status() { sed -n 1p "$WORK/headers" | tr -d '\r'; }
 
-section "Mock provider, OpenAI format"
-curl -sS "$MOCK/v1/chat/completions" -H 'Authorization: Bearer mock' \
-  -d '{"model":"alpha;tokens=3","messages":[{"role":"user","content":"hello"}]}'
+section "Non-streaming request through the gateway"
+ask demo-fast ''
+status
+grep -iE '^x-llmgate-' "$WORK/headers" | tr -d '\r'
 
-section "Mock provider, Anthropic format, streaming"
-curl -sS -N "$MOCK/v1/messages" -H 'x-api-key: mock' -H 'anthropic-version: 2026-10-21' \
-  -d '{"model":"beta;tokens=2","max_tokens":16,"stream":true,"messages":[{"role":"user","content":"hello"}]}'
+section "Streaming request, with usage"
+ask demo-fast ',"stream":true,"stream_options":{"include_usage":true}'
 
-section "Mock provider, injected 429"
-curl -sS -i "$MOCK/v1/chat/completions" -H 'Authorization: Bearer mock' \
-  -d '{"model":"alpha;fail=status;status=429;retry_after=2","messages":[{"role":"user","content":"hello"}]}' \
-  | grep -iE '^(HTTP/|retry-after|\{)'
+section "An unsupported field is rejected by name, and never reaches the provider"
+ask demo-fast ',"tools":[]'
+status
 
-section "Mock counters"
-curl -sS "$MOCK/__mock/stats"
+section "The provider fails before any content: an ordinary HTTP error"
+ask demo-fails-before-content ',"stream":true'
+status
+
+section "The provider fails after content: one error event, and no [DONE]"
+ask demo-fails-midstream ',"stream":true'
+status
+
+section "The provider is rate limiting: the status and retry hint are passed on"
+ask demo-rate-limited ''
+status
+grep -i '^retry-after' "$WORK/headers" | tr -d '\r'
+
+section "A client that disconnects cancels the upstream request"
+curl -sS -N --max-time 0.5 -o /dev/null "$GATEWAY/v1/chat/completions" -H "Authorization: Bearer $KEY" \
+  -d '{"model":"demo-slow","stream":true,"messages":[{"role":"user","content":"hello"}]}' 2>/dev/null || true
+sleep 0.3
+printf 'mock counters for the canceled stream: '
+curl -sS "$MOCK/__mock/stats" | python3 -I -c 'import json,sys; print(json.load(sys.stdin)["slow"])'
+
+section "What the gateway recorded for each attempt"
+python3 -I - "$WORK/gateway.log" <<'PY'
+import json, sys
+for line in open(sys.argv[1]):
+    r = json.loads(line)
+    if r.get("msg") != "upstream attempt":
+        continue
+    print("{alias:28} {outcome:16} committed={committed!s:5} usage={usage_state:8} completion_tokens={tokens} text_events={text_events}".format(
+        tokens=r.get("completion_tokens", "-"), **r))
+PY
 
 section "Done"
