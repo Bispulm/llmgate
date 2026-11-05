@@ -83,7 +83,7 @@ func serve(ctx context.Context, configPath string, p process) error {
 			return err
 		}
 		defer tenant.close()
-		opts.Auth, opts.Ledger, opts.TeamLimiter = tenant.keys, tenant.ledger, tenant.limiter
+		opts.Auth, opts.Ledger, opts.TeamLimiter, opts.Cache = tenant.keys, tenant.ledger, tenant.limiter, tenant.cache
 	} else {
 		logger.Warn("development mode: budgets are not enforced and usage is only logged")
 		opts.Auth = auth.NewDevKey(secrets.DevKey)
@@ -191,6 +191,7 @@ func serve(ctx context.Context, configPath string, p process) error {
 // buildRoutes creates each configured provider and the alias table that uses them.
 func buildRoutes(cfg *config.Config, secrets *config.Secrets) (*routing.Table, error) {
 	providers := make(map[string]provider.Provider, len(cfg.Providers))
+	scopes := make(map[string]string, len(cfg.Providers))
 	limiters := make(map[string]*limits.FairLimiter, len(cfg.Providers))
 	for _, p := range cfg.Providers {
 		adapter, err := newProvider(p, secrets.ProviderKeys[p.Name], cfg.Limits)
@@ -198,6 +199,7 @@ func buildRoutes(cfg *config.Config, secrets *config.Secrets) (*routing.Table, e
 			return nil, fmt.Errorf("provider %q: %w", p.Name, err)
 		}
 		providers[p.Name] = adapter
+		scopes[p.Name] = p.Type + " " + p.BaseURL
 		if p.MaxConcurrency > 0 {
 			// Upstream capacity belongs to the account, so routes share one limiter.
 			limiters[p.Name] = limits.NewFairLimiter(limits.Config{
@@ -217,6 +219,7 @@ func buildRoutes(cfg *config.Config, secrets *config.Secrets) (*routing.Table, e
 			routes[j] = routing.Route{
 				ProviderName: r.Provider,
 				Provider:     providers[r.Provider],
+				Scope:        scopes[r.Provider],
 				Model:        r.Model,
 				Tier:         r.Tier,
 				Weight:       r.Weight,
@@ -227,6 +230,7 @@ func buildRoutes(cfg *config.Config, secrets *config.Secrets) (*routing.Table, e
 			Name:            m.Alias,
 			MaxOutputTokens: m.MaxOutputTokens,
 			MaxAttempts:     m.MaxAttempts,
+			CacheTTL:        m.Cache.TTL,
 			Routes:          routes,
 		}
 	}

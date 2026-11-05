@@ -14,6 +14,7 @@ import (
 	"github.com/Bispulm/llmgate/internal/accounting"
 	"github.com/Bispulm/llmgate/internal/admin"
 	"github.com/Bispulm/llmgate/internal/auth"
+	"github.com/Bispulm/llmgate/internal/cache"
 	"github.com/Bispulm/llmgate/internal/config"
 	"github.com/Bispulm/llmgate/internal/limits"
 	"github.com/Bispulm/llmgate/internal/routing"
@@ -25,13 +26,16 @@ const reconcileBatch = 200
 // tenantRuntime is everything tenant mode adds: Postgres for money and keys, Redis for
 // team limits, the admin API, and the reconciler.
 type tenantRuntime struct {
-	cfg     *config.Config
-	pool    *pgxpool.Pool
-	redis   *redis.Client
-	keys    *auth.KeyStore
-	ledger  *accounting.Ledger
-	limiter *limits.TeamLimiter
-	admin   http.Handler
+	cfg   *config.Config
+	pool  *pgxpool.Pool
+	redis *redis.Client
+	// cacheRedis is the cache's own Redis, when it has one.
+	cacheRedis *redis.Client
+	cache      *cache.Cache
+	keys       *auth.KeyStore
+	ledger     *accounting.Ledger
+	limiter    *limits.TeamLimiter
+	admin      http.Handler
 }
 
 func startTenant(ctx context.Context, cfg *config.Config, secrets *config.Secrets, routes *routing.Table, logger *slog.Logger) (*tenantRuntime, error) {
@@ -59,12 +63,17 @@ func (t *tenantRuntime) start(ctx context.Context, secrets *config.Secrets, rout
 	if err != nil {
 		return fmt.Errorf("storing price list %q: %w", list.Label, err)
 	}
-	redisOpts, err := redis.ParseURL(secrets.RedisURL)
-	if err != nil {
-		// The parse error can contain the URL, and so its password.
-		return errors.New("parsing the Redis URL: the URL is malformed")
+	if t.redis, err = newRedis(secrets.RedisURL); err != nil {
+		return err
 	}
-	t.redis = redis.NewClient(redisOpts)
+	cacheClient := t.redis
+	if secrets.CacheRedisURL != secrets.RedisURL {
+		if t.cacheRedis, err = newRedis(secrets.CacheRedisURL); err != nil {
+			return err
+		}
+		cacheClient = t.cacheRedis
+	}
+	t.cache = cache.New(cache.Options{Client: cacheClient, Prefix: t.cfg.Redis.KeyPrefix, MaxEntryBytes: t.cfg.Cache.MaxEntryBytes})
 
 	rejected := accounting.RejectedChargeNone
 	if t.cfg.Accounting.RejectedAttemptCharge == config.RejectedChargeConservative {
@@ -108,9 +117,20 @@ func (t *tenantRuntime) runReconciler(ctx context.Context, logger *slog.Logger) 
 	})
 }
 
+func newRedis(url string) (*redis.Client, error) {
+	opts, err := redis.ParseURL(url)
+	if err != nil {
+		// The parse error can contain the URL, and so its password.
+		return nil, errors.New("parsing a Redis URL: the URL is malformed")
+	}
+	return redis.NewClient(opts), nil
+}
+
 func (t *tenantRuntime) close() {
-	if t.redis != nil {
-		_ = t.redis.Close()
+	for _, c := range []*redis.Client{t.redis, t.cacheRedis} {
+		if c != nil {
+			_ = c.Close()
+		}
 	}
 	t.pool.Close()
 }
