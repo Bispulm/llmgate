@@ -346,10 +346,13 @@ func (t *usageTracker) apply(raw json.RawMessage, isDelta bool) {
 		t.cacheWrite = in.CacheWrite
 	}
 	if in.Output != nil {
+		// These counts are cumulative, so one going backwards is wrong. The higher figure
+		// is kept, since charging the lower one could undercharge.
 		if t.output != nil && *in.Output < *t.output {
 			t.decreased = true
+		} else {
+			t.output = in.Output
 		}
-		t.output = in.Output
 		if isDelta {
 			t.finished = true
 		}
