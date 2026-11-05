@@ -1,14 +1,19 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/Bispulm/llmgate/internal/mock"
+	"github.com/Bispulm/llmgate/internal/sse"
 )
 
 const testConfig = `
@@ -79,6 +84,226 @@ func TestServeRunsUntilCanceled(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("server did not stop after cancel")
+	}
+}
+
+// startServe runs the gateway command with the given configuration, stopping it
+// when the test ends.
+func startServe(t *testing.T, config string) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(path, []byte(config), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	addrs := make(chan string, 1)
+	done := make(chan error, 1)
+	go func() {
+		done <- run(ctx, []string{"serve", "-config", path}, testEnv, io.Discard, func(addr string) { addrs <- addr })
+	}()
+	t.Cleanup(func() {
+		cancel()
+		if err := <-done; err != nil {
+			t.Errorf("run returned %v", err)
+		}
+	})
+
+	select {
+	case addr := <-addrs:
+		return addr
+	case err := <-done:
+		done <- err
+		t.Fatalf("run returned early: %v", err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("server did not start")
+	}
+	return ""
+}
+
+func TestServeProxiesToTheConfiguredProvider(t *testing.T) {
+	upstream := httptest.NewServer(mock.New())
+	defer upstream.Close()
+
+	config := strings.Replace(testConfig, "http://127.0.0.1:18301/v1", upstream.URL+"/v1", 1)
+	addr := startServe(t, config)
+
+	post := func(t *testing.T, key, body string) (*http.Response, string) {
+		t.Helper()
+		req, err := http.NewRequest(http.MethodPost, "http://"+addr+"/v1/chat/completions", strings.NewReader(body))
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header.Set("Authorization", "Bearer "+key)
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = resp.Body.Close() }()
+		raw, err := io.ReadAll(resp.Body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return resp, string(raw)
+	}
+	const message = `"messages":[{"role":"user","content":"hello"}]`
+
+	t.Run("non-streaming", func(t *testing.T) {
+		resp, body := post(t, "dev", `{"model":"fast",`+message+`}`)
+		if resp.StatusCode != http.StatusOK || !strings.Contains(body, "[alpha]") {
+			t.Fatalf("status %d, body %s", resp.StatusCode, body)
+		}
+	})
+	t.Run("streaming", func(t *testing.T) {
+		resp, body := post(t, "dev", `{"model":"fast","stream":true,`+message+`}`)
+		if resp.StatusCode != http.StatusOK || !strings.Contains(body, "[alpha]") || !strings.HasSuffix(body, "data: [DONE]\n\n") {
+			t.Fatalf("status %d, body %s", resp.StatusCode, body)
+		}
+	})
+	t.Run("the configured client key is required", func(t *testing.T) {
+		if resp, _ := post(t, "wrong", `{"model":"fast",`+message+`}`); resp.StatusCode != http.StatusUnauthorized {
+			t.Fatalf("status %d", resp.StatusCode)
+		}
+	})
+	t.Run("the configured output limit applies", func(t *testing.T) {
+		if resp, _ := post(t, "dev", `{"model":"fast","max_tokens":65,`+message+`}`); resp.StatusCode != http.StatusBadRequest {
+			t.Fatalf("status %d", resp.StatusCode)
+		}
+	})
+}
+
+// startStream begins a streaming request and reads its first event, so the request
+// is known to be in flight.
+func startStream(t *testing.T, addr string) (*http.Response, *sse.Decoder) {
+	t.Helper()
+	req, err := http.NewRequest(http.MethodPost, "http://"+addr+"/v1/chat/completions",
+		strings.NewReader(`{"model":"fast","stream":true,"messages":[{"role":"user","content":"hello"}]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Authorization", "Bearer dev")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = resp.Body.Close() })
+	decoder := sse.NewDecoder(resp.Body, 1<<16)
+	if _, err := decoder.Next(); err != nil {
+		t.Fatal(err)
+	}
+	return resp, decoder
+}
+
+// lastEvent reads a stream to its end and returns its final event's data.
+func lastEvent(decoder *sse.Decoder) string {
+	last := ""
+	for {
+		ev, err := decoder.Next()
+		if err != nil {
+			return last
+		}
+		last = string(ev.Data)
+	}
+}
+
+func TestShutdown(t *testing.T) {
+	serveWith := func(t *testing.T, upstreamURL, model, drain string) (string, context.CancelFunc, chan error) {
+		t.Helper()
+		config := strings.Replace(testConfig, "http://127.0.0.1:18301/v1", upstreamURL+"/v1", 1)
+		config = strings.Replace(config, "model: alpha", "model: "+quoteYAML(model), 1)
+		config = strings.Replace(config, "shutdown_timeout: 2s", "shutdown_timeout: "+drain, 1)
+		path := filepath.Join(t.TempDir(), "config.yaml")
+		if err := os.WriteFile(path, []byte(config), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		ctx, cancel := context.WithCancel(context.Background())
+		t.Cleanup(cancel)
+		addrs := make(chan string, 1)
+		done := make(chan error, 1)
+		go func() {
+			done <- run(ctx, []string{"serve", "-config", path}, testEnv, io.Discard, func(addr string) { addrs <- addr })
+		}()
+		select {
+		case addr := <-addrs:
+			return addr, cancel, done
+		case err := <-done:
+			t.Fatalf("run returned early: %v", err)
+		case <-time.After(5 * time.Second):
+			t.Fatal("server did not start")
+		}
+		return "", cancel, done
+	}
+	waitForRun := func(t *testing.T, done chan error) {
+		t.Helper()
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Fatalf("run returned %v", err)
+			}
+		case <-time.After(10 * time.Second):
+			t.Fatal("run did not return")
+		}
+	}
+
+	t.Run("a stream that finishes within the drain timeout completes", func(t *testing.T) {
+		upstream := httptest.NewServer(mock.New())
+		defer upstream.Close()
+		addr, cancel, done := serveWith(t, upstream.URL, "alpha;tokens=6;interval=50ms", "5s")
+		_, decoder := startStream(t, addr)
+		cancel()
+		if got := lastEvent(decoder); got != "[DONE]" {
+			t.Fatalf("last event = %q", got)
+		}
+		waitForRun(t, done)
+	})
+	t.Run("a stream outliving the drain timeout is ended, along with its upstream call", func(t *testing.T) {
+		m := mock.New()
+		upstream := httptest.NewServer(m)
+		defer upstream.Close()
+		addr, cancel, done := serveWith(t, upstream.URL, "stuck;tokens=64;interval=1s", "200ms")
+		_, decoder := startStream(t, addr)
+
+		start := time.Now()
+		cancel()
+		waitForRun(t, done)
+		if got := time.Since(start); got > 5*time.Second {
+			t.Fatalf("shutdown took %v", got)
+		}
+		if got := lastEvent(decoder); got == "[DONE]" {
+			t.Fatal("a stream ended by shutdown looks successful")
+		}
+		deadline := time.Now().Add(5 * time.Second)
+		for m.Stats()["stuck"].Canceled != 1 {
+			if time.Now().After(deadline) {
+				t.Fatalf("upstream call was not canceled: %+v", m.Stats()["stuck"])
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+	})
+}
+
+func quoteYAML(s string) string { return "'" + s + "'" }
+
+func TestServeLogsThatBudgetsAreNotEnforced(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var logs bytes.Buffer
+	started := make(chan struct{})
+	done := make(chan error, 1)
+	go func() {
+		done <- run(ctx, []string{"serve", "-config", writeTestConfig(t)}, testEnv, &logs, func(string) { close(started) })
+	}()
+	select {
+	case <-started:
+	case err := <-done:
+		t.Fatalf("run returned early: %v", err)
+	}
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(logs.String(), "budgets are not enforced") {
+		t.Fatalf("logs = %s", logs.String())
 	}
 }
 
