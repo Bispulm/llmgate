@@ -52,7 +52,7 @@ stack-down:
 	docker compose --profile stack down
 
 image:
-	docker build -t llmgate:dev .
+	docker build --build-arg COMMIT=$$(git rev-parse HEAD) -t llmgate:dev .
 
 # Runs every test, including those needing real Postgres and Redis. It fails rather
 # than skips if they can't be reached.

@@ -17,6 +17,13 @@ PG_CONTAINER=${BENCH_PG_CONTAINER:-llmgate-postgres-1}
 DB_URL="postgres://llmgate:llmgate_dev@127.0.0.1:${LLMGATE_POSTGRES_PORT:-15433}/llmgate_bench?sslmode=disable"
 REDIS_URL="redis://127.0.0.1:${LLMGATE_REDIS_PORT:-16383}/2"
 
+for port in 18300 18301 18302 18303; do
+  if lsof -nP -iTCP:"$port" -sTCP:LISTEN >/dev/null 2>&1; then
+    echo "port $port is in use, and the benchmark needs 18300 to 18303 for its own processes" >&2
+    exit 1
+  fi
+done
+
 SHA=$(git rev-parse --short HEAD)$(git diff --quiet && git diff --cached --quiet || echo "-dirty")
 OUT=bench/results/$(date -u +%Y-%m-%d)-$SHA
 WORK=$(mktemp -d)
@@ -74,8 +81,9 @@ other_cpu() {
 section "Mock and database"
 "$WORK/llmgate-mock" -listen 127.0.0.1:18301 2>"$WORK/mock.log" & MOCK_PID=$!
 wait_for http://127.0.0.1:18301/__mock/stats
-docker exec "$PG_CONTAINER" psql -U llmgate -d llmgate -tAc "SELECT 1 FROM pg_database WHERE datname = 'llmgate_bench'" | grep -q 1 ||
-  docker exec "$PG_CONTAINER" psql -U llmgate -d llmgate -qc "CREATE DATABASE llmgate_bench"
+kill -0 "$MOCK_PID" 2>/dev/null || { echo "the mock exited at startup" >&2; exit 1; }
+# A fresh database each run, so the liability report covers this run only.
+docker exec "$PG_CONTAINER" psql -U llmgate -d llmgate -qc "DROP DATABASE IF EXISTS llmgate_bench WITH (FORCE)" -c "CREATE DATABASE llmgate_bench" >/dev/null
 
 prices() {
   for model in "$@"; do
@@ -136,6 +144,8 @@ export BENCH_DEV_KEY=bench-dev-key BENCH_MOCK_KEY=mock BENCH_DATABASE_URL=$DB_UR
 start_gateway() { # config file
   "$WORK/llmgate" serve --config "$1" 2>"$WORK/gateway.log" & GATEWAY_PID=$!
   wait_for http://127.0.0.1:18300/healthz
+  # Something else answering on the port mustn't pass for this gateway.
+  kill -0 "$GATEWAY_PID" 2>/dev/null || { echo "the gateway exited at startup:" >&2; cat "$WORK/gateway.log" >&2; exit 1; }
 }
 stop_gateway() { kill "$GATEWAY_PID" 2>/dev/null || true; wait "$GATEWAY_PID" 2>/dev/null || true; GATEWAY_PID=""; }
 bench() { # label url key model [flags...]
@@ -145,7 +155,10 @@ bench() { # label url key model [flags...]
 }
 cli() { LLMGATE_ADMIN_TOKEN=$ADMIN_TOKEN "$WORK/llmgate" "$@" --admin-url http://127.0.0.1:18302; }
 team_key() { # team
-  cli teams create "$1" --budget-usd 100000 >/dev/null 2>&1 || true
+  # Limits far above the workload, so the shared Redis check runs on every request without
+  # refusing any.
+  cli teams create "$1" --budget-usd 100000 --requests-per-minute 100000000 --tokens-per-minute 100000000000 \
+    --max-in-flight 100000 >/dev/null 2>&1 || true
   cli keys create "$1" | head -1
 }
 metric() { curl -s http://127.0.0.1:18303/metrics | awk -v m="$1" '$1 == m {print $2}'; }
