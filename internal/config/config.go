@@ -40,6 +40,7 @@ const (
 	DefaultClientWriteTimeout       = 10 * time.Second
 	DefaultBodyReadTimeout          = 10 * time.Second
 	DefaultShutdownTimeout          = 30 * time.Second
+	DefaultQueueTimeout             = 5 * time.Second
 )
 
 // Config is the validated contents of a configuration file.
@@ -93,6 +94,15 @@ type Provider struct {
 	BaseURL        string `yaml:"base_url"`
 	APIKeyEnv      string `yaml:"api_key_env"`
 	MaxTokensParam string `yaml:"max_tokens_param"`
+
+	// MaxConcurrency limits attempts running at once on this provider, in each
+	// process. Zero means no limit. The others only apply when it's set.
+	MaxConcurrency     int `yaml:"max_concurrency"`
+	MaxQueue           int `yaml:"max_queue"`
+	MaxQueuePerTeam    int `yaml:"max_queue_per_team"`
+	MaxInFlightPerTeam int `yaml:"max_in_flight_per_team"`
+	// QueueTimeout is how long a request waits before trying another route.
+	QueueTimeout time.Duration `yaml:"queue_timeout"`
 }
 
 // Model is a client-visible alias and the routes that can serve it.
@@ -175,6 +185,7 @@ func (c *Config) applyDefaults() {
 	setDefault(&c.Limits.BodyReadTimeout, DefaultBodyReadTimeout)
 	for i := range c.Providers {
 		setDefault(&c.Providers[i].MaxTokensParam, MaxCompletionTokens)
+		setDefault(&c.Providers[i].QueueTimeout, DefaultQueueTimeout)
 	}
 }
 
@@ -306,7 +317,21 @@ func (p Provider) validate() error {
 	default:
 		return fmt.Errorf("unknown max_tokens_param %q", p.MaxTokensParam)
 	}
+	if err := p.validateConcurrency(); err != nil {
+		return err
+	}
 	return validateBaseURL(p.BaseURL)
+}
+
+func (p Provider) validateConcurrency() error {
+	if p.MaxConcurrency < 0 || p.MaxQueue < 0 || p.MaxQueuePerTeam < 0 || p.MaxInFlightPerTeam < 0 || p.QueueTimeout < 0 {
+		return errors.New("concurrency settings must not be negative")
+	}
+	// Without this, these would look like protection while doing nothing.
+	if p.MaxConcurrency == 0 && (p.MaxQueue > 0 || p.MaxQueuePerTeam > 0 || p.MaxInFlightPerTeam > 0) {
+		return errors.New("queue and per-team limits need max_concurrency to be set")
+	}
+	return nil
 }
 
 // validateBaseURL refuses plaintext to anything but loopback, because the

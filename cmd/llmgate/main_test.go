@@ -173,6 +173,51 @@ func TestServeProxiesToTheConfiguredProvider(t *testing.T) {
 	})
 }
 
+func TestServeAppliesProviderConcurrencyLimits(t *testing.T) {
+	m := mock.New()
+	upstream := httptest.NewServer(m)
+	defer upstream.Close()
+
+	config := strings.Replace(testConfig, "http://127.0.0.1:18301/v1", upstream.URL+"/v1", 1)
+	config = strings.Replace(config, "api_key_env: TEST_PROVIDER_KEY", "api_key_env: TEST_PROVIDER_KEY\n    max_concurrency: 1", 1)
+	config = strings.Replace(config, "model: alpha", "model: 'held;latency=1s'", 1)
+	addr := startServe(t, config)
+
+	send := func() int {
+		req, err := http.NewRequest(http.MethodPost, "http://"+addr+"/v1/chat/completions",
+			strings.NewReader(`{"model":"fast","messages":[{"role":"user","content":"hello"}]}`))
+		if err != nil {
+			t.Error(err)
+			return 0
+		}
+		req.Header.Set("Authorization", "Bearer dev")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Error(err)
+			return 0
+		}
+		defer func() { _ = resp.Body.Close() }()
+		_, _ = io.Copy(io.Discard, resp.Body)
+		return resp.StatusCode
+	}
+
+	first := make(chan int, 1)
+	go func() { first <- send() }()
+	deadline := time.Now().Add(5 * time.Second)
+	for m.Stats()["held"].Requests != 1 {
+		if time.Now().After(deadline) {
+			t.Fatal("the first request never reached the provider")
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	if got := send(); got != http.StatusServiceUnavailable {
+		t.Fatalf("second request = %d, want it shed while the first runs", got)
+	}
+	if got := <-first; got != http.StatusOK {
+		t.Fatalf("first request = %d", got)
+	}
+}
+
 func TestServeProxiesToAnAnthropicProvider(t *testing.T) {
 	upstream := httptest.NewServer(mock.New())
 	defer upstream.Close()

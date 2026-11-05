@@ -65,6 +65,17 @@ Outcomes are reported when an attempt ends, so a stream that dies midway counts 
 
 **Replica behavior.** Breakers are process-local. Each replica learns about a failing route on its own, so a fleet of N replicas sends roughly N times the minimum evidence before all have opened, and up to N times the probes during recovery. Sharing state would add a dependency to every request's path, for a saving of a few failed attempts. This is not acceptable for budgets, which is why [ADR 0002](0002-postgres-is-the-budget-authority.md) keeps those in Postgres.
 
+### Concurrency and fair admission
+
+Each provider can have a limit on attempts running at once, because upstream capacity belongs to the account rather than to one model. When it's full, requests wait in a bounded queue.
+
+- **Round robin between teams.** Waiting teams are served in turn, and each team's own requests in order. A team queueing hundreds of requests gets one turn in each round, the same as a team with one.
+- **Per-team limits.** `max_queue_per_team` keeps one team from filling the queue and shedding everyone else. `max_in_flight_per_team` keeps one team from holding every slot, and a team at its limit doesn't hold up teams behind it.
+- **Explicit shedding.** A full queue, or a wait longer than `queue_timeout`, moves on to the next route. With nowhere left to go, the client gets a fast `503 capacity_exceeded` with `Retry-After`.
+- **Capacity comes before the attempt.** A route that was never called isn't an attempt, costs nothing, and doesn't affect its health. A slot comes back however an attempt ends.
+
+These limits are per process, so a fleet's total is the limit times its replicas. Limits a team is promised across replicas live in Redis, described in [ADR 0002](0002-postgres-is-the-budget-authority.md).
+
 ## Alternatives considered
 
 - **Failing over on every error.** Simple, and wrong for invalid requests and cancellations.
