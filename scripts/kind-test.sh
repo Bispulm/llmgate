@@ -2,8 +2,9 @@
 # Installs the chart on a local kind cluster and checks it serves, accounts, and
 # survives a rolling restart. Only the mock provider is used, so nothing costs money.
 #
-# Every kubectl and helm call names its context, so no other cluster is touched. The
-# cluster is deleted at the end unless KEEP_CLUSTER=1.
+# The cluster gets a kubeconfig of its own, so the default one, and its current context,
+# are never changed. Every kubectl and helm call also names its context. The cluster is
+# deleted at the end unless KEEP_CLUSTER=1.
 set -euo pipefail
 
 CLUSTER=llmgate-dev
@@ -14,11 +15,12 @@ ADMIN_PORT=${LLMGATE_KIND_ADMIN_PORT:-18307}
 ADMIN_TOKEN=kind-test-admin-token
 WORK=$(mktemp -d)
 PIDS=()
+export KUBECONFIG="$WORK/kubeconfig"
 
 cleanup() {
   for pid in "${PIDS[@]:-}"; do kill "$pid" 2>/dev/null || true; done
-  rm -rf "$WORK"
   if [ "${KEEP_CLUSTER:-0}" != 1 ]; then kind delete cluster --name "$CLUSTER" >/dev/null 2>&1 || true; fi
+  rm -rf "$WORK"
 }
 trap cleanup EXIT
 
@@ -26,7 +28,11 @@ k() { kubectl --context "$CONTEXT" -n "$NAMESPACE" "$@"; }
 section() { printf '\n== %s\n' "$1"; }
 
 section "Cluster"
-kind get clusters 2>/dev/null | grep -qx "$CLUSTER" || kind create cluster --name "$CLUSTER" --wait 120s
+if kind get clusters 2>/dev/null | grep -qx "$CLUSTER"; then
+  kind export kubeconfig --name "$CLUSTER" >/dev/null
+else
+  kind create cluster --name "$CLUSTER" --wait 120s
+fi
 docker build -q -t llmgate:dev . >/dev/null
 # Only the gateway is loaded: the cluster pulls Postgres and Redis itself, since kind
 # can't load a multi-platform image that's only partly stored locally.
