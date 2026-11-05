@@ -185,6 +185,11 @@ for c in 1 4 16 64 256; do
 done
 
 section "Memory per active stream"
+# A fresh process, given a moment to settle, so the idle reading isn't left over from the
+# saturation runs before it.
+stop_gateway
+start_gateway "$WORK/dev.yaml"
+sleep 3
 IDLE_HEAP=$(metric go_memstats_heap_inuse_bytes); IDLE_GOROUTINES=$(metric go_goroutines)
 # Each stream lasts about ten seconds, so the heap is sampled while all of them are open.
 LLMGATE_BENCH_KEY=$BENCH_DEV_KEY "$WORK/llmgate-bench" -label streams -url "$GATEWAY" -model bench-slow -stream \
