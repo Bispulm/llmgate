@@ -67,7 +67,7 @@ What the gateway does when something fails, how to recognize it, and what to do.
 
 - Run `llmgate migrate` before starting a new version. The chart does this in a pre-upgrade hook. The gateway refuses to start on an outdated schema, rather than migrating by itself.
 - Check a configuration first with `llmgate validate --config config.yaml`.
-- On a rolling update, `server.drain_delay` keeps a stopping replica serving while it reports not ready, then in-flight requests get `server.shutdown_timeout` to finish and settle. Anything still running when that runs out is canceled, settled as uncertain, and left to the reconciler.
+- On a rolling update, `server.drain_delay` keeps a stopping replica serving while it reports not ready and asks clients to close their connections, then in-flight requests get `server.shutdown_timeout` to finish and settle. Anything still running when that runs out is canceled, settled as uncertain, and charged its full reservation unless usage arrives. Keep the shutdown timeout above `limits.request_timeout`, and the pod's grace period above both.
 - Prices change only through a new `pricing.version`. Reusing a version with different prices is refused at startup, because every past charge has to stay reproducible.
 
 ## Clocks disagree

@@ -37,6 +37,14 @@ The script also measures:
 
 `llmgate-bench` sends requests from a fixed number of workers for a fixed time, after a warm-up whose requests are sent but not counted. For each response it records the time to the first byte of the body, which for a stream is its first event, and the time to read the whole response. It reports nearest-rank percentiles, throughput, and errors by status, as JSON. `llmgate-bench compare` puts several runs in a table, with what each adds to the first. The API key comes from `LLMGATE_BENCH_KEY` and never appears in the output.
 
+Three things to keep in mind when reading the numbers:
+
+- **It's closed-loop.** Each worker waits for a response before sending the next request, so when the gateway slows down, fewer requests are sent. That understates tail latency under overload compared with a fixed arrival rate. The saturation sweep shows where throughput stops growing, which is where this matters.
+- **Failed requests are counted, not timed.** Errors are reported by status, and only successful responses go into the percentiles. Any run with errors says so in its table.
+- **"Added" latency is a difference of percentiles**, such as the gateway's p99 minus the mock's p99, not the percentile of a per-request difference.
+
+The CPU profile is taken during the tenant-mode run only, which costs that run a little.
+
 ## Conditions
 
 Each run records the commit, the Go version, the operating system, the CPU, its cores and memory, how Postgres and Redis were run, the workload, the load average before it started, and the CPU other processes used during it, sampled every 10 seconds. The benchmark loads the machine itself, so the load average during the run says nothing about other work. A run is labeled **contended** if the load average before it exceeded a quarter of the cores, or other processes averaged more than one core, and its report says so at the top. A contended run isn't presented as a measurement of the gateway.
