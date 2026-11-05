@@ -21,6 +21,7 @@ The following do not commit, and consume no meaningful memory because adapters d
 - An upstream `200` and its headers.
 - Role-only or empty chunks.
 - `ping` events and comments.
+- Chunks that only report usage. Some servers send them on every chunk, including the role-only one.
 - Anthropic `message_start`, `content_block_start`, and thinking prelude.
 
 Before commit, the gateway holds at most one normalized event, whose size is limited by the SSE event limit. Everything that fails before commit, including a bad content type, a malformed first event, or a timeout waiting for it, is still eligible for failover and otherwise produces a clean HTTP error.
@@ -40,7 +41,7 @@ After commit:
 | Stream idle timeout | Between content events | Detects a stalled upstream after commit |
 | Client write timeout | Per write and flush | A stalled client releases upstream resources |
 
-Pings don't reset the first-event or idle timers, because a provider that only sends keepalives isn't making progress.
+Pings and usage reports don't reset the first-event or idle timers, because a provider that only sends those isn't making progress.
 
 ### Backpressure
 

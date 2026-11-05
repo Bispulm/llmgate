@@ -326,7 +326,7 @@ func (s *Server) proxyStream(parent context.Context, x *exchange) {
 	}
 	defer func() { _ = stream.Close() }()
 
-	first, err := stream.Next()
+	first, err := x.awaitFirstOutput(stream)
 	if errors.Is(err, io.EOF) {
 		// Adapters report a finish reason as an event, so this breaks their contract.
 		err = &provider.Error{
@@ -342,8 +342,6 @@ func (s *Server) proxyStream(parent context.Context, x *exchange) {
 	watchdog.stop()
 	x.attempt.TimeToFirstEvent = time.Since(x.start)
 
-	x.observe(first)
-
 	// This is the commitment point. See ADR 0003.
 	x.attempt.Committed = true
 	out := newStreamWriter(x, s)
@@ -352,14 +350,12 @@ func (s *Server) proxyStream(parent context.Context, x *exchange) {
 		return
 	}
 
-	idle := newWatchdog(0, func() { cancel(errStreamIdleTimeout) })
+	idle := newWatchdog(s.limits.StreamIdleTimeout, func() { cancel(errStreamIdleTimeout) })
 	defer idle.stop()
 	for {
-		idle.reset(s.limits.StreamIdleTimeout)
 		event, err := stream.Next()
-		idle.stop()
-
 		if errors.Is(err, io.EOF) {
+			idle.stop()
 			if err := out.finish(x.attempt.Usage); err != nil {
 				x.clientWriteFailed(err)
 				return
@@ -368,13 +364,37 @@ func (s *Server) proxyStream(parent context.Context, x *exchange) {
 			return
 		}
 		if err != nil {
+			idle.stop()
 			s.interruptStream(ctx, x, out, err)
 			return
 		}
 		x.observe(event)
+		if !event.HasOutput() {
+			continue // Not progress, so the idle timer keeps running.
+		}
+
+		// A slow client isn't the upstream stalling, so writing doesn't count as idle.
+		idle.stop()
 		if err := out.write(event); err != nil {
 			x.clientWriteFailed(err)
 			return
+		}
+		idle.reset(s.limits.StreamIdleTimeout)
+	}
+}
+
+// awaitFirstOutput reads until an event with output arrives, which is what may
+// commit the response. The first-event timeout bounds how long this can take,
+// however many usage reports arrive in the meantime.
+func (x *exchange) awaitFirstOutput(stream provider.Stream) (chat.StreamEvent, error) {
+	for {
+		event, err := stream.Next()
+		if err != nil {
+			return chat.StreamEvent{}, err
+		}
+		x.observe(event)
+		if event.HasOutput() {
+			return event, nil
 		}
 	}
 }

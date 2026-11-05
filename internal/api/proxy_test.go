@@ -1227,6 +1227,7 @@ func TestStreamFramingFromUpstreamDoesNotChangeOutput(t *testing.T) {
 type fakeProvider struct {
 	completion *chat.Completion
 	events     []chat.StreamEvent
+	streamErr  error // ends the stream after events, instead of io.EOF
 }
 
 func (f *fakeProvider) Complete(context.Context, *chat.Request, string) (*chat.Completion, error) {
@@ -1234,15 +1235,19 @@ func (f *fakeProvider) Complete(context.Context, *chat.Request, string) (*chat.C
 }
 
 func (f *fakeProvider) Stream(context.Context, *chat.Request, string) (provider.Stream, error) {
-	return &fakeStream{events: f.events}, nil
+	return &fakeStream{events: f.events, err: f.streamErr}, nil
 }
 
 type fakeStream struct {
 	events []chat.StreamEvent
+	err    error
 }
 
 func (s *fakeStream) Next() (chat.StreamEvent, error) {
 	if len(s.events) == 0 {
+		if s.err != nil {
+			return chat.StreamEvent{}, s.err
+		}
 		return chat.StreamEvent{}, io.EOF
 	}
 	ev := s.events[0]
@@ -1370,6 +1375,83 @@ func TestResponseEncoding(t *testing.T) {
 		}
 		if a := g.recorder.wait(t); a.Usage == nil || a.Usage.State != chat.UsageMalformed {
 			t.Fatalf("attempt usage = %+v", a.Usage)
+		}
+	})
+}
+
+// usageServer streams chunks that carry usage but no output, as servers with
+// continuous usage reporting do. The optional first chunk comes before them.
+func usageServer(t *testing.T, first string) string {
+	t.Helper()
+	const usageChunk = `{"choices":[{"index":0,"delta":{"role":"assistant"}}],"usage":{"prompt_tokens":1,"completion_tokens":0,"total_tokens":1}}`
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		if first != "" {
+			_, _ = io.WriteString(w, "data: "+first+"\n\n")
+		}
+		for {
+			_, _ = io.WriteString(w, "data: "+usageChunk+"\n\n")
+			_ = http.NewResponseController(w).Flush()
+			select {
+			case <-r.Context().Done():
+				return
+			case <-time.After(10 * time.Millisecond):
+			}
+		}
+	}))
+	t.Cleanup(ts.Close)
+	return ts.URL
+}
+
+func TestUsageReportsAreNotOutput(t *testing.T) {
+	usage := &chat.Usage{State: chat.UsageReported, PromptTokens: 1, TotalTokens: 1}
+	shortTimers := func(o *Options) {
+		o.Limits.FirstEventTimeout = 200 * time.Millisecond
+		o.Limits.StreamIdleTimeout = 200 * time.Millisecond
+	}
+	gatewayFor := func(t *testing.T, url string) *gateway {
+		t.Helper()
+		adapter, err := openai.New(openai.Options{BaseURL: url, APIKey: "k", MaxResponseBytes: 1 << 16, MaxEventBytes: 1 << 16})
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(adapter.CloseIdleConnections)
+		return startGateway(t, adapter, "m", nil, shortTimers)
+	}
+
+	t.Run("a report before any output doesn't commit the response", func(t *testing.T) {
+		g := startGateway(t, &fakeProvider{
+			events:    []chat.StreamEvent{{Usage: usage}},
+			streamErr: &provider.Error{Kind: provider.KindServer, Delivery: provider.DeliveryConfirmed},
+		}, "m", nil)
+		expectError(t, g.post(t, chatBody(true, "")), 502, "upstream_error", "upstream_failed")
+		a := g.recorder.wait(t)
+		if a.Committed || a.Outcome != accounting.OutcomeFailed {
+			t.Fatalf("attempt = %+v", a)
+		}
+		if a.Usage == nil {
+			t.Fatal("the usage report was lost")
+		}
+	})
+	t.Run("reports alone don't keep the first-event window open", func(t *testing.T) {
+		g := gatewayFor(t, usageServer(t, ""))
+		expectError(t, g.post(t, chatBody(true, "")), 504, "upstream_error", "upstream_timeout")
+		if a := g.recorder.wait(t); a.Committed || a.Usage == nil {
+			t.Fatalf("attempt = %+v", a)
+		}
+	})
+	t.Run("reports alone don't keep a stalled stream alive", func(t *testing.T) {
+		g := gatewayFor(t, usageServer(t, `{"choices":[{"index":0,"delta":{"content":"a"}}]}`))
+		start := time.Now()
+		s := readStream(t, g.post(t, chatBody(true, "")).Body)
+		if s.done || s.err == nil {
+			t.Fatalf("stream = %+v", s)
+		}
+		if got := time.Since(start); got > 5*time.Second {
+			t.Fatalf("the stall was detected after %v", got)
+		}
+		if a := g.recorder.wait(t); a.ErrorKind != provider.KindTimeout || a.Usage == nil {
+			t.Fatalf("attempt = %+v", a)
 		}
 	})
 }
