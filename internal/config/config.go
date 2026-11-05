@@ -49,6 +49,11 @@ const (
 	DefaultUncertainGrace           = 10 * time.Minute
 	DefaultDatabaseMaxConns         = 20
 	DefaultRedisKeyPrefix           = "llmgate:"
+	DefaultMaxCacheEntryBytes       = 256 << 10
+
+	// MaxCacheTTL and MaxCacheEntryBytes bound what one cached answer can occupy.
+	MaxCacheTTL        = 24 * time.Hour
+	MaxCacheEntryBytes = 4 << 20
 
 	// MaxKeyCacheTTL bounds how long a revoked key can keep working on another replica.
 	MaxKeyCacheTTL = 5 * time.Minute
@@ -86,6 +91,7 @@ type Config struct {
 	Admin          Admin          `yaml:"admin"`
 	Pricing        Pricing        `yaml:"pricing"`
 	Accounting     Accounting     `yaml:"accounting"`
+	Cache          Cache          `yaml:"cache"`
 	Limits         Limits         `yaml:"limits"`
 	CircuitBreaker CircuitBreaker `yaml:"circuit_breaker"`
 	Providers      []Provider     `yaml:"providers"`
@@ -175,6 +181,19 @@ func (d *Decimal) UnmarshalYAML(node *yaml.Node) error {
 	return nil
 }
 
+// Cache configures the response cache. Aliases opt in with their own TTL.
+type Cache struct {
+	// RedisURLEnv names a separate Redis for cached answers, so that memory pressure from
+	// the cache can't evict rate-limit state. Without it the cache shares that Redis.
+	RedisURLEnv   string `yaml:"redis_url_env"`
+	MaxEntryBytes int    `yaml:"max_entry_bytes"`
+}
+
+// ModelCache lets clients opt in to cached answers for an alias.
+type ModelCache struct {
+	TTL time.Duration `yaml:"ttl"`
+}
+
 // Accounting configures settlement and reconciliation.
 type Accounting struct {
 	ReconcileInterval time.Duration `yaml:"reconcile_interval"`
@@ -224,8 +243,9 @@ type Model struct {
 	Alias           string `yaml:"alias"`
 	MaxOutputTokens int64  `yaml:"max_output_tokens"`
 	// MaxAttempts bounds upstream attempts per request. Zero means one per route.
-	MaxAttempts int     `yaml:"max_attempts"`
-	Routes      []Route `yaml:"routes"`
+	MaxAttempts int        `yaml:"max_attempts"`
+	Routes      []Route    `yaml:"routes"`
+	Cache       ModelCache `yaml:"cache"`
 }
 
 // Route points an alias at a model on a provider.
@@ -249,6 +269,8 @@ type Secrets struct {
 	DatabaseURL  string
 	RedisURL     string
 	AdminToken   string
+	// CacheRedisURL is the cache's own Redis, or RedisURL if it has none.
+	CacheRedisURL string
 }
 
 // Tenant reports whether this configuration uses virtual keys and budgets.
@@ -298,6 +320,14 @@ func (c *Config) ResolveSecrets(getenv func(string) string) (*Secrets, error) {
 			return nil, fmt.Errorf("environment variable %s is not set", r.name)
 		}
 	}
+	if c.Tenant() {
+		secrets.CacheRedisURL = secrets.RedisURL
+		if c.Cache.RedisURLEnv != "" {
+			if secrets.CacheRedisURL = getenv(c.Cache.RedisURLEnv); secrets.CacheRedisURL == "" {
+				return nil, fmt.Errorf("environment variable %s is not set", c.Cache.RedisURLEnv)
+			}
+		}
+	}
 	if c.Tenant() && len(secrets.AdminToken) < MinAdminTokenLength {
 		return nil, fmt.Errorf("environment variable %s must hold at least %d characters", c.Admin.TokenEnv, MinAdminTokenLength)
 	}
@@ -320,6 +350,14 @@ func (c *Config) validateMode() error {
 		if c.Database != (Database{}) || c.Redis != (Redis{}) || c.Admin != (Admin{}) || c.Pricing.Version != "" || len(c.Pricing.Prices) > 0 {
 			return errors.New("database, redis, admin, and pricing need auth.mode: tenant")
 		}
+		if c.Cache != (Cache{}) {
+			return errors.New("the cache needs auth.mode: tenant")
+		}
+		for _, m := range c.Models {
+			if m.Cache != (ModelCache{}) {
+				return fmt.Errorf("model %q: the cache needs auth.mode: tenant", m.Alias)
+			}
+		}
 	case AuthTenant:
 		if c.Auth.DevKeyEnv != "" {
 			return errors.New("auth.dev_key_env can't be used with auth.mode: tenant")
@@ -340,6 +378,7 @@ func (c *Config) applyDefaults() {
 		setDefault(&c.Accounting.ReconcileInterval, DefaultReconcileInterval)
 		setDefault(&c.Accounting.UncertainGrace, DefaultUncertainGrace)
 		setDefault(&c.Accounting.RejectedAttemptCharge, RejectedChargeNone)
+		setDefault(&c.Cache.MaxEntryBytes, DefaultMaxCacheEntryBytes)
 	}
 	setDefault(&c.Limits.MaxRequestBytes, DefaultMaxRequestBytes)
 	setDefault(&c.Limits.MaxResponseBytes, DefaultMaxResponseBytes)
@@ -463,6 +502,9 @@ func (c *Config) validateTenant() error {
 	case RejectedChargeNone, RejectedChargeConservative:
 	default:
 		return fmt.Errorf("accounting.rejected_attempt_charge must be %s or %s", RejectedChargeNone, RejectedChargeConservative)
+	}
+	if c.Cache.MaxEntryBytes < 0 || c.Cache.MaxEntryBytes > MaxCacheEntryBytes {
+		return fmt.Errorf("cache.max_entry_bytes must be between 0 and %d", MaxCacheEntryBytes)
 	}
 	if err := c.validateAdminListen(); err != nil {
 		return err
@@ -670,6 +712,9 @@ func (m Model) validate(providers map[string]bool) error {
 	}
 	if len(m.Routes) == 0 {
 		return errors.New("at least one route is required")
+	}
+	if m.Cache.TTL < 0 || m.Cache.TTL > MaxCacheTTL {
+		return fmt.Errorf("cache.ttl must be between 0 and %v", MaxCacheTTL)
 	}
 	if m.MaxAttempts < 0 || m.MaxAttempts > maxAttemptsLimit {
 		return fmt.Errorf("max_attempts must be between 0 and %d", maxAttemptsLimit)

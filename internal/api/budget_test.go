@@ -17,6 +17,7 @@ import (
 
 	"github.com/Bispulm/llmgate/internal/accounting"
 	"github.com/Bispulm/llmgate/internal/auth"
+	"github.com/Bispulm/llmgate/internal/cache"
 	"github.com/Bispulm/llmgate/internal/chat"
 	"github.com/Bispulm/llmgate/internal/limits"
 	"github.com/Bispulm/llmgate/internal/mock"
@@ -87,6 +88,8 @@ type instanceOptions struct {
 	logger      *slog.Logger
 	adjust      func(*Limits)
 	keyCacheTTL time.Duration
+	cache       *cache.Cache
+	cacheTTL    time.Duration
 }
 
 // instance runs one gateway replica, with its own connection pool and adapters. Alias
@@ -121,8 +124,9 @@ func (e *tenantEnv) instance(opts instanceOptions, models ...string) (string, *h
 		Recorder:    accounting.NewLogRecorder(slog.New(slog.DiscardHandler)),
 		Ledger:      ledger,
 		TeamLimiter: opts.limiter,
+		Cache:       opts.cache,
 		Limits:      serverLimits,
-		Routes: routing.NewTable([]routing.Alias{{Name: "fast", MaxOutputTokens: 10, Routes: routes}},
+		Routes: routing.NewTable([]routing.Alias{{Name: "fast", MaxOutputTokens: 10, Routes: routes, CacheTTL: opts.cacheTTL}},
 			routing.Options{Breaker: routing.BreakerConfig{MinRequests: 100000}}),
 	}))
 	e.t.Cleanup(ts.Close)
