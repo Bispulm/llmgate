@@ -174,7 +174,7 @@ func buildRoutes(cfg *config.Config, secrets *config.Secrets) (*routing.Table, e
 		}
 		aliases[i] = routing.Alias{Name: m.Alias, MaxOutputTokens: m.MaxOutputTokens, Routes: routes}
 	}
-	return routing.NewTable(aliases), nil
+	return routing.NewTable(aliases, routing.Options{}), nil
 }
 
 func newProvider(p config.Provider, apiKey string, limits config.Limits) (provider.Provider, error) {
