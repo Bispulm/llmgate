@@ -20,6 +20,7 @@ import (
 	"github.com/Bispulm/llmgate/internal/cache"
 	"github.com/Bispulm/llmgate/internal/chat"
 	"github.com/Bispulm/llmgate/internal/limits"
+	"github.com/Bispulm/llmgate/internal/metrics"
 	"github.com/Bispulm/llmgate/internal/mock"
 	"github.com/Bispulm/llmgate/internal/provider/openai"
 	"github.com/Bispulm/llmgate/internal/routing"
@@ -90,6 +91,7 @@ type instanceOptions struct {
 	keyCacheTTL time.Duration
 	cache       *cache.Cache
 	cacheTTL    time.Duration
+	metrics     *metrics.Metrics
 }
 
 // instance runs one gateway replica, with its own connection pool and adapters. Alias
@@ -125,6 +127,7 @@ func (e *tenantEnv) instance(opts instanceOptions, models ...string) (string, *h
 		Ledger:      ledger,
 		TeamLimiter: opts.limiter,
 		Cache:       opts.cache,
+		Metrics:     opts.metrics,
 		Limits:      serverLimits,
 		Routes: routing.NewTable([]routing.Alias{{Name: "fast", MaxOutputTokens: 10, Routes: routes, CacheTTL: opts.cacheTTL}},
 			routing.Options{Breaker: routing.BreakerConfig{MinRequests: 100000}}),
