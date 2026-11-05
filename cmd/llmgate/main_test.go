@@ -173,6 +173,34 @@ func TestServeProxiesToTheConfiguredProvider(t *testing.T) {
 	})
 }
 
+func TestServeProxiesToAnAnthropicProvider(t *testing.T) {
+	upstream := httptest.NewServer(mock.New())
+	defer upstream.Close()
+
+	config := strings.Replace(testConfig, "http://127.0.0.1:18301/v1", upstream.URL, 1)
+	config = strings.Replace(config, "type: openai-compatible", "type: anthropic", 1)
+	addr := startServe(t, config)
+
+	req, err := http.NewRequest(http.MethodPost, "http://"+addr+"/v1/chat/completions",
+		strings.NewReader(`{"model":"fast","messages":[{"role":"system","content":"s"},{"role":"user","content":"hello"}]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Authorization", "Bearer dev")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.StatusCode != http.StatusOK || !strings.Contains(string(body), `"object":"chat.completion"`) || !strings.Contains(string(body), "[alpha]") {
+		t.Fatalf("status %d, body %s", resp.StatusCode, body)
+	}
+}
+
 // startStream begins a streaming request and reads its first event, so the request
 // is known to be in flight.
 func startStream(t *testing.T, addr string) (*http.Response, *sse.Decoder) {

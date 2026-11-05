@@ -22,6 +22,7 @@ import (
 	"github.com/Bispulm/llmgate/internal/chat"
 	"github.com/Bispulm/llmgate/internal/mock"
 	"github.com/Bispulm/llmgate/internal/provider"
+	"github.com/Bispulm/llmgate/internal/provider/anthropic"
 	"github.com/Bispulm/llmgate/internal/provider/openai"
 	"github.com/Bispulm/llmgate/internal/routing"
 	"github.com/Bispulm/llmgate/internal/sse"
@@ -1572,6 +1573,124 @@ func TestWaitForRequests(t *testing.T) {
 		t.Fatal("the wait ended before the attempt was recorded")
 	}
 	<-finished
+}
+
+func newAnthropicGateway(t *testing.T, model string, options ...func(*Options)) *gateway {
+	t.Helper()
+	m := mock.New()
+	upstream := httptest.NewServer(m)
+	t.Cleanup(upstream.Close)
+	adapter, err := anthropic.New(anthropic.Options{
+		BaseURL:          upstream.URL,
+		APIKey:           testProviderKey,
+		MaxResponseBytes: 1 << 20,
+		MaxEventBytes:    1 << 16,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(adapter.CloseIdleConnections)
+	return startGateway(t, adapter, model, m, options...)
+}
+
+// Clients must get the same contract whichever provider serves them.
+func TestAnthropicThroughTheGateway(t *testing.T) {
+	t.Run("a non-streaming response has the same shape", func(t *testing.T) {
+		g := newAnthropicGateway(t, "alpha;tokens=2;thinking=3;cache_read=7")
+		var got struct {
+			Object  string `json:"object"`
+			Model   string `json:"model"`
+			Choices []struct {
+				Message struct {
+					Content string `json:"content"`
+				} `json:"message"`
+				FinishReason string `json:"finish_reason"`
+			} `json:"choices"`
+			Usage struct {
+				Prompt            int64 `json:"prompt_tokens"`
+				Completion        int64 `json:"completion_tokens"`
+				Total             int64 `json:"total_tokens"`
+				CompletionDetails struct {
+					Reasoning int64 `json:"reasoning_tokens"`
+				} `json:"completion_tokens_details"`
+				PromptDetails struct {
+					Cached int64 `json:"cached_tokens"`
+				} `json:"prompt_tokens_details"`
+			} `json:"usage"`
+		}
+		if err := json.NewDecoder(g.post(t, chatBody(false, "")).Body).Decode(&got); err != nil {
+			t.Fatal(err)
+		}
+		if got.Object != "chat.completion" || got.Model != "fast" || got.Choices[0].Message.Content != "[alpha] token-1" || got.Choices[0].FinishReason != "stop" {
+			t.Fatalf("response = %+v", got)
+		}
+		u := got.Usage
+		if u.Completion != 5 || u.CompletionDetails.Reasoning != 3 || u.PromptDetails.Cached != 7 || u.Total != u.Prompt+u.Completion {
+			t.Fatalf("usage = %+v", u)
+		}
+	})
+	t.Run("a stream has the same shape, without the thinking", func(t *testing.T) {
+		g := newAnthropicGateway(t, "alpha;tokens=2;thinking=3")
+		s := readStream(t, g.post(t, chatBody(true, `,"stream_options":{"include_usage":true}`)).Body)
+		if !s.done || s.text != "[alpha] token-1" || s.finish != "stop" {
+			t.Fatalf("stream = %+v", s)
+		}
+		last := s.chunks[len(s.chunks)-1]
+		if len(last.Choices) != 0 || !strings.Contains(string(last.Usage), `"completion_tokens":5`) {
+			t.Fatalf("last chunk = %+v", last)
+		}
+		if a := g.recorder.wait(t); a.Outcome != accounting.OutcomeCompleted || a.TextEvents != 2 || a.Usage.State != chat.UsageReported {
+			t.Fatalf("attempt = %+v", a)
+		}
+	})
+	t.Run("thinking followed by a failure hasn't committed", func(t *testing.T) {
+		g := newAnthropicGateway(t, "a;thinking=3;fail=disconnect;after=0")
+		expectError(t, g.post(t, chatBody(true, "")), 502, "upstream_error", "upstream_failed")
+		a := g.recorder.wait(t)
+		if a.Committed || a.Outcome != accounting.OutcomeFailed {
+			t.Fatalf("attempt = %+v", a)
+		}
+		if a.Usage == nil || a.Usage.State != chat.UsagePartial || a.Usage.PromptTokens == 0 {
+			t.Fatalf("usage = %+v: the input cost was reported and must be kept", a.Usage)
+		}
+	})
+	t.Run("an error event before any text is an ordinary HTTP error", func(t *testing.T) {
+		g := newAnthropicGateway(t, "a;fail=stream_error;after=0")
+		expectError(t, g.post(t, chatBody(true, "")), 503, "upstream_error", "upstream_overloaded")
+	})
+	t.Run("a failure after text ends without completion and shows no usage", func(t *testing.T) {
+		g := newAnthropicGateway(t, "alpha;fail=disconnect;after=2;tokens=5")
+		s := readStream(t, g.post(t, chatBody(true, `,"stream_options":{"include_usage":true}`)).Body)
+		if s.done || s.err == nil || s.text != "[alpha] token-1" {
+			t.Fatalf("stream = %+v", s)
+		}
+		for _, c := range s.chunks {
+			if string(c.Usage) != "null" {
+				t.Fatalf("usage shown to the client: %s", c.Usage)
+			}
+		}
+		a := g.recorder.wait(t)
+		if !a.Committed || a.Outcome != accounting.OutcomeInterrupted || a.Usage == nil || a.Usage.State != chat.UsagePartial {
+			t.Fatalf("attempt = %+v", a)
+		}
+	})
+	t.Run("a refusal with no text completes as content_filter", func(t *testing.T) {
+		g := newAnthropicGateway(t, "a;tokens=0;finish=refusal")
+		s := readStream(t, g.post(t, chatBody(true, "")).Body)
+		if !s.done || s.finish != "content_filter" || s.text != "" {
+			t.Fatalf("stream = %+v", s)
+		}
+	})
+	t.Run("temperature is refused, never dropped", func(t *testing.T) {
+		g := newAnthropicGateway(t, "temp-check")
+		expectError(t, g.post(t, chatBody(false, `,"temperature":0.5`)), 400, "invalid_request_error", "upstream_rejected")
+		if requests := g.mock.Stats()["temp-check"].Requests; requests != 0 {
+			t.Fatalf("upstream saw %d requests", requests)
+		}
+		if a := g.recorder.wait(t); a.Delivery != provider.DeliveryNotSent {
+			t.Fatalf("attempt = %+v", a)
+		}
+	})
 }
 
 // brokenWriter fails every write, the way a connection does once a client has gone.
