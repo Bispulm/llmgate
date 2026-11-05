@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
 	"sync"
 	"time"
 
@@ -364,11 +365,17 @@ func (l *Ledger) disposition(f FinishRequest) disposition {
 		return dispositionUncertain
 	case f.Delivery == provider.DeliveryNotSent:
 		return dispositionReleased
-	case f.UpstreamStatus != 0 && l.rejected == RejectedChargeNone:
+	case f.UpstreamStatus != 0 && !timedOut(f.UpstreamStatus) && l.rejected == RejectedChargeNone:
 		return dispositionRejected
 	default:
 		return dispositionUncertain
 	}
+}
+
+// timedOut reports a status that means the provider gave up rather than refused, so the
+// model may have run, and been billed.
+func timedOut(status int) bool {
+	return status == http.StatusRequestTimeout || status == http.StatusGatewayTimeout
 }
 
 type attemptRow struct {
