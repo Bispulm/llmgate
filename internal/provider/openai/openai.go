@@ -12,10 +12,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"net"
 	"net/http"
 	"net/url"
-	"strconv"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -25,16 +23,7 @@ import (
 	"github.com/Bispulm/llmgate/internal/sse"
 )
 
-const (
-	maxErrorBodyBytes = 64 << 10
-	maxDrainBytes     = 64 << 10
-	// drainTimeout bounds waiting for the end of a finished stream's body.
-	drainTimeout = 100 * time.Millisecond
-	// maxIdentifierLength bounds an upstream error code kept from a response.
-	maxIdentifierLength = 64
-
-	doneMarker = "[DONE]"
-)
+const doneMarker = "[DONE]"
 
 // Options configures a Provider.
 type Options struct {
@@ -168,7 +157,7 @@ func (p *Provider) send(ctx context.Context, req *chat.Request, model string, st
 
 	resp, err := p.client.Do(httpReq)
 	if err != nil {
-		return nil, transportError(ctx, err)
+		return nil, provider.TransportError(ctx, err)
 	}
 	if resp.StatusCode != http.StatusOK {
 		defer func() { _ = resp.Body.Close() }()
@@ -177,27 +166,9 @@ func (p *Provider) send(ctx context.Context, req *chat.Request, model string, st
 	return resp, nil
 }
 
-// transportError classifies a failure to get a response. Only a failure to
-// connect proves that nothing was sent.
-func transportError(ctx context.Context, err error) *provider.Error {
-	delivery := provider.DeliveryUncertain
-	var opErr *net.OpError
-	if errors.As(err, &opErr) && opErr.Op == "dial" {
-		delivery = provider.DeliveryNotSent
-	}
-	kind := provider.KindConnection
-	switch {
-	case errors.Is(ctx.Err(), context.Canceled):
-		kind = provider.KindCanceled
-	case errors.Is(ctx.Err(), context.DeadlineExceeded):
-		kind = provider.KindTimeout
-	}
-	return &provider.Error{Kind: kind, Delivery: delivery, Err: err}
-}
-
 // statusError classifies a non-200 response.
 func statusError(resp *http.Response) *provider.Error {
-	body, _ := io.ReadAll(io.LimitReader(resp.Body, maxErrorBodyBytes))
+	body := provider.ReadErrorBody(resp.Body)
 	var envelope struct {
 		Error json.RawMessage `json:"error"`
 	}
@@ -205,7 +176,7 @@ func statusError(resp *http.Response) *provider.Error {
 	if json.Unmarshal(body, &envelope) == nil {
 		details = parseErrorDetails(envelope.Error)
 	}
-	kind := kindForStatus(resp.StatusCode)
+	kind := provider.KindForStatus(resp.StatusCode)
 	if kind == provider.KindRateLimited && details.isBilling() {
 		kind = provider.KindBilling
 	}
@@ -213,32 +184,8 @@ func statusError(resp *http.Response) *provider.Error {
 		Kind:         kind,
 		Delivery:     provider.DeliveryConfirmed,
 		Status:       resp.StatusCode,
-		RetryAfter:   parseRetryAfter(resp.Header.Get("Retry-After"), time.Now()),
+		RetryAfter:   provider.ParseRetryAfter(resp.Header.Get("Retry-After"), time.Now()),
 		UpstreamCode: details.identifier(),
-	}
-}
-
-func kindForStatus(status int) provider.Kind {
-	switch {
-	case status == http.StatusUnauthorized, status == http.StatusForbidden:
-		return provider.KindAuth
-	case status == http.StatusNotFound:
-		return provider.KindNotFound
-	case status == http.StatusPaymentRequired:
-		return provider.KindBilling
-	case status == http.StatusRequestTimeout:
-		return provider.KindTimeout
-	case status == http.StatusTooManyRequests:
-		return provider.KindRateLimited
-	case status == http.StatusServiceUnavailable, status == 529:
-		return provider.KindOverloaded
-	case status >= 500:
-		return provider.KindServer
-	case status >= 400:
-		return provider.KindInvalidRequest
-	default:
-		// A redirect or an unexpected success. Redirects aren't followed.
-		return provider.KindProtocol
 	}
 }
 
@@ -257,10 +204,10 @@ func parseErrorDetails(errorJSON []byte) errorDetails {
 	if len(errorJSON) == 0 || json.Unmarshal(errorJSON, &e) != nil {
 		return out
 	}
-	if s, ok := e.Code.(string); ok && isIdentifier(s) {
+	if s, ok := e.Code.(string); ok && provider.IsIdentifier(s) {
 		out.code = s
 	}
-	if s, ok := e.Type.(string); ok && isIdentifier(s) {
+	if s, ok := e.Type.(string); ok && provider.IsIdentifier(s) {
 		out.errType = s
 	}
 	return out
@@ -290,42 +237,6 @@ func (d errorDetails) isBilling() bool {
 	return d.errType == "insufficient_quota"
 }
 
-func isIdentifier(s string) bool {
-	if s == "" || len(s) > maxIdentifierLength {
-		return false
-	}
-	for _, c := range s {
-		switch {
-		case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c >= '0' && c <= '9', c == '_', c == '-', c == '.':
-		default:
-			return false
-		}
-	}
-	return true
-}
-
-func parseRetryAfter(value string, now time.Time) time.Duration {
-	if value == "" {
-		return 0
-	}
-	if seconds, err := strconv.Atoi(value); err == nil {
-		if seconds <= 0 {
-			return 0
-		}
-		return time.Duration(seconds) * time.Second
-	}
-	if when, err := http.ParseTime(value); err == nil {
-		if d := when.Sub(now); d > 0 {
-			return d
-		}
-	}
-	return 0
-}
-
-func protocolError(message string) *provider.Error {
-	return &provider.Error{Kind: provider.KindProtocol, Delivery: provider.DeliveryConfirmed, Err: errors.New(message)}
-}
-
 // Complete implements provider.Provider.
 func (p *Provider) Complete(ctx context.Context, req *chat.Request, model string) (*chat.Completion, error) {
 	resp, err := p.send(ctx, req, model, false)
@@ -336,10 +247,10 @@ func (p *Provider) Complete(ctx context.Context, req *chat.Request, model string
 
 	body, err := io.ReadAll(io.LimitReader(resp.Body, p.maxResponseBytes+1))
 	if err != nil {
-		return nil, readError(ctx, err)
+		return nil, provider.ReadError(ctx, err)
 	}
 	if int64(len(body)) > p.maxResponseBytes {
-		return nil, protocolError("response exceeds the size limit")
+		return nil, provider.ProtocolError("response exceeds the size limit")
 	}
 	return decodeCompletion(body)
 }
@@ -347,7 +258,7 @@ func (p *Provider) Complete(ctx context.Context, req *chat.Request, model string
 func decodeCompletion(body []byte) (*chat.Completion, error) {
 	// Decoding would otherwise replace invalid bytes with U+FFFD.
 	if !utf8.Valid(body) {
-		return nil, protocolError("response is not valid UTF-8")
+		return nil, provider.ProtocolError("response is not valid UTF-8")
 	}
 	var in struct {
 		Choices []struct {
@@ -363,27 +274,27 @@ func decodeCompletion(body []byte) (*chat.Completion, error) {
 		Usage json.RawMessage `json:"usage"`
 	}
 	if err := json.Unmarshal(body, &in); err != nil {
-		return nil, protocolError("response is not the expected JSON")
+		return nil, provider.ProtocolError("response is not the expected JSON")
 	}
 	if len(in.Choices) != 1 {
-		return nil, protocolError("response does not have exactly one choice")
+		return nil, provider.ProtocolError("response does not have exactly one choice")
 	}
 	choice := in.Choices[0]
 	if choice.Index != 0 {
-		return nil, protocolError("response choice has an unexpected index")
+		return nil, provider.ProtocolError("response choice has an unexpected index")
 	}
 	if hasValue(choice.Message.ToolCalls) || hasValue(choice.Message.FunctionCall) {
-		return nil, protocolError("response contains a tool call, which the contract excludes")
+		return nil, provider.ProtocolError("response contains a tool call, which the contract excludes")
 	}
 	if choice.Message.Content == nil && choice.Message.Refusal == nil {
-		return nil, protocolError("response has neither content nor a refusal")
+		return nil, provider.ProtocolError("response has neither content nor a refusal")
 	}
 	if choice.FinishReason == nil {
-		return nil, protocolError("response has no finish reason")
+		return nil, provider.ProtocolError("response has no finish reason")
 	}
 	finish, ok := parseFinishReason(*choice.FinishReason)
 	if !ok {
-		return nil, protocolError("response has an unsupported finish reason")
+		return nil, provider.ProtocolError("response has an unsupported finish reason")
 	}
 
 	out := &chat.Completion{FinishReason: finish, Usage: parseUsage(in.Usage)}
@@ -456,19 +367,6 @@ func parseUsage(raw json.RawMessage) *chat.Usage {
 	return out
 }
 
-// readError classifies a failure partway through a response. The upstream
-// certainly received the request, so a cancellation here may still be billed.
-func readError(ctx context.Context, err error) *provider.Error {
-	kind := provider.KindInterrupted
-	switch {
-	case errors.Is(ctx.Err(), context.Canceled):
-		kind = provider.KindCanceled
-	case errors.Is(ctx.Err(), context.DeadlineExceeded):
-		kind = provider.KindTimeout
-	}
-	return &provider.Error{Kind: kind, Delivery: provider.DeliveryConfirmed, Err: err}
-}
-
 // Stream implements provider.Provider.
 func (p *Provider) Stream(ctx context.Context, req *chat.Request, model string) (provider.Stream, error) {
 	// A context of its own lets Close cancel the upstream, and bound the drain,
@@ -483,13 +381,11 @@ func (p *Provider) Stream(ctx context.Context, req *chat.Request, model string) 
 	if !strings.HasPrefix(strings.ToLower(contentType), "text/event-stream") {
 		_ = resp.Body.Close()
 		cancel()
-		return nil, protocolError("stream response is not an event stream")
+		return nil, provider.ProtocolError("stream response is not an event stream")
 	}
 	return &stream{
-		ctx:     streamCtx,
-		cancel:  cancel,
-		body:    resp.Body,
-		decoder: sse.NewDecoder(resp.Body, p.maxEventBytes),
+		ResponseStream: provider.NewResponseStream(streamCtx, cancel, resp.Body),
+		decoder:        sse.NewDecoder(resp.Body, p.maxEventBytes),
 	}, nil
 }
 
@@ -509,14 +405,11 @@ type wireChunk struct {
 }
 
 type stream struct {
-	ctx     context.Context
-	cancel  context.CancelFunc
-	body    io.ReadCloser
+	*provider.ResponseStream
 	decoder *sse.Decoder
 
 	finished bool // a finish reason arrived
 	done     bool // the completion marker arrived
-	closed   bool
 }
 
 // Next implements provider.Stream.
@@ -531,9 +424,10 @@ func (s *stream) Next() (chat.StreamEvent, error) {
 		}
 		if string(ev.Data) == doneMarker {
 			if !s.finished {
-				return chat.StreamEvent{}, protocolError("stream completed without a finish reason")
+				return chat.StreamEvent{}, provider.ProtocolError("stream completed without a finish reason")
 			}
 			s.done = true
+			s.MarkCompleted()
 			return chat.StreamEvent{}, io.EOF
 		}
 		out, err := s.parseChunk(ev.Data)
@@ -548,14 +442,14 @@ func (s *stream) Next() (chat.StreamEvent, error) {
 
 func (s *stream) decodeError(err error) error {
 	if errors.Is(err, sse.ErrEventTooLarge) {
-		return protocolError("stream event exceeds the size limit")
+		return provider.ProtocolError("stream event exceeds the size limit")
 	}
 	if errors.Is(err, io.EOF) {
 		// The connection ended cleanly, but with no completion marker the output
 		// can't be trusted to be whole.
 		err = errors.New("stream ended without a completion marker")
 	}
-	return readError(s.ctx, err)
+	return s.ReadError(err)
 }
 
 // parseChunk validates one event. An event carrying nothing, such as a role-only
@@ -564,25 +458,25 @@ func (s *stream) parseChunk(data []byte) (chat.StreamEvent, error) {
 	var out chat.StreamEvent
 	// Decoding would otherwise replace invalid bytes with U+FFFD.
 	if !utf8.Valid(data) {
-		return out, protocolError("stream event is not valid UTF-8")
+		return out, provider.ProtocolError("stream event is not valid UTF-8")
 	}
 	var chunk wireChunk
 	if err := json.Unmarshal(data, &chunk); err != nil {
-		return out, protocolError("stream event is not the expected JSON")
+		return out, provider.ProtocolError("stream event is not the expected JSON")
 	}
 	if hasValue(chunk.Error) {
 		return out, streamError(chunk.Error)
 	}
 	if len(chunk.Choices) > 1 {
-		return out, protocolError("stream event has more than one choice")
+		return out, provider.ProtocolError("stream event has more than one choice")
 	}
 	if len(chunk.Choices) == 1 {
 		choice := chunk.Choices[0]
 		if choice.Index != 0 {
-			return out, protocolError("stream event has an unexpected choice index")
+			return out, provider.ProtocolError("stream event has an unexpected choice index")
 		}
 		if hasValue(choice.Delta.ToolCalls) || hasValue(choice.Delta.FunctionCall) {
-			return out, protocolError("stream event contains a tool call, which the contract excludes")
+			return out, provider.ProtocolError("stream event contains a tool call, which the contract excludes")
 		}
 		if choice.Delta.Content != nil {
 			out.Content = *choice.Delta.Content
@@ -591,15 +485,15 @@ func (s *stream) parseChunk(data []byte) (chat.StreamEvent, error) {
 			out.Refusal = *choice.Delta.Refusal
 		}
 		if s.finished && (out.Content != "" || out.Refusal != "") {
-			return out, protocolError("stream event has content after the finish reason")
+			return out, provider.ProtocolError("stream event has content after the finish reason")
 		}
 		if choice.FinishReason != nil {
 			if s.finished {
-				return out, protocolError("stream event repeats the finish reason")
+				return out, provider.ProtocolError("stream event repeats the finish reason")
 			}
 			finish, ok := parseFinishReason(*choice.FinishReason)
 			if !ok {
-				return out, protocolError("stream event has an unsupported finish reason")
+				return out, provider.ProtocolError("stream event has an unsupported finish reason")
 			}
 			out.FinishReason = finish
 			s.finished = true
@@ -623,23 +517,4 @@ func streamError(errorJSON []byte) *provider.Error {
 		kind = provider.KindOverloaded
 	}
 	return &provider.Error{Kind: kind, Delivery: provider.DeliveryConfirmed, UpstreamCode: code}
-}
-
-// Close implements provider.Stream. After a completed stream it reads the tail
-// of the body, because HTTP/1.1 can't reuse a connection otherwise.
-func (s *stream) Close() error {
-	if s.closed {
-		return nil
-	}
-	s.closed = true
-	defer s.cancel()
-	if s.done {
-		timer := time.AfterFunc(drainTimeout, s.cancel)
-		defer timer.Stop()
-		_, _ = io.CopyN(io.Discard, s.body, maxDrainBytes)
-	}
-	if err := s.body.Close(); err != nil {
-		return fmt.Errorf("closing upstream response: %w", err)
-	}
-	return nil
 }
