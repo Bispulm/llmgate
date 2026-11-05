@@ -238,18 +238,24 @@ func (l *Ledger) Reserve(ctx context.Context, r ReserveRequest) (*Reservation, e
 			ON CONFLICT (id) DO NOTHING`, r.RequestID, r.TeamID, r.KeyID, r.Alias, r.Stream, now); err != nil {
 			return err
 		}
-		// A period is created on first use, from the team's limit at that moment.
-		if _, err := tx.Exec(ctx, `
-			INSERT INTO budget_periods (team_id, starts_at, ends_at, limit_micros)
-			SELECT id, $2, $3, budget_limit_micros FROM teams WHERE id = $1
-			ON CONFLICT (team_id, starts_at) DO NOTHING`, r.TeamID, start, end); err != nil {
-			return err
-		}
-
 		var limit, settled, reserved int64
-		err := tx.QueryRow(ctx, `
-			SELECT id, limit_micros, settled_micros, reserved_micros FROM budget_periods
-			WHERE team_id = $1 AND starts_at = $2 FOR UPDATE`, r.TeamID, start).Scan(&out.PeriodID, &limit, &settled, &reserved)
+		lockPeriod := func() error {
+			return tx.QueryRow(ctx, `
+				SELECT id, limit_micros, settled_micros, reserved_micros FROM budget_periods
+				WHERE team_id = $1 AND starts_at = $2 FOR UPDATE`, r.TeamID, start).Scan(&out.PeriodID, &limit, &settled, &reserved)
+		}
+		err := lockPeriod()
+		if errors.Is(err, pgx.ErrNoRows) {
+			// A period is created on first use, from the team's limit. Locking the team's
+			// row waits for a limit change in flight, so the period starts from the new one.
+			if _, err := tx.Exec(ctx, `
+				INSERT INTO budget_periods (team_id, starts_at, ends_at, limit_micros)
+				SELECT id, $2, $3, budget_limit_micros FROM teams WHERE id = $1 FOR SHARE
+				ON CONFLICT (team_id, starts_at) DO NOTHING`, r.TeamID, start, end); err != nil {
+				return err
+			}
+			err = lockPeriod()
+		}
 		if errors.Is(err, pgx.ErrNoRows) {
 			return ErrUnknownTeam
 		}
@@ -784,8 +790,9 @@ func adjustCharge(ctx context.Context, tx pgx.Tx, id string, a attemptRow, usage
 	return err
 }
 
-// SetLimit changes a team's budget, including for the current period. Lowering it below
-// existing obligations is allowed: it blocks new work and doesn't touch work in flight.
+// SetLimit changes a team's budget, including for the current period and any later one
+// already opened. Lowering it below existing obligations is allowed: it blocks new work
+// and doesn't touch work in flight.
 func (l *Ledger) SetLimit(ctx context.Context, teamID string, limitMicros int64) error {
 	start, end := periodBounds(l.now())
 	err := pgx.BeginFunc(ctx, l.pool, func(tx pgx.Tx) error {
@@ -796,9 +803,13 @@ func (l *Ledger) SetLimit(ctx context.Context, teamID string, limitMicros int64)
 		if tag.RowsAffected() == 0 {
 			return ErrUnknownTeam
 		}
-		_, err = tx.Exec(ctx, `
+		if _, err := tx.Exec(ctx, `
 			INSERT INTO budget_periods (team_id, starts_at, ends_at, limit_micros) VALUES ($1, $2, $3, $4)
-			ON CONFLICT (team_id, starts_at) DO UPDATE SET limit_micros = EXCLUDED.limit_micros`, teamID, start, end, limitMicros)
+			ON CONFLICT (team_id, starts_at) DO UPDATE SET limit_micros = EXCLUDED.limit_micros`, teamID, start, end, limitMicros); err != nil {
+			return err
+		}
+		// A replica whose clock has already reached next month may have opened its period.
+		_, err = tx.Exec(ctx, `UPDATE budget_periods SET limit_micros = $2 WHERE team_id = $1 AND starts_at > $3`, teamID, limitMicros, start)
 		return err
 	})
 	if err != nil {
