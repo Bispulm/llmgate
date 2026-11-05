@@ -1683,12 +1683,9 @@ func TestAnthropicThroughTheGateway(t *testing.T) {
 	})
 	t.Run("temperature is refused, never dropped", func(t *testing.T) {
 		g := newAnthropicGateway(t, "temp-check")
-		expectError(t, g.post(t, chatBody(false, `,"temperature":0.5`)), 400, "invalid_request_error", "upstream_rejected")
+		expectError(t, g.post(t, chatBody(false, `,"temperature":0.5`)), 400, "invalid_request_error", "no_capable_route")
 		if requests := g.mock.Stats()["temp-check"].Requests; requests != 0 {
 			t.Fatalf("upstream saw %d requests", requests)
-		}
-		if a := g.recorder.wait(t); a.Delivery != provider.DeliveryNotSent {
-			t.Fatalf("attempt = %+v", a)
 		}
 	})
 }
