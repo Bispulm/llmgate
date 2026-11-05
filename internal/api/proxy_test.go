@@ -113,6 +113,12 @@ func newGateway(t *testing.T, model string, options ...func(*Options)) *gateway 
 
 func startGateway(t *testing.T, p provider.Provider, model string, m *mock.Server, options ...func(*Options)) *gateway {
 	t.Helper()
+	return startGatewayOn(t, nil, p, model, m, options...)
+}
+
+// startGatewayOn is startGateway with the listener wrapped, when wrap isn't nil.
+func startGatewayOn(t *testing.T, wrap func(net.Listener) net.Listener, p provider.Provider, model string, m *mock.Server, options ...func(*Options)) *gateway {
+	t.Helper()
 	rec := &attemptRecorder{attempts: make(chan recordedAttempt, 64)}
 	opts := Options{
 		Auth:     auth.NewDevKey(testAPIKey),
@@ -131,7 +137,11 @@ func startGateway(t *testing.T, p provider.Provider, model string, m *mock.Serve
 		rec = inner
 	}
 
-	ts := httptest.NewServer(New(opts))
+	ts := httptest.NewUnstartedServer(New(opts))
+	if wrap != nil {
+		ts.Listener = wrap(ts.Listener)
+	}
+	ts.Start()
 	t.Cleanup(ts.Close)
 
 	client := &http.Client{Transport: &http.Transport{}}
