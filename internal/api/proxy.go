@@ -36,9 +36,10 @@ const (
 	// capacityRetryAfter is a short hint, because a slot could free at any moment.
 	capacityRetryAfter = time.Second
 
-	// admissionTimeout bounds reserving and marking an attempt, so that a database that
-	// has hung refuses requests soon, rather than holding them until their deadline.
-	admissionTimeout = 5 * time.Second
+	// defaultAdmissionTimeout bounds looking up a key, and reserving and marking an
+	// attempt, so that a database that has hung refuses requests soon, rather than
+	// holding them until their deadline.
+	defaultAdmissionTimeout = 5 * time.Second
 	// reserveLease is how long a reservation can go unsent before a reconciler may release
 	// it. It's only ever that long if this replica stopped between two statements.
 	reserveLease = time.Minute
@@ -101,7 +102,9 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 
 	// Authenticate before reading the body, so an unauthenticated caller can't make
 	// the gateway buffer or parse anything.
-	principal, err := s.auth.Authenticate(r.Context(), auth.BearerToken(r.Header))
+	authCtx, cancelAuth := context.WithTimeout(r.Context(), s.admissionTimeout())
+	principal, err := s.auth.Authenticate(authCtx, auth.BearerToken(r.Header))
+	cancelAuth()
 	if err != nil && !errors.Is(err, auth.ErrInvalidCredential) {
 		// Still a refusal, but the key may be perfectly good.
 		s.logger.LogAttrs(r.Context(), slog.LevelWarn, "a key could not be checked", attrRequestID(id), slog.Any("error", err))
@@ -308,7 +311,7 @@ func (s *Server) reserve(ctx context.Context, x *exchange, selected *routing.Sel
 	if s.ledger == nil {
 		return nil, nil
 	}
-	admitCtx, cancel := context.WithTimeout(ctx, admissionTimeout)
+	admitCtx, cancel := context.WithTimeout(ctx, s.admissionTimeout())
 	defer cancel()
 
 	reservation, err := s.ledger.Reserve(admitCtx, accounting.ReserveRequest{
@@ -335,6 +338,13 @@ func (s *Server) reserve(ctx context.Context, x *exchange, selected *routing.Sel
 		return nil, err
 	}
 	return reservation, nil
+}
+
+func (s *Server) admissionTimeout() time.Duration {
+	if s.limits.AdmissionTimeout > 0 {
+		return s.limits.AdmissionTimeout
+	}
+	return defaultAdmissionTimeout
 }
 
 // dispatchLease is longer than an attempt can run, so that a reconciler only takes over an

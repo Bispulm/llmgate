@@ -856,7 +856,7 @@ func TestAHungLedgerFailsClosedBeforeTheRequestDeadline(t *testing.T) {
 	if resp.StatusCode != http.StatusServiceUnavailable || !strings.Contains(body, codeAccountingUnavailable) {
 		t.Fatalf("status = %d: %s", resp.StatusCode, body)
 	}
-	if elapsed := time.Since(start); elapsed > 2*admissionTimeout {
+	if elapsed := time.Since(start); elapsed > 2*defaultAdmissionTimeout {
 		t.Fatalf("took %v", elapsed)
 	}
 }
