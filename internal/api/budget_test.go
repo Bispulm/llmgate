@@ -860,3 +860,42 @@ func TestAHungLedgerFailsClosedBeforeTheRequestDeadline(t *testing.T) {
 		t.Fatalf("took %v", elapsed)
 	}
 }
+
+// Tokens a provider may have used count against a team's limit even when it never said
+// how many, or cancelling just before the usage report would make the limit optional.
+// Like the budget, the count is conservative: the most the attempt could have used.
+func TestUnknownUsageCountsAgainstTokenLimits(t *testing.T) {
+	req, err := chat.DecodeRequest([]byte(chatBody(true, "")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	bound := accounting.InputBound(req) + 10
+	for name, tt := range map[string]struct {
+		model string
+		want  int64
+	}{
+		"an interrupted stream":          {"cut;fail=disconnect;after=1;tokens=3", bound},
+		"a stream with no usage":         {"quiet;usage=none;tokens=1", bound},
+		"a refusal costs nothing":        {"refused;fail=status;status=400", 0},
+		"a reported count is used as is": {"counted;tokens=3", -1},
+	} {
+		t.Run(name, func(t *testing.T) {
+			e := newTenantEnv(t, tt.model)
+			key := e.addTeam("a", 100_000)
+			limiter := &denyingLimiter{decision: limits.Decision{Allowed: true}}
+			url, client := e.instance(instanceOptions{limiter: limiter}, tt.model)
+			call(t, client, url, key, chatBody(true, ""))
+			deadline := time.Now().Add(5 * time.Second)
+			for limiter.released.Load() != 1 && time.Now().Before(deadline) {
+				time.Sleep(5 * time.Millisecond)
+			}
+			got := limiter.debited.Load()
+			switch {
+			case tt.want < 0 && (got <= 0 || got >= bound):
+				t.Fatalf("debited %d, want the reported count", got)
+			case tt.want >= 0 && got != tt.want:
+				t.Fatalf("debited %d, want %d", got, tt.want)
+			}
+		})
+	}
+}
