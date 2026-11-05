@@ -14,6 +14,7 @@ import (
 
 	"github.com/Bispulm/llmgate/internal/accounting"
 	"github.com/Bispulm/llmgate/internal/auth"
+	"github.com/Bispulm/llmgate/internal/cache"
 	"github.com/Bispulm/llmgate/internal/limits"
 	"github.com/Bispulm/llmgate/internal/routing"
 )
@@ -64,7 +65,9 @@ type Options struct {
 	Ledger Ledger
 	// TeamLimiter applies team limits. Without one, teams have none.
 	TeamLimiter TeamLimiter
-	Limits      Limits
+	// Cache serves repeated requests that opt in. Without one, nothing is cached.
+	Cache  *cache.Cache
+	Limits Limits
 }
 
 // Server handles client requests. Use New to create one.
@@ -75,6 +78,7 @@ type Server struct {
 	recorder    accounting.Recorder
 	ledger      Ledger
 	teamLimiter TeamLimiter
+	cache       *cache.Cache
 	limits      Limits
 	mux         *http.ServeMux
 	draining    atomic.Bool
@@ -91,6 +95,7 @@ func New(opts Options) *Server {
 		recorder:    opts.Recorder,
 		ledger:      opts.Ledger,
 		teamLimiter: opts.TeamLimiter,
+		cache:       opts.Cache,
 		limits:      opts.Limits,
 		mux:         http.NewServeMux(),
 	}
