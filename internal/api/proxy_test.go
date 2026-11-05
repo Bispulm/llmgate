@@ -1264,6 +1264,10 @@ type fakeProvider struct {
 	streamErr  error // ends the stream after events, instead of io.EOF
 }
 
+func (f *fakeProvider) Capabilities() provider.Capabilities {
+	return provider.Capabilities{Sampling: true}
+}
+
 func (f *fakeProvider) Complete(context.Context, *chat.Request, string) (*chat.Completion, error) {
 	return f.completion, nil
 }

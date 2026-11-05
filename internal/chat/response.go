@@ -24,6 +24,9 @@ const (
 	// UsageMalformed means a report arrived but its counts are unusable. Only Raw
 	// is meaningful.
 	UsageMalformed UsageState = "malformed"
+	// UsagePartial means input counts arrived but the response never finished, so
+	// output is only a lower bound. It's kept for reconciliation.
+	UsagePartial UsageState = "partial"
 )
 
 // Usage is a provider's token report. A nil *Usage means the provider reported
@@ -46,7 +49,7 @@ type Usage struct {
 
 // Reportable says whether the counts are safe to show a client.
 func (u *Usage) Reportable() bool {
-	return u != nil && u.State != UsageMalformed
+	return u != nil && (u.State == UsageReported || u.State == UsageInconsistent)
 }
 
 // Completion is the result of a non-streaming attempt.
