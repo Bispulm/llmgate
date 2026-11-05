@@ -37,10 +37,14 @@ type request struct {
 type response struct {
 	scenario     scenario
 	tokens       int  // text events in the response
+	thinking     int  // thinking tokens, which also count against the output limit
 	limited      bool // stopped by the output limit
 	promptTokens int
 	includeUsage bool
 }
+
+// outputTokens is the billable output, which includes thinking.
+func (r response) outputTokens() int { return r.tokens + r.thinking }
 
 func (r response) text() string {
 	var b strings.Builder
@@ -87,14 +91,15 @@ type labelCounters struct {
 type Server struct {
 	mux *http.ServeMux
 
-	mu     sync.Mutex
-	labels map[string]*labelCounters
+	mu        sync.Mutex
+	labels    map[string]*labelCounters
+	scenarios map[string]int // requests seen per exact model string
 }
 
 // New returns a mock provider serving POST /v1/chat/completions,
 // POST /v1/messages, and GET /__mock/stats.
 func New() *Server {
-	s := &Server{mux: http.NewServeMux(), labels: make(map[string]*labelCounters)}
+	s := &Server{mux: http.NewServeMux(), labels: make(map[string]*labelCounters), scenarios: make(map[string]int)}
 	s.mux.HandleFunc("POST /v1/chat/completions", func(w http.ResponseWriter, r *http.Request) {
 		s.serve(w, r, openAIWire{})
 	})
@@ -126,6 +131,15 @@ func (s *Server) Stats() map[string]LabelStats {
 func (s *Server) serveStats(w http.ResponseWriter, _ *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(s.Stats())
+}
+
+// countScenario returns how many requests have used this exact model string,
+// including this one.
+func (s *Server) countScenario(model string) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.scenarios[model]++
+	return s.scenarios[model]
 }
 
 func (s *Server) counters(label string) *labelCounters {
@@ -162,6 +176,9 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, wire wireFormat) 
 
 	counters := s.counters(sc.label)
 	counters.requests.Add(1)
+	if sc.failFirst > 0 && s.countScenario(req.model) > sc.failFirst {
+		sc.fail = ""
+	}
 	out := &output{w: w, ctl: http.NewResponseController(w), chunk: sc.chunk, counters: counters}
 
 	if err := sleep(r.Context(), sc.latency); err != nil {
@@ -180,14 +197,17 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, wire wireFormat) 
 		return
 	}
 
-	n := sc.tokens
-	limited := req.maxOutput > 0 && req.maxOutput < n
+	// Thinking comes first, so it uses up the limit before any text.
+	thinking, n := sc.thinking, sc.tokens
+	limited := req.maxOutput > 0 && thinking+n > req.maxOutput
 	if limited {
-		n = req.maxOutput
+		thinking = min(thinking, req.maxOutput)
+		n = req.maxOutput - thinking
 	}
 	resp := response{
 		scenario:     sc,
 		tokens:       n,
+		thinking:     thinking,
 		limited:      limited,
 		promptTokens: req.promptTokens,
 		includeUsage: req.includeUsage,
