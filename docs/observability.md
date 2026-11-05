@@ -44,12 +44,12 @@ Traces are off unless `tracing.otlp_endpoint` is set. They're exported over OTLP
 ```yaml
 tracing:
   otlp_endpoint: http://127.0.0.1:4318   # /v1/traces is added to a base URL
-  sample_ratio: 0.1                      # New traces only; a caller's decision is kept
+  sample_ratio: 0.1                      # New traces only; a caller's decision is kept. 0 traces only those.
 ```
 
 | Span | Parent | Attributes |
 |---|---|---|
-| `chat.completions` | A caller's `traceparent`, if sent | `llmgate.request_id`, `llmgate.alias`, `llmgate.stream`, `llmgate.team`, `llmgate.attempts`, `http.response.status_code` |
+| `chat.completions` | A caller's `traceparent`, if sent. Only authenticated requests are traced, so a trace header alone can't get spans exported. | `llmgate.request_id`, `llmgate.alias`, `llmgate.stream`, `llmgate.team`, `llmgate.attempts`, `http.response.status_code` |
 | `attempt` | `chat.completions` | `llmgate.provider`, `llmgate.model`, `llmgate.attempt.number`, `llmgate.attempt.reason`, `llmgate.outcome`, `llmgate.error_kind`, `llmgate.committed`, `llmgate.upstream_status`, `llmgate.charge_kind`, `llmgate.charge_micros`, and `llmgate.admitted` when the ledger refused it |
 | `ledger.reserve` | `attempt` | `llmgate.reserved_micros` |
 | `ledger.mark_dispatched` | `attempt` | |

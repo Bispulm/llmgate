@@ -485,7 +485,15 @@ func TestServeExportsMetricsOnTheirOwnListener(t *testing.T) {
 		body, _ := io.ReadAll(resp.Body)
 		return resp.StatusCode, string(body)
 	}
-	status, body := get("http://" + addrs.Metrics + "/metrics")
+	// The response reaches the client before the handler records it, so wait for that.
+	want := `llmgate_requests_total{alias="fast",status="200",stream="false"} 1`
+	var status int
+	var body string
+	for deadline := time.Now().Add(5 * time.Second); time.Now().Before(deadline); time.Sleep(10 * time.Millisecond) {
+		if status, body = get("http://" + addrs.Metrics + "/metrics"); strings.Contains(body, want) {
+			break
+		}
+	}
 	for _, want := range []string{`llmgate_requests_total{alias="fast",status="200",stream="false"} 1`, `llmgate_breaker_state{model="alpha",provider="primary",state="closed"} 1`, "go_goroutines"} {
 		if status != http.StatusOK || !strings.Contains(body, want) {
 			t.Fatalf("status %d, missing %s", status, want)

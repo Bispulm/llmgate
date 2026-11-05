@@ -103,3 +103,30 @@ func TestARequestIsTracedWithoutItsContent(t *testing.T) {
 		}
 	}
 }
+
+// Anyone can send a trace header, so nothing is traced until a caller has authenticated.
+// Otherwise unauthenticated traffic could force spans to be exported.
+func TestNothingIsTracedBeforeAuthentication(t *testing.T) {
+	recorder := tracetest.NewSpanRecorder()
+	provider := sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(recorder))
+	t.Cleanup(func() { _ = provider.Shutdown(t.Context()) })
+	g := newGateway(t, "alpha;tokens=1", func(o *Options) { o.Tracer = provider.Tracer("test") })
+
+	req, err := http.NewRequest(http.MethodPost, g.url+"/v1/chat/completions", strings.NewReader(chatBody(false, "")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Authorization", "Bearer wrong")
+	req.Header.Set("traceparent", "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01")
+	resp, err := g.client.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("status = %d", resp.StatusCode)
+	}
+	if got := len(recorder.Ended()) + len(recorder.Started()); got != 0 {
+		t.Fatalf("%d spans for an unauthenticated request", got)
+	}
+}

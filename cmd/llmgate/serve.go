@@ -114,7 +114,7 @@ func serve(ctx context.Context, configPath string, p process) error {
 
 	var tenant *tenantRuntime
 	if cfg.Tenant() {
-		tenant, err = startTenant(ctx, cfg, secrets, routes, logger)
+		tenant, err = startTenant(ctx, cfg, secrets, routes, logger, gatewayMetrics)
 		if err != nil {
 			return err
 		}

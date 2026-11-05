@@ -41,7 +41,7 @@ func startTracing(ctx context.Context, cfg config.Tracing) (trace.Tracer, func()
 	}
 	provider := sdktrace.NewTracerProvider(
 		sdktrace.WithBatcher(exporter),
-		sdktrace.WithSampler(sdktrace.ParentBased(sdktrace.TraceIDRatioBased(cfg.SampleRatio))),
+		sdktrace.WithSampler(sdktrace.ParentBased(sdktrace.TraceIDRatioBased(cfg.Ratio()))),
 		sdktrace.WithResource(resource.NewSchemaless(attribute.String("service.name", "llmgate"))),
 	)
 	stop := func() {

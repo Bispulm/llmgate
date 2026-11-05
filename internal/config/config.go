@@ -196,8 +196,18 @@ type Metrics struct {
 // Tracing exports OpenTelemetry traces over OTLP/HTTP, and is off unless an endpoint is
 // set. Spans carry routing and accounting decisions, never request or response content.
 type Tracing struct {
-	OTLPEndpoint string  `yaml:"otlp_endpoint"`
-	SampleRatio  float64 `yaml:"sample_ratio"`
+	OTLPEndpoint string `yaml:"otlp_endpoint"`
+	// SampleRatio samples new traces. A caller's decision is always kept. Unset means 1,
+	// and 0 means only what callers have chosen to sample.
+	SampleRatio *float64 `yaml:"sample_ratio"`
+}
+
+// Ratio returns the sample ratio, 1 when unset.
+func (t Tracing) Ratio() float64 {
+	if t.SampleRatio == nil {
+		return 1
+	}
+	return *t.SampleRatio
 }
 
 // Cache configures the response cache. Aliases opt in with their own TTL.
@@ -392,9 +402,6 @@ func (c *Config) validateMode() error {
 
 func (c *Config) applyDefaults() {
 	setDefault(&c.Server.ShutdownTimeout, DefaultShutdownTimeout)
-	if c.Tracing.OTLPEndpoint != "" {
-		setDefault(&c.Tracing.SampleRatio, 1)
-	}
 	if c.Tenant() {
 		setDefault(&c.Auth.KeyCacheTTL, DefaultKeyCacheTTL)
 		setDefault(&c.Database.MaxConns, DefaultDatabaseMaxConns)
@@ -598,12 +605,12 @@ func (c *Config) validateMetrics() error {
 // validate refuses plaintext to anything but loopback, since spans name teams and routes.
 func (t Tracing) validate() error {
 	if t.OTLPEndpoint == "" {
-		if t.SampleRatio != 0 {
+		if t.SampleRatio != nil {
 			return errors.New("tracing.sample_ratio needs tracing.otlp_endpoint")
 		}
 		return nil
 	}
-	if t.SampleRatio < 0 || t.SampleRatio > 1 {
+	if t.Ratio() < 0 || t.Ratio() > 1 {
 		return errors.New("tracing.sample_ratio must be between 0 and 1")
 	}
 	u, err := url.Parse(t.OTLPEndpoint)

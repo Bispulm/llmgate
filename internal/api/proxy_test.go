@@ -1856,3 +1856,23 @@ func TestConcurrentStreamsStayIsolated(t *testing.T) {
 		}
 	}
 }
+
+// A body over the limit is refused, and the connection closed rather than drained, so a
+// slow client can't keep it busy. Wrapping the writer for metrics mustn't hide that.
+func TestAnOversizedBodyClosesTheConnection(t *testing.T) {
+	g := newGateway(t, "alpha;tokens=1", func(o *Options) { o.Limits.MaxRequestBytes = 1024 })
+	body := chatBody(false, `,"padding":"`+strings.Repeat("x", 4096)+`"`)
+	req, err := http.NewRequest(http.MethodPost, g.url+"/v1/chat/completions", strings.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Authorization", "Bearer "+testAPIKey)
+	resp, err := g.client.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusRequestEntityTooLarge || !resp.Close {
+		t.Fatalf("status = %d, close = %v", resp.StatusCode, resp.Close)
+	}
+}

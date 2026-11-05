@@ -9,9 +9,11 @@ import (
 	"context"
 	"crypto/rand"
 	"fmt"
+	"net"
 	"net/url"
 	"os"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -150,4 +152,38 @@ func Redis(t *testing.T) (*redis.Client, string) {
 		_ = client.Close()
 	})
 	return client, prefix
+}
+
+// SilentRedis returns the address of a server that accepts connections and never
+// answers, like a Redis that has hung. A server refusing connections fails at once, which
+// is the easy case. This is the one that finds timeouts that don't apply.
+func SilentRedis(t *testing.T) string {
+	t.Helper()
+	var lc net.ListenConfig
+	listener, err := lc.Listen(context.Background(), "tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var mu sync.Mutex
+	var conns []net.Conn
+	go func() {
+		for {
+			conn, err := listener.Accept()
+			if err != nil {
+				return
+			}
+			mu.Lock()
+			conns = append(conns, conn)
+			mu.Unlock()
+		}
+	}()
+	t.Cleanup(func() {
+		_ = listener.Close()
+		mu.Lock()
+		defer mu.Unlock()
+		for _, c := range conns {
+			_ = c.Close()
+		}
+	})
+	return listener.Addr().String()
 }

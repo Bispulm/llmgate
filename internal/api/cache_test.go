@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"encoding/json"
 	"io"
 	"net/http"
 	"strings"
@@ -259,5 +260,30 @@ func TestACacheOutageIsAMiss(t *testing.T) {
 		if elapsed := time.Since(start); elapsed > time.Second {
 			t.Fatalf("a request took %v with the cache down", elapsed)
 		}
+	}
+}
+
+// A hit returns the usage the original response reported, field for field.
+func TestAHitReturnsTheOriginalUsage(t *testing.T) {
+	const model = "alpha;tokens=3;cache_read=2"
+	e := newTenantEnv(t, model)
+	key := e.addTeam("a", 100_000)
+	url, client := e.instance(instanceOptions{cache: newTestCache(t), cacheTTL: time.Minute}, model)
+	usageOf := func(body string) string {
+		var parsed struct {
+			Usage json.RawMessage `json:"usage"`
+		}
+		if err := json.Unmarshal([]byte(body), &parsed); err != nil {
+			t.Fatal(err)
+		}
+		return string(parsed.Usage)
+	}
+	_, miss := ask(t, client, url, key, chatBody(false, ""), true)
+	resp, hit := ask(t, client, url, key, chatBody(false, ""), true)
+	if resp.Header.Get(headerCache) != cacheHit {
+		t.Fatalf("cache = %q", resp.Header.Get(headerCache))
+	}
+	if !strings.Contains(usageOf(miss), "cached_tokens") || usageOf(hit) != usageOf(miss) {
+		t.Fatalf("hit usage %s, original %s", usageOf(hit), usageOf(miss))
 	}
 }
