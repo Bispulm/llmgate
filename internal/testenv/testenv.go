@@ -41,6 +41,24 @@ func skipOrFail(t *testing.T, variable string) {
 // and connect from several pools, as separate gateway replicas do.
 func PostgresURL(t *testing.T) string {
 	t.Helper()
+	schemaURL := UnmigratedPostgresURL(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	pool, err := store.Open(ctx, store.PoolConfig{URL: schemaURL, MaxConns: 2})
+	if err != nil {
+		t.Fatalf("connecting to the schema: %v", err)
+	}
+	defer pool.Close()
+	if err := store.Migrate(ctx, pool); err != nil {
+		t.Fatalf("migrating: %v", err)
+	}
+	return schemaURL
+}
+
+// UnmigratedPostgresURL returns the URL of a fresh, empty schema, dropped when the test
+// ends.
+func UnmigratedPostgresURL(t *testing.T) string {
+	t.Helper()
 	base := os.Getenv(PostgresURLEnv)
 	if base == "" {
 		skipOrFail(t, PostgresURLEnv)
@@ -75,14 +93,6 @@ func PostgresURL(t *testing.T) string {
 	schemaURL, err := withSearchPath(base, schema)
 	if err != nil {
 		t.Fatal(err)
-	}
-	pool, err := store.Open(ctx, store.PoolConfig{URL: schemaURL, MaxConns: 2})
-	if err != nil {
-		t.Fatalf("connecting to the schema: %v", err)
-	}
-	defer pool.Close()
-	if err := store.Migrate(ctx, pool); err != nil {
-		t.Fatalf("migrating: %v", err)
 	}
 	return schemaURL
 }
