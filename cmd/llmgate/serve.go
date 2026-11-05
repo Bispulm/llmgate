@@ -46,6 +46,28 @@ func serveCommand(p process) *cobra.Command {
 	return cmd
 }
 
+// validateCommand checks a configuration file the way serve would, without credentials
+// or any connection, so it can run in CI against a rendered chart.
+func validateCommand(p process) *cobra.Command {
+	var configPath string
+	cmd := &cobra.Command{
+		Use:   "validate",
+		Short: "Check a configuration file without starting anything",
+		Args:  cobra.NoArgs,
+		RunE: func(*cobra.Command, []string) error {
+			cfg, err := config.Load(configPath)
+			if err != nil {
+				return err
+			}
+			_, err = fmt.Fprintf(p.stdout, "the configuration is valid: %s mode, %d providers, %d model aliases\n", cfg.Auth.Mode, len(cfg.Providers), len(cfg.Models))
+			return err
+		},
+	}
+	cmd.Flags().StringVar(&configPath, "config", "", "path to the configuration file")
+	_ = cmd.MarkFlagRequired("config")
+	return cmd
+}
+
 func serve(ctx context.Context, configPath string, p process) error {
 	cfg, err := config.Load(configPath)
 	if err != nil {
