@@ -76,3 +76,22 @@ func TestAQueuedAdmissionCanGiveUp(t *testing.T) {
 		t.Fatalf("gave up after %v", elapsed)
 	}
 }
+
+// A refused reservation leaves nothing behind: no attempt, and no request either.
+func TestARefusedReservationLeavesNothing(t *testing.T) {
+	e := newEnv(t, reservedFor)
+	e.reserve("opens-the-period-and-fits")
+	if _, err := e.ledger.Reserve(context.Background(), reserveRequest("refused", 1)); err == nil {
+		t.Fatal("admitted past the limit")
+	}
+	var requests, attempts int
+	if err := e.pool.QueryRow(context.Background(), `SELECT (SELECT count(*) FROM requests WHERE id = 'refused'), (SELECT count(*) FROM attempts WHERE request_id = 'refused')`).Scan(&requests, &attempts); err != nil {
+		t.Fatal(err)
+	}
+	if requests != 0 || attempts != 0 {
+		t.Fatalf("a refusal left %d requests and %d attempts", requests, attempts)
+	}
+	if got := e.period(); got.reserved != reservedFor {
+		t.Fatalf("period = %+v", got)
+	}
+}
