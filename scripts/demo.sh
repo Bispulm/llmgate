@@ -54,7 +54,7 @@ sed -e "s/127.0.0.1:18300/127.0.0.1:${GATEWAY_PORT}/" \
 "$WORK/llmgate-mock" -listen "127.0.0.1:${MOCK_PORT}" 2>"$WORK/mock.log" &
 PIDS+=($!)
 LLMGATE_DEV_KEY=demo-dev-key LLMGATE_MOCK_PROVIDER_KEY=demo-provider-key \
-  "$WORK/llmgate" serve -config "$WORK/config.yaml" 2>"$WORK/gateway.log" &
+  "$WORK/llmgate" serve --config "$WORK/config.yaml" 2>"$WORK/gateway.log" &
 PIDS+=($!)
 
 wait_for "$MOCK/__mock/stats"
