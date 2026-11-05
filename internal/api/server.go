@@ -5,6 +5,7 @@ package api
 
 import (
 	"context"
+	"crypto/rand"
 	"log/slog"
 	"net/http"
 	"sync/atomic"
@@ -140,6 +141,7 @@ func (s *Server) handleReady(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleNotFound(w http.ResponseWriter, r *http.Request) {
 	abandonBody(w, r)
+	w.Header().Set("X-Request-Id", rand.Text())
 	writeError(w, &apiError{
 		Status:  http.StatusNotFound,
 		Type:    errTypeInvalidRequest,
