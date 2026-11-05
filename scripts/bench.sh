@@ -25,6 +25,7 @@ MOCK_PID=""
 mkdir -p "$OUT"
 
 cleanup() {
+  [ -n "${SAMPLER_PID:-}" ] && kill "$SAMPLER_PID" 2>/dev/null || true
   [ -n "$GATEWAY_PID" ] && kill "$GATEWAY_PID" 2>/dev/null || true
   [ -n "$MOCK_PID" ] && kill "$MOCK_PID" 2>/dev/null || true
   wait 2>/dev/null || true
@@ -43,6 +44,16 @@ go build -o "$WORK/llmgate-mock" ./cmd/llmgate-mock
 go build -o "$WORK/llmgate-bench" ./cmd/llmgate-bench
 
 LOAD_BEFORE=$(load1)
+
+# The benchmark loads the machine itself, so the load average during and after it says
+# nothing about other work. Instead, sample the CPU that other processes use: everything
+# but this run's binaries and the container VM, which hosts this run's Postgres and Redis.
+other_cpu() {
+  ps -Ao pcpu=,comm= | awk -v work="$WORK" '
+    index($0, work) || /Virtualization|limactl|qemu/ { next }
+    { total += $1 } END { printf "%.0f\n", total }'
+}
+( while true; do other_cpu >>"$WORK/other-cpu"; sleep 10; done ) & SAMPLER_PID=$!
 {
   echo "# Run conditions"
   echo
@@ -231,12 +242,14 @@ docker exec "$PG_CONTAINER" psql -U llmgate -d llmgate_bench -tAc "
   WHERE p.settled_micros <> COALESCE((SELECT sum(l.amount_micros) FROM ledger_entries l JOIN attempts a ON a.id = l.attempt_id WHERE a.budget_period_id = p.id), 0)
      OR p.reserved_micros <> COALESCE((SELECT sum(a.reserved_micros) FROM attempts a WHERE a.budget_period_id = p.id AND a.state IN ('reserved', 'dispatched', 'uncertain')), 0)" >"$WORK/mismatched"
 
-LOAD_AFTER=$(load1)
+kill "$SAMPLER_PID" 2>/dev/null || true; SAMPLER_PID=""
+OTHER_AVG=$(awk '{ t += $1; n++ } END { printf "%.0f", n ? t / n : 0 }' "$WORK/other-cpu")
+OTHER_MAX=$(sort -n "$WORK/other-cpu" | tail -1)
 CONTENDED=no
-awk -v a="$LOAD_BEFORE" -v b="$LOAD_AFTER" -v c="$(cores)" 'BEGIN { exit !((a > c/4) || (b > c/4)) }' && CONTENDED=yes
+awk -v l="$LOAD_BEFORE" -v o="$OTHER_AVG" -v c="$(cores)" 'BEGIN { exit !((l > c/4) || (o > 100)) }' && CONTENDED=yes
 {
-  echo "| Load average after | $LOAD_AFTER |"
-  echo "| Contended | $CONTENDED (a run is contended if the 1-minute load average exceeded a quarter of the cores before or after) |"
+  echo "| Other processes' CPU during the run | average ${OTHER_AVG}%, peak ${OTHER_MAX:-0}%, sampled every 10 seconds |"
+  echo "| Contended | $CONTENDED (contended if the load average before the run exceeded a quarter of the cores, or other processes averaged more than one core) |"
 } >>"$OUT/environment.md"
 
 section "Report"
