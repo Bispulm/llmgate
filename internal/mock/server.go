@@ -7,7 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"net"
 	"net/http"
 	"strings"
 	"sync"
@@ -329,15 +328,16 @@ func injectFailure(w http.ResponseWriter, out *output, wire wireFormat, sc scena
 	return false, nil
 }
 
-// abortConnection closes the connection with a reset, so the client sees a
-// transport failure rather than a clean end of stream.
+// abortConnection closes the connection without finishing the response, so the
+// client sees a transport failure rather than a clean end of stream.
+//
+// It's a plain close rather than a reset. With SO_LINGER 0, a client's read on a
+// reused connection could stay blocked until TCP keepalive noticed, so whether the
+// scenario ended promptly depended on what was in flight.
 func abortConnection(w http.ResponseWriter) {
 	conn, _, err := http.NewResponseController(w).Hijack()
 	if err != nil {
 		panic(http.ErrAbortHandler)
-	}
-	if tcp, ok := conn.(*net.TCPConn); ok {
-		_ = tcp.SetLinger(0)
 	}
 	_ = conn.Close()
 }
