@@ -591,6 +591,7 @@ func TestFailuresBeforeCommitAreOrdinaryHTTPErrors(t *testing.T) {
 		{"server error", "a;fail=status;status=500", 502, "upstream_error", "upstream_failed", provider.KindServer, provider.DeliveryConfirmed},
 		{"provider rejected the credential", "a;fail=status;status=401", 502, "upstream_error", "upstream_misconfigured", provider.KindAuth, provider.DeliveryConfirmed},
 		{"provider has no such model", "a;fail=status;status=404", 502, "upstream_error", "upstream_misconfigured", provider.KindNotFound, provider.DeliveryConfirmed},
+		{"provider account has a billing problem", "a;fail=status;status=402", 502, "upstream_error", "upstream_account_limit", provider.KindBilling, provider.DeliveryConfirmed},
 		{"provider rejected the request", "a;fail=status;status=400", 400, "invalid_request_error", "upstream_rejected", provider.KindInvalidRequest, provider.DeliveryConfirmed},
 		{"provider reported a timeout", "a;fail=status;status=408", 504, "upstream_error", "upstream_timeout", provider.KindTimeout, provider.DeliveryConfirmed},
 		{"connection dropped", "a;fail=drop_before_headers", 502, "upstream_error", "upstream_failed", provider.KindConnection, provider.DeliveryUncertain},

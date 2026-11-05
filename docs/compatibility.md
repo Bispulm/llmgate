@@ -168,10 +168,13 @@ All errors use the OpenAI envelope, with `x-request-id` set on the response:
 | 502 | `upstream_error` | `upstream_failed` | Connection failure, or provider 5xx |
 | 502 | `upstream_error` | `upstream_protocol_error` | Malformed provider response |
 | 502 | `upstream_error` | `upstream_misconfigured` | Provider rejected the gateway's credentials or model |
+| 502 | `upstream_error` | `upstream_account_limit` | The provider account is out of credit or over a spend limit |
 | 503 | `upstream_error` | `upstream_overloaded` | Provider reports overload |
 | 504 | `upstream_error` | `upstream_timeout` | A deadline passed before commit |
 
 `upstream_rejected` is a 400 rather than a 5xx because the same request will keep failing, and client SDKs automatically retry a 5xx.
+
+OpenAI reports exhausted credit and spend limits as HTTP 429, the same status as a rate limit. The gateway separates them by error code, because retrying can't help and the operator, not the client, has to act.
 
 The gateway does not forward provider error messages, which can contain account details. It logs the provider's status and error code, and includes the code in the message of `upstream_rejected` when it is a short identifier.
 
