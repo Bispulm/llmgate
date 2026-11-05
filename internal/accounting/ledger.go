@@ -351,8 +351,15 @@ func lockAttempt(ctx context.Context, tx pgx.Tx, id string, skipLocked bool) (at
 	return a, true, nil
 }
 
+// correctable reports whether an attempt's charge is only conservative, so that a usage
+// report can still replace it. Doing so changes its kind, which is why it happens once.
+func correctable(a attemptRow) bool {
+	return a.state == StateReconciled && a.chargeKind != nil && *a.chargeKind == ChargeConservative && a.chargeMicros != nil
+}
+
 // Finish records how an attempt ended, and settles it if the cost is known. It's
-// idempotent: once an attempt is final, repeating this changes nothing.
+// idempotent: once an attempt is final, repeating this changes nothing, other than a
+// usage report replacing a conservative charge.
 func (l *Ledger) Finish(ctx context.Context, f FinishRequest) (Settlement, error) {
 	var out Settlement
 	err := pgx.BeginFunc(ctx, l.pool, func(tx pgx.Tx) error {
@@ -362,6 +369,18 @@ func (l *Ledger) Finish(ctx context.Context, f FinishRequest) (Settlement, error
 		}
 		if !found {
 			return ErrUnknownAttempt
+		}
+		if correctable(a) && f.Usage.Reportable() {
+			// The owner outlasted its lease, and a reconciler charged the most it could have
+			// cost. Its report is better evidence than that.
+			prices, err := l.pinnedPrices(ctx, tx, a)
+			if err != nil {
+				return err
+			}
+			if charge, err := prices.Charge(f.Usage); err == nil {
+				out = Settlement{ChargeMicros: charge, Kind: ChargeReported, OverReservation: charge > a.reservedMicros}
+				return adjustCharge(ctx, tx, f.AttemptID, a, f.Usage, l.now(), charge)
+			}
 		}
 		if a.state == StateReconciled || a.state == StateReleased {
 			out = Settlement{AlreadySettled: true}
@@ -653,7 +672,7 @@ func (l *Ledger) ApplyLateUsage(ctx context.Context, attemptID string, usage *ch
 			applied = true
 			f := FinishRequest{AttemptID: attemptID, Usage: usage}
 			return settleLate(ctx, tx, attemptID, a, f, now, charge)
-		case a.state == StateReconciled && a.chargeKind != nil && *a.chargeKind == ChargeConservative && a.chargeMicros != nil:
+		case correctable(a):
 			applied = true
 			return adjustCharge(ctx, tx, attemptID, a, usage, now, charge)
 		default:

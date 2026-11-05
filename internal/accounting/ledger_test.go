@@ -208,6 +208,75 @@ func finished(attemptID string, usage *chat.Usage) accounting.FinishRequest {
 	}
 }
 
+// An attempt's owner can be slow enough that a reconciler has already charged it the full
+// reservation. Its report is then the best evidence there is, so it corrects the charge.
+func TestAReportFromASlowOwnerCorrectsAConservativeCharge(t *testing.T) {
+	e := newEnv(t, 100_000)
+	r := e.dispatched("slow-owner")
+	e.clock.Advance(2 * time.Minute)
+	if _, err := e.ledger.Reconcile(context.Background(), 100); err != nil {
+		t.Fatal(err)
+	}
+	e.clock.Advance(2 * time.Minute)
+	if _, err := e.ledger.Reconcile(context.Background(), 100); err != nil {
+		t.Fatal(err)
+	}
+	if state, _, kind := e.attemptState(r.AttemptID); state != accounting.StateReconciled || kind == nil || *kind != accounting.ChargeConservative {
+		t.Fatalf("state = %s, kind = %v", state, kind)
+	}
+
+	settlement, err := e.ledger.Finish(context.Background(), finished(r.AttemptID, reported(40, 10)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	const want = 40 + 2*10
+	if settlement.ChargeMicros != want || settlement.Kind != accounting.ChargeReported {
+		t.Fatalf("settlement = %+v", settlement)
+	}
+	if got := e.period(); got.settled != want || got.reserved != 0 {
+		t.Fatalf("period = %+v", got)
+	}
+	e.checkBooks()
+
+	// It only happens once.
+	repeat, err := e.ledger.Finish(context.Background(), finished(r.AttemptID, reported(1, 1)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !repeat.AlreadySettled || repeat.ChargeMicros != want {
+		t.Fatalf("repeat = %+v", repeat)
+	}
+	if got := e.period(); got.settled != want {
+		t.Fatalf("period = %+v", got)
+	}
+	e.checkBooks()
+}
+
+// A report with nothing usable in it can't lower a charge.
+func TestAnUnusableReportLeavesAConservativeChargeAlone(t *testing.T) {
+	e := newEnv(t, 100_000)
+	r := e.dispatched("unusable")
+	e.clock.Advance(2 * time.Minute)
+	if _, err := e.ledger.Reconcile(context.Background(), 100); err != nil {
+		t.Fatal(err)
+	}
+	e.clock.Advance(2 * time.Minute)
+	if _, err := e.ledger.Reconcile(context.Background(), 100); err != nil {
+		t.Fatal(err)
+	}
+	before := e.period()
+	settlement, err := e.ledger.Finish(context.Background(), finished(r.AttemptID, nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !settlement.AlreadySettled || settlement.Kind != accounting.ChargeConservative {
+		t.Fatalf("settlement = %+v", settlement)
+	}
+	if got := e.period(); got != before {
+		t.Fatalf("period = %+v, was %+v", got, before)
+	}
+}
+
 func TestReserveHoldsLiability(t *testing.T) {
 	e := newEnv(t, 1000)
 	r := e.reserve("r1")
