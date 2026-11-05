@@ -51,7 +51,7 @@ func run(ctx context.Context, args []string, p process) error {
 	root.SetErr(p.stderr)
 	root.SetArgs(args)
 	// Each command gets ctx from ExecuteContext, through cmd.Context().
-	root.AddCommand(serveCommand(p), migrateCommand(p), validateCommand(p)) //nolint:contextcheck // See above.
-	addAdminCommands(root, p)                                               //nolint:contextcheck // See above.
+	root.AddCommand(serveCommand(p), migrateCommand(p), validateCommand(p), versionCommand(p)) //nolint:contextcheck // See above.
+	addAdminCommands(root, p)                                                                  //nolint:contextcheck // See above.
 	return root.ExecuteContext(ctx)
 }

@@ -15,11 +15,15 @@ ADMIN_PORT=${LLMGATE_KIND_ADMIN_PORT:-18307}
 ADMIN_TOKEN=kind-test-admin-token
 WORK=$(mktemp -d)
 PIDS=()
+CREATED=0
+# Its own tag, so it never replaces the image the Compose stack uses.
+IMAGE=llmgate:kind-test
 export KUBECONFIG="$WORK/kubeconfig"
 
 cleanup() {
   for pid in "${PIDS[@]:-}"; do kill "$pid" 2>/dev/null || true; done
-  if [ "${KEEP_CLUSTER:-0}" != 1 ]; then kind delete cluster --name "$CLUSTER" >/dev/null 2>&1 || true; fi
+  # Only a cluster this run created is deleted, never one that was already there.
+  if [ "$CREATED" = 1 ] && [ "${KEEP_CLUSTER:-0}" != 1 ]; then kind delete cluster --name "$CLUSTER" >/dev/null 2>&1 || true; fi
   rm -rf "$WORK"
 }
 trap cleanup EXIT
@@ -32,11 +36,12 @@ if kind get clusters 2>/dev/null | grep -qx "$CLUSTER"; then
   kind export kubeconfig --name "$CLUSTER" >/dev/null
 else
   kind create cluster --name "$CLUSTER" --wait 120s
+  CREATED=1
 fi
-docker build -q -t llmgate:dev . >/dev/null
+docker build -q -t "$IMAGE" . >/dev/null
 # Only the gateway is loaded: the cluster pulls Postgres and Redis itself, since kind
 # can't load a multi-platform image that's only partly stored locally.
-kind load docker-image llmgate:dev --name "$CLUSTER" >/dev/null
+kind load docker-image "$IMAGE" --name "$CLUSTER" >/dev/null
 kubectl --context "$CONTEXT" create namespace "$NAMESPACE" --dry-run=client -o yaml | kubectl --context "$CONTEXT" apply -f - >/dev/null
 
 section "Dependencies"
@@ -51,7 +56,7 @@ k create secret generic llmgate \
 
 section "Chart"
 helm --kube-context "$CONTEXT" -n "$NAMESPACE" upgrade --install llmgate deploy/helm/llmgate \
-  --set mock.enabled=true --wait --timeout 4m
+  --set mock.enabled=true --set image.tag=kind-test --wait --timeout 4m
 k rollout status deploy/llmgate --timeout=120s
 
 k port-forward svc/llmgate "$GATEWAY_PORT:18300" >"$WORK/pf-gateway.log" 2>&1 & PIDS+=($!)
@@ -95,5 +100,18 @@ section "Usage"
 k port-forward svc/llmgate-admin "$ADMIN_PORT:18302" >"$WORK/pf-admin-2.log" 2>&1 & PIDS+=($!)
 for _ in $(seq 1 100); do ready "http://127.0.0.1:$ADMIN_PORT/" && break; sleep 0.2; done
 cli usage kind-team
+
+section "A rollback restores the configuration"
+config_of() { k get deploy/llmgate -o jsonpath='{.spec.template.spec.volumes[0].configMap.name}'; }
+before=$(config_of)
+helm --kube-context "$CONTEXT" -n "$NAMESPACE" upgrade llmgate deploy/helm/llmgate \
+  --set mock.enabled=true --set image.tag=kind-test --set config.auth.key_cache_ttl=20s --wait --timeout 4m >/dev/null
+changed=$(config_of)
+helm --kube-context "$CONTEXT" -n "$NAMESPACE" rollback llmgate 1 --wait --timeout 4m >/dev/null
+after=$(config_of)
+echo "configuration: $before, then $changed, then after the rollback $after"
+[ "$before" != "$changed" ] && [ "$after" = "$before" ] || { echo "the rollback didn't restore the configuration"; exit 1; }
+k get configmap "$after" >/dev/null || { echo "the restored configuration doesn't exist"; exit 1; }
+
 echo
 echo "kind test passed"

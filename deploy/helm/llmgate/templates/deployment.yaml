@@ -14,13 +14,9 @@ spec:
     metadata:
       labels:
         {{- include "llmgate.labels" . | nindent 8 }}
-      annotations:
-        checksum/config: {{ toYaml .Values.config | sha256sum }}
     spec:
       automountServiceAccountToken: false
-      # Longer than the drain delay plus the drain, so in-flight requests can finish and
-      # settle before the pod is killed.
-      terminationGracePeriodSeconds: 45
+      terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
       securityContext:
         runAsNonRoot: true
         runAsUser: 65532
@@ -52,4 +48,4 @@ spec:
       volumes:
         - name: config
           configMap:
-            name: {{ include "llmgate.name" . }}-config
+            name: {{ include "llmgate.configName" . }}
