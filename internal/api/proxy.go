@@ -342,6 +342,8 @@ func (s *Server) proxyStream(parent context.Context, x *exchange) {
 	watchdog.stop()
 	x.attempt.TimeToFirstEvent = time.Since(x.start)
 
+	x.observe(first)
+
 	// This is the commitment point. See ADR 0003.
 	x.attempt.Committed = true
 	out := newStreamWriter(x, s)
@@ -349,7 +351,6 @@ func (s *Server) proxyStream(parent context.Context, x *exchange) {
 		x.clientWriteFailed(err)
 		return
 	}
-	x.observe(first)
 
 	idle := newWatchdog(0, func() { cancel(errStreamIdleTimeout) })
 	defer idle.stop()
